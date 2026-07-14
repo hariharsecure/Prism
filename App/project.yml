@@ -1,0 +1,196 @@
+# XcodeGen spec for the Prism app family. Regenerate with:
+#   cd ~/Documents/Prism/App && DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodegen
+#
+# Signing notes (this machine has ZERO codesigning identities):
+#   - Debug builds ad-hoc: CODE_SIGN_ENTITLEMENTS is overridden per-config to
+#     Config/Prism-Debug.entitlements (hand-written, no restricted entitlements) —
+#     com.apple.developer.system-extension.install is a *restricted* entitlement that
+#     AMFI kills at launch without a provisioning profile.
+#   - Release keeps Config/Prism.entitlements (generated below, includes
+#     system-extension.install) for when a real team signs + notarizes.
+#   - Automatic signing is scaffolded on every target: CODE_SIGN_STYLE Automatic +
+#     DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM} (env-driven — set DEVELOPMENT_TEAM in the
+#     shell before `xcodegen`, or drop the team into the target in Xcode). Empty is
+#     safe: with no team the Automatic (Release) path just has no team yet, and the
+#     per-target Debug override below re-asserts Manual ad-hoc ("-") so this
+#     identity-less machine keeps building Debug. NO team id is hardcoded.
+#     IMPORTANT: target settings override project settings, so each target must
+#     re-declare the Debug ad-hoc override or its base `Automatic` would win and
+#     break the ad-hoc build.
+name: Prism
+options:
+  bundleIdPrefix: studio.prism
+  deploymentTarget:
+    macOS: "14.2"
+    iOS: "17.0"
+  createIntermediateGroups: true
+
+packages:
+  PrismStudio:
+    path: ../PrismStudio
+
+settings:
+  base:
+    SWIFT_VERSION: 5.10
+    CODE_SIGN_STYLE: Automatic
+    CURRENT_PROJECT_VERSION: 1
+    MARKETING_VERSION: 0.1.0
+  configs:
+    # No signing identities exist on this machine: Debug signs ad-hoc
+    # (manual style — automatic style refuses entitlements without a cert).
+    # Release stays Automatic for when a real team is configured.
+    Debug:
+      CODE_SIGN_STYLE: Manual
+      CODE_SIGN_IDENTITY: "-"
+      AD_HOC_CODE_SIGNING_ALLOWED: YES
+
+targets:
+  Prism:
+    type: application
+    platform: macOS
+    sources: [PrismApp]
+    info:
+      path: Config/Prism-Info.plist
+      properties:
+        CFBundleDisplayName: Prism
+        NSCameraUsageDescription: Prism captures video from cameras you add as sources.
+        NSMicrophoneUsageDescription: Prism captures audio from microphones you add as sources.
+        NSAudioCaptureUsageDescription: Prism can capture system and per-app audio as sources.
+        NSLocalNetworkUsageDescription: Prism discovers and receives video from your iPhones and iPads on the local network.
+        NSSystemExtensionUsageDescription: Prism installs a camera extension so other apps can use Prism's program output as a camera.
+        NSBluetoothAlwaysUsageDescription: Prism uses Bluetooth to discover nearby iPhones and iPads so you can pair them faster over Wi-Fi.
+        NSBonjourServices: [_prism._udp]
+        NSCameraUseContinuityCameraDeviceType: true
+        LSMinimumSystemVersion: "14.2"
+    # Entitlement files are hand-maintained (NOT generated): xcodegen's
+    # `entitlements:` block forces one file on every config, but Debug must
+    # drop the restricted system-extension.install key to stay ad-hoc-signable.
+    #   Config/Prism.entitlements       → Release (system-extension.install + device access)
+    #   Config/Prism-Debug.entitlements → Debug   (device access only)
+    dependencies:
+      # system-extension targets embed into Contents/Library/SystemExtensions
+      # automatically (XcodeGen picks the destination from the product type).
+      - target: PrismVCamExtension
+        embed: true
+        codeSign: true
+      - package: PrismStudio
+        products:
+          - PrismCore
+          - PrismCapture
+          - PrismScreen
+          - PrismAudio
+          - PrismSound
+          - PrismCompositor
+          - PrismCompose
+          - PrismAnimation
+          - PrismColor
+          - PrismVision
+          - PrismSources
+          - PrismExport
+          - PrismOutput
+          - PrismControl
+          - PrismLink
+          - PrismVirtualCam
+          - PrismControlSurface
+          - PrismProximity
+          - PrismDirector
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: studio.prism.app
+        ENABLE_HARDENED_RUNTIME: true
+        CODE_SIGN_ENTITLEMENTS: Config/Prism.entitlements
+        # Automatic signing, ready the moment a team exists (env-driven, empty-safe).
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}
+      configs:
+        Debug:
+          # Ad-hoc-signable entitlements (no restricted com.apple.developer.* keys).
+          CODE_SIGN_ENTITLEMENTS: Config/Prism-Debug.entitlements
+          # Re-assert ad-hoc so the target-base Automatic can't break Debug.
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: "-"
+          AD_HOC_CODE_SIGNING_ALLOWED: YES
+
+  PrismVCamExtension:
+    type: system-extension
+    platform: macOS
+    sources: [PrismVCamExtension]
+    info:
+      path: Config/PrismVCamExtension-Info.plist
+      properties:
+        CFBundleDisplayName: Prism Camera Extension
+        CFBundlePackageType: SYSX
+        CMIOExtension:
+          # Must be TeamIdentifierPrefix-prefixed or registration fails silently
+          # (PrismVirtualCam README §2).
+          CMIOExtensionMachServiceName: $(TeamIdentifierPrefix)studio.prism.PrismStudio.vcam
+    entitlements:
+      path: Config/PrismVCamExtension.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+    dependencies:
+      - package: PrismStudio
+        products: [PrismCore, PrismVirtualCam]
+    settings:
+      base:
+        # Must equal PrismVCamConstants.extensionBundleID; the bundle on disk must be
+        # Contents/Library/SystemExtensions/studio.prism.PrismStudio.vcam.systemextension.
+        PRODUCT_BUNDLE_IDENTIFIER: studio.prism.PrismStudio.vcam
+        PRODUCT_NAME: studio.prism.PrismStudio.vcam
+        # Automatic signing, ready the moment a team exists (env-driven, empty-safe).
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}
+      configs:
+        Debug:
+          # Re-assert ad-hoc so the target-base Automatic can't break Debug.
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: "-"
+          AD_HOC_CODE_SIGNING_ALLOWED: YES
+
+  PrismCamera:
+    type: application
+    platform: iOS
+    sources: [PrismCamera]
+    info:
+      path: Config/PrismCamera-Info.plist
+      properties:
+        CFBundleDisplayName: Prism Camera
+        NSCameraUsageDescription: Prism Camera streams this device's camera to Prism on your Mac.
+        NSMicrophoneUsageDescription: Prism Camera streams this device's microphone to Prism on your Mac.
+        NSLocalNetworkUsageDescription: Prism Camera connects to Prism on your Mac over the local network.
+        NSBonjourServices: [_prism._udp]
+        UILaunchScreen: {}
+        UIRequiredDeviceCapabilities: [arm64]
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+    dependencies:
+      - package: PrismStudio
+        products: [PrismCore, PrismLink, PrismLinkSender]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: studio.prism.camera
+        TARGETED_DEVICE_FAMILY: "1,2"
+        # Automatic signing, ready the moment a team exists (env-driven, empty-safe).
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}
+      configs:
+        Debug:
+          # Re-assert ad-hoc so the target-base Automatic can't break Debug.
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: "-"
+          AD_HOC_CODE_SIGNING_ALLOWED: YES
+
+  PrismTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources: [PrismAppTests]
+    dependencies:
+      - target: Prism
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: studio.prism.app-tests
+        GENERATE_INFOPLIST_FILE: YES
+      configs:
+        Debug:
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: "-"
+          AD_HOC_CODE_SIGNING_ALLOWED: YES

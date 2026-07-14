@@ -1,0 +1,61 @@
+# Build artifacts
+App/.build_dd/
+App/build/
+App/DerivedData/
+App/Prism.xcodeproj/
+PrismStudio/.build/
+.build/
+DerivedData/
+*.o
+*.swiftmodule
+
+# Secrets / keys — never publish
+*.key
+*.pem
+*.p12
+*.pfx
+*.keychain
+*.keychain-db
+*.mobileprovision
+*.cer
+*.der
+*.p8
+.env
+.env.*
+credentials*
+secrets*
+
+# nested/backup git internals — never publish (may contain old history/secrets)
+.git.bak/
+**/.git.bak/
+*.crt
+
+# macOS / editor cruft
+.DS_Store
+*.xcuserstate
+xcuserdata/
+scratchpad/
+*.log
+*.profraw
+*.profdata
+
+# Internal working docs — kept locally, NOT published (process/ledgers/notes)
+/SOL_FIX_LEDGER.md
+/FIX_LEDGER.md
+/MOVIESOURCE_FIX_LEDGER.md
+/TILE_MONTAGE_FIX_LEDGER.md
+/CROSS_VERIFY_FINDINGS.md
+/WAVE2_FINDINGS.md
+/PRODUCTION_BIBLE.md
+/WORLD_CLASS_VISION.md
+/KNOWN_LIMITATIONS.md
+/OPTIMIZATION_PLAN.md
+/ANIMATION_ENHANCEMENTS_DESIGN.md
+/APP_UI_DESIGN.md
+/BEAT_SYNC_DESIGN.md
+/MONTAGE_TILE_EFFECTS_DESIGN.md
+/MUSIC_DESIGN.md
+/TRANSITIONS_CHARACTERS_MEMES_DESIGN.md
+PrismStudio/AGENTS.md
+docs/UNREAL_AR_3D_CHARACTER_DESIGN.md
+docs/UNREAL_INTERACTIVE_CHARACTERS_DESIGN.md
