@@ -10,6 +10,9 @@ import SwiftUI
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     let engine = AppEngine()
+    /// Owns system-wide hotkeys (Carbon RegisterEventHotKey). Created lazily
+    /// after the engine so it can wire actions to it, and started once at launch.
+    lazy var hotKeys = HotKeyManager(engine: engine)
     private var shutdownStarted = false
     private var engineWillChange: AnyCancellable?
 
@@ -19,6 +22,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         engineWillChange = engine.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
         }
+
+        // Register any persisted global hotkeys with the OS (fires backgrounded).
+        hotKeys.start()
 
         // Debug-only headless verification hooks (same pattern as
         // PRISM_LINK_STATE_FILE / PRISM_AUTOADD_PEERS; no-ops in normal use):
@@ -140,6 +146,14 @@ struct PrismApp: App {
                 .environmentObject(appDelegate.engine)
         } label: {
             Image(systemName: appDelegate.engine.isRecording ? "record.circle.fill" : "sparkles.tv")
+        }
+
+        // Settings window (⌘,): hosts the global-hotkeys binding UI. The app had
+        // no formal Settings surface before; this adds one.
+        Settings {
+            HotKeysSettingsView()
+                .environmentObject(appDelegate.engine)
+                .environmentObject(appDelegate.hotKeys)
         }
     }
 }

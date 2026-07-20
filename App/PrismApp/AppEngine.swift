@@ -4515,6 +4515,21 @@ final class AppEngine: ObservableObject {
         }
     }
 
+    // MARK: Global-hotkeys support (read-only view for the toggle-stream policy)
+
+    /// Whether a single-RTMP "quick path" target is fully configured. The
+    /// global toggle-stream hotkey reads this (via `StreamStartPolicy`) so it can
+    /// start the user's saved target instead of inventing a URL. `configured*`
+    /// are private, so this thin accessor lives here rather than in an extension.
+    var hotKeyHasConfiguredStreamTarget: Bool {
+        guard let url = configuredStreamURL, let key = configuredStreamKey else { return false }
+        return !url.isEmpty && !key.isEmpty
+    }
+
+    /// Count of enabled restream destinations — the fallback broadcast target for
+    /// the toggle-stream hotkey when no single-RTMP quick target is configured.
+    var hotKeyEnabledDestinationCount: Int { destinations.filter(\.enabled).count }
+
     // MARK: Control server (obs-websocket, port 4455)
 
     func setControlServer(_ enabled: Bool) {
