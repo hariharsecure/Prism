@@ -69,13 +69,20 @@ let package = Package(
         // synthetic data. Depends only on PrismCore (PixelBufferPool); touches no
         // production compositor/render-loop source.
         .target(name: "PrismDepthSpike", dependencies: ["PrismCore"], swiftSettings: v5),
+        // Deterministic A/V fixtures + oracle for the dev harness and XCTest only.
+        // Deliberately omitted from `products` so it stays out of the app graph.
+        .target(
+            name: "PrismAVTestKit",
+            dependencies: ["PrismCore", "PrismCompositor", "PrismOutput"],
+            swiftSettings: v5
+        ),
         .executableTarget(
             name: "prism-dev",
             dependencies: [
                 "PrismCore", "PrismCapture", "PrismScreen", "PrismAudio",
                 "PrismCompositor", "PrismAnimation", "PrismColor", "PrismVision", "PrismSources", "PrismExport", "PrismCompose", "PrismControlSurface", "PrismProximity", "PrismDirector", "PrismSound",
                 "PrismOutput", "PrismControl", "PrismLink", "PrismLinkSender",
-                "PrismVirtualCam",
+                "PrismVirtualCam", "PrismAVTestKit",
             ],
             swiftSettings: v5
         ),
@@ -92,7 +99,7 @@ let package = Package(
                 "PrismCompositor", "PrismAudio", "PrismAnimation", "PrismColor",
                 "PrismVision", "PrismSources", "PrismExport", "PrismCompose",
                 "PrismOutput", "PrismControlSurface", "PrismControl", "PrismProximity", "PrismDirector", "PrismSound",
-                "PrismCapture", "PrismScreen", "PrismLink", "PrismVirtualCam",
+                "PrismCapture", "PrismScreen", "PrismLink", "PrismVirtualCam", "PrismAVTestKit",
             ],
             swiftSettings: v5
         ),

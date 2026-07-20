@@ -133,6 +133,7 @@ struct MultiviewWindow: View {
                 .strokeBorder(isActive ? Color.red : Color.secondary.opacity(0.25),
                               lineWidth: isActive ? 2 : 1))
         }
+        .accessibilityIdentifier("multiview.preset.card")
         .buttonStyle(.plain)
         .help("Switch the program to the \(preset.rawValue) preset")
     }
@@ -168,6 +169,7 @@ struct MultiviewWindow: View {
                         .overlay(RoundedRectangle(cornerRadius: 6)
                             .strokeBorder(Color.secondary.opacity(0.25), lineWidth: 1))
                     }
+                    .accessibilityIdentifier("multiview.collection.card")
                     .buttonStyle(.plain)
                     .help("Load the \(collection.name) layout")
                 }

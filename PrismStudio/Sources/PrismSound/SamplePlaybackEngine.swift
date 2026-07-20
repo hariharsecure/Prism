@@ -100,22 +100,21 @@ final class AudioPacketMinter {
 
 /// Testable core of the live tap drain (A3/A4). Given each drained block's peak
 /// and frame count it decides whether to ingest the block and, if so, the
-/// PTS sample-offset to stamp. Silent idle blocks are skipped and do NOT advance
-/// the clock, so the next real block stays PTS-contiguous with the previous
-/// ingested one — no B18 gap, hence no 0.5 s of queued silence ahead of the
-/// first trigger. Pure value type ⇒ unit-testable without any audio hardware.
+/// PTS sample-offset to stamp. Silent idle blocks are skipped but still advance
+/// house time, so the next real block aligns with the program mix without
+/// queueing the skipped PCM. Pure value type ⇒ unit-testable without hardware.
 struct LiveDrainClock {
-    private(set) var ingestedFrames: Int64 = 0
+    private(set) var elapsedFrames: Int64 = 0
     let silenceFloor: Float
     init(silenceFloor: Float) { self.silenceFloor = silenceFloor }
 
-    /// Returns the contiguous PTS sample offset for a block to ingest, or `nil`
-    /// to skip it (silent idle block).
+    /// Returns the house-timeline sample offset for a block to ingest, or nil
+    /// for silence. Every valid block advances time even when its PCM is skipped.
     mutating func admit(peak: Float, frames: Int) -> Int64? {
-        guard peak > silenceFloor, frames > 0 else { return nil }
-        let offset = ingestedFrames
-        ingestedFrames += Int64(frames)
-        return offset
+        guard frames > 0 else { return nil }
+        let offset = elapsedFrames
+        elapsedFrames += Int64(frames)
+        return peak > silenceFloor ? offset : nil
     }
 }
 
@@ -254,8 +253,8 @@ public final class SamplePlaybackEngine: @unchecked Sendable {
             _ = ring.read(into: drain.mutableAudioBufferList, frameCount: n)
             guard let data = drain.floatChannelData else { break }
 
-            // A4: drop fully-silent idle blocks (LiveDrainClock keeps the PTS of
-            // real blocks contiguous, so nothing queues ahead of the first hit).
+            // A4: drop fully-silent idle blocks. LiveDrainClock still advances
+            // their house-time span, so the first hit aligns without queued PCM.
             var peak: Float = 0
             outer: for c in 0..<channels {
                 for f in 0..<n { let a = abs(data[c][f]); if a > peak { peak = a; if peak > Self.liveSilenceFloor { break outer } } }

@@ -21,6 +21,7 @@ struct DestinationsEditor: View {
                 } label: {
                     Label("Add", systemImage: "plus.circle")
                 }
+                .accessibilityIdentifier("destinations.add.button")
                 .controlSize(.small)
                 .help("Add another platform to stream to at the same time")
             }
@@ -68,17 +69,20 @@ private struct DestinationRow: View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 6) {
                 Toggle("", isOn: enabledBinding)
+                    .accessibilityIdentifier("destinations.row.enabled.toggle")
                     .labelsHidden()
                     .toggleStyle(.switch)
                     .controlSize(.mini)
                     .help("Include this destination when you Go Live")
                 TextField("Name", text: fieldBinding(\.name))
                     .textFieldStyle(.roundedBorder)
+                    .accessibilityIdentifier("destinations.row.name.field")
                     .frame(width: 120)
                 Picker("", selection: protoBinding) {
                     Text("RTMP").tag(Destination.Proto.rtmp)
                     Text("SRT").tag(Destination.Proto.srt)
                 }
+                .accessibilityIdentifier("destinations.row.proto.picker")
                 .labelsHidden()
                 .frame(width: 74)
                 .disabled(engine.isStreaming)
@@ -88,6 +92,7 @@ private struct DestinationRow: View {
                 } label: {
                     Image(systemName: "minus.circle.fill").foregroundStyle(.red)
                 }
+                .accessibilityIdentifier("destinations.row.remove")
                 .buttonStyle(.plain)
                 .help("Remove destination")
             }
@@ -95,12 +100,14 @@ private struct DestinationRow: View {
                 TextField(current.proto == .srt ? "srt://host:port?…" : "rtmp://host/app",
                           text: fieldBinding(\.url))
                     .textFieldStyle(.roundedBorder)
+                    .accessibilityIdentifier("destinations.row.url.field")
                     .disabled(engine.isStreaming)
                 // Codex #8: the key/streamid is a secret — mask it (and it is
                 // stored in the Keychain, not the plaintext JSON).
                 SecureField(current.proto == .srt ? "streamid" : "stream key",
                             text: fieldBinding(\.key))
                     .textFieldStyle(.roundedBorder)
+                    .accessibilityIdentifier("destinations.row.key.field")
                     .frame(width: 110)
                     .disabled(engine.isStreaming)
             }

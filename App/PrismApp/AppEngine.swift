@@ -749,7 +749,21 @@ final class AppEngine: ObservableObject {
     @Published private(set) var cameras: [SourceDescriptor] = []
     @Published private(set) var microphones: [SourceDescriptor] = []
     @Published private(set) var peers: [PeerEntry] = []
-    @Published private(set) var activeSources: [ActiveSource] = []
+    @Published private(set) var activeSources: [ActiveSource] = [] {
+        didSet { persistActiveSources() } // source persistence: save the show whenever the set changes
+    }
+
+    /// Add-time file identity (bookmark + loop) for image/movie sources, keyed by
+    /// their runtime id. Feeds `persistActiveSources` (the descriptor.id of a media
+    /// source is a throwaway `SourceID`, so the file has to be captured on add and
+    /// dropped on remove). Source-persistence support state.
+    var persistableSourceFiles: [SourceID: PersistableSourceFile] = [:]
+    /// Entries whose device/file was absent at restore: skipped for creation but
+    /// RETAINED so a later save keeps them (they reappear when the device returns).
+    var retainedAbsentSources: [PersistedSource] = []
+    /// While a restore is replaying sources, suppress the per-mutation save so the
+    /// file is written ONCE at the end (live sources + retained-absent).
+    var isSourcePersistenceSuspended = false
 
     /// The most recently added video source that got its own layer. The view
     /// layer observes this to auto-select the new layer in the Inspector, so a
@@ -1796,7 +1810,16 @@ final class AppEngine: ObservableObject {
 
     @Published var lastError: String?
 
-    var isOnAir: Bool { isRecording || vcamOutputEnabled }
+    /// On-air = ANY live output is running: recording, virtual camera, OR
+    /// streaming (RTMP/SRT). Omitting `isStreaming` here reported "not on air"
+    /// while actively broadcasting — a false operator status.
+    var isOnAir: Bool { Self.computeOnAir(recording: isRecording, vcam: vcamOutputEnabled, streaming: isStreaming) }
+
+    /// Pure on-air predicate (extracted so the contract is unit-testable without
+    /// driving a live output). Every live-output surface must be OR'd in here.
+    static func computeOnAir(recording: Bool, vcam: Bool, streaming: Bool) -> Bool {
+        recording || vcam || streaming
+    }
 
     /// Serial queue for outbound LinkPeer control sends (C25). LinkPeer's
     /// send* methods do NOT hop to the link queue internally, so they must
@@ -1880,6 +1903,7 @@ final class AppEngine: ObservableObject {
         sceneCollections = SceneCollectionStore.load() // v2 deliverable 1
         destinations = StreamDestinationsStore.load()  // deliverable B: restream targets
         restorePersistedSettings()                     // transition kind/enable/duration + stinger
+        restorePersistedSources()                      // source persistence: reopen the saved show's sources
 
         // Debug-only: auto-start the obs-websocket control server on TCP 4455 so
         // a headless loopback client can exercise the request surface without the
@@ -2743,6 +2767,9 @@ final class AppEngine: ObservableObject {
                                          contentMode: .aspectFit)
             let descriptor = SourceDescriptor(kind: .media, id: source.id.raw,
                                               name: fileURL.deletingPathExtension().lastPathComponent)
+            // Source persistence: capture the file BEFORE register() appends (the
+            // append triggers the save, which reads this table).
+            registerPersistableSourceFile(id: source.id, url: fileURL, isMovie: false, loop: nil)
             try registerGenerated(source, descriptor: descriptor)
         } catch {
             lastError = "Couldn't add image \(fileURL.lastPathComponent): \(error.localizedDescription)"
@@ -2836,6 +2863,8 @@ final class AppEngine: ObservableObject {
                                          contentMode: .aspectFit, loop: loop)
             let descriptor = SourceDescriptor(kind: .media, id: source.id.raw,
                                               name: fileURL.deletingPathExtension().lastPathComponent)
+            // Source persistence: capture the file (+loop) BEFORE register() appends.
+            registerPersistableSourceFile(id: source.id, url: fileURL, isMovie: true, loop: loop)
             try registerMovie(source, descriptor: descriptor,
                               fileURL: fileURL, loop: loop, scoped: scoped)
         } catch {
@@ -3402,6 +3431,7 @@ final class AppEngine: ObservableObject {
         animatedMemeByteCost[id] = nil
         animatedMemeLRU.removeAll { $0 == id }
         animatedGIFSourceURLs[id] = nil
+        persistableSourceFiles[id] = nil // source persistence: drop the file identity on remove
         invalidatePendingStingerCue(for: id, drain: true)
         if activeStingerSourceID == id { cancelActiveStingerTransition() }
         let source = activeSources.remove(at: index)

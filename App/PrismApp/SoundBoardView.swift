@@ -73,6 +73,7 @@ struct SoundBoardView: View {
             .background(id != nil ? Color.accentColor.opacity(0.16) : Color.gray.opacity(0.12),
                         in: RoundedRectangle(cornerRadius: 8))
         }
+        .accessibilityIdentifier("sound.pad.\(index)")
         .buttonStyle(.plain)
         .help(id.map { "Trigger \(engine.soundName(forID: $0))" } ?? "Assign a sound to this pad")
         .contextMenu {
@@ -95,12 +96,14 @@ struct SoundBoardView: View {
                     Label(engine.beatIsPlaying ? "Stop" : "Play",
                           systemImage: engine.beatIsPlaying ? "stop.fill" : "play.fill")
                 }
+                .accessibilityIdentifier("sound.beat.playToggle")
                 .controlSize(.small)
 
                 HStack(spacing: 4) {
                     Text("BPM").font(.caption2).foregroundStyle(.secondary)
                     Slider(value: Binding(get: { engine.beatPattern.bpm },
                                           set: { engine.setBPM($0) }), in: 60...200)
+                        .accessibilityIdentifier("sound.beat.bpm.slider")
                         .frame(width: 90)
                     Text("\(Int(engine.beatPattern.bpm))").font(.caption2.monospacedDigit()).frame(width: 26)
                 }
@@ -108,6 +111,7 @@ struct SoundBoardView: View {
                     Text("Swing").font(.caption2).foregroundStyle(.secondary)
                     Slider(value: Binding(get: { engine.beatPattern.swing },
                                           set: { engine.setSwing($0) }), in: 0...0.6)
+                        .accessibilityIdentifier("sound.beat.swing.slider")
                         .frame(width: 70)
                 }
                 Spacer()
@@ -129,6 +133,7 @@ struct SoundBoardView: View {
                                               : Color.gray.opacity(s % 4 == 0 ? 0.28 : 0.15))
                                         .frame(width: 18, height: 18)
                                 }
+                                .accessibilityIdentifier("sound.beat.step.\(t).\(s)")
                                 .buttonStyle(.plain)
                             }
                         }
@@ -150,6 +155,7 @@ struct SoundBoardView: View {
                         Text(bed.name).tag(String?.some(bed.id))
                     }
                 }
+                .accessibilityIdentifier("sound.bed.picker")
                 .pickerStyle(.menu)
                 .labelsHidden()
                 .frame(maxWidth: 200)
@@ -160,6 +166,7 @@ struct SoundBoardView: View {
                     Label(engine.bedIsPlaying ? "Stop" : "Play",
                           systemImage: engine.bedIsPlaying ? "stop.fill" : "play.fill")
                 }
+                .accessibilityIdentifier("sound.bed.playToggle")
                 .controlSize(.small)
                 .disabled(!engine.bedIsPlaying && engine.activeBedID == nil && engine.musicBeds.isEmpty)
 
@@ -167,6 +174,7 @@ struct SoundBoardView: View {
                     Image(systemName: "speaker.wave.2").font(.caption2).foregroundStyle(.secondary)
                     Slider(value: Binding(get: { engine.bedVolume },
                                           set: { engine.setBedVolume($0) }), in: 0...1)
+                        .accessibilityIdentifier("sound.bed.volume.slider")
                         .frame(width: 90)
                 }
 
@@ -174,6 +182,7 @@ struct SoundBoardView: View {
                                      set: { engine.setBedDucking($0) })) {
                     Label("Duck under mic", systemImage: "waveform.badge.mic")
                 }
+                .accessibilityIdentifier("sound.bed.duck.toggle")
                 .toggleStyle(.button)
                 .controlSize(.small)
                 .help("Automatically lower the music when a microphone is speaking")
@@ -217,13 +226,16 @@ struct SoundBrowserSheet: View {
             Text("Assign Sound to Pad \(padIndex + 1)").font(.headline)
 
             HStack(spacing: 8) {
-                TextField("Search sounds…", text: $query).textFieldStyle(.roundedBorder)
+                TextField("Search sounds…", text: $query)
+                    .textFieldStyle(.roundedBorder)
+                    .accessibilityIdentifier("sound.browser.search.field")
                 Picker("Category", selection: $category) {
                     Text("All").tag(String?.none)
                     ForEach(engine.soundCategories, id: \.self) { c in
                         Text(c).tag(String?.some(c))
                     }
                 }
+                .accessibilityIdentifier("sound.browser.category.picker")
                 .pickerStyle(.menu)
                 .labelsHidden()
                 .fixedSize()
@@ -250,6 +262,7 @@ struct SoundBrowserSheet: View {
                         }
                         .contentShape(Rectangle())
                     }
+                    .accessibilityIdentifier("sound.browser.result.row")
                     .buttonStyle(.plain)
                 }
                 .frame(minHeight: 220)
@@ -257,7 +270,9 @@ struct SoundBrowserSheet: View {
 
             HStack {
                 Spacer()
-                Button("Cancel") { assigning = nil }.keyboardShortcut(.cancelAction)
+                Button("Cancel") { assigning = nil }
+                    .accessibilityIdentifier("sound.browser.cancel")
+                    .keyboardShortcut(.cancelAction)
             }
         }
         .padding(18)

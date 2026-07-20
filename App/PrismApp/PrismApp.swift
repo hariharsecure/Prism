@@ -43,6 +43,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
                 NSApplication.shared.terminate(nil)
             }
         }
+        //   PRISM_DEBUG_SCREENSHOT="dir,delaySeconds" → after the delay, capture
+        // a PNG of each of the app's own on-screen windows into `dir` (via
+        // `screencapture -l<windowID>`), then terminate through the REAL quit
+        // path — same Timer-not-asyncAfter rule as the hooks above.
+        if let spec = env["PRISM_DEBUG_SCREENSHOT"] {
+            let parts = spec.split(separator: ",", maxSplits: 1).map(String.init)
+            let dir = parts.first ?? ""
+            let delay = parts.count > 1 ? (Double(parts[1]) ?? 3) : 3
+            if !dir.isEmpty {
+                Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { _ in
+                    MainActor.assumeIsolated { Self.captureDebugScreenshots(to: dir) }
+                }
+            }
+        }
+    }
+
+    /// PRISM_DEBUG_SCREENSHOT: shoot every on-screen window owned by this
+    /// process to `directory` as `prism_window<N>.png`, then quit through
+    /// `applicationShouldTerminate` (engine shutdown included). Debug-only —
+    /// unreachable unless the env hook above is set.
+    private static func captureDebugScreenshots(to directory: String) {
+        let dirURL = URL(fileURLWithPath: directory, isDirectory: true)
+        try? FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
+        let pid = ProcessInfo.processInfo.processIdentifier
+        let windows = (CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]) ?? []
+        var index = 0
+        for info in windows {
+            guard let ownerPID = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
+                  ownerPID == pid,
+                  let windowID = (info[kCGWindowNumber as String] as? NSNumber)?.uint32Value
+            else { continue }
+            // Skip sub-window-sized surfaces (menu-bar extra, status items).
+            if let bounds = info[kCGWindowBounds as String] as? [String: Any],
+               let w = (bounds["Width"] as? NSNumber)?.doubleValue,
+               let h = (bounds["Height"] as? NSNumber)?.doubleValue,
+               w < 200 || h < 200 { continue }
+            index += 1
+            let file = dirURL.appendingPathComponent("prism_window\(index).png").path
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+            // -o: no window shadow, -x: no sound, -l: capture by window id.
+            task.arguments = ["-o", "-x", "-l", String(windowID), file]
+            do {
+                try task.run()
+                task.waitUntilExit()
+            } catch {
+                NSLog("PRISM_DEBUG_SCREENSHOT: screencapture failed to launch: \(error)")
+            }
+        }
+        NSLog("PRISM_DEBUG_SCREENSHOT: captured \(index) window(s) to \(directory)")
+        NSApplication.shared.terminate(nil)
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

@@ -67,6 +67,7 @@ struct MemesView: View {
             .padding(6)
             .background(Color.gray.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
         }
+        .accessibilityIdentifier("memes.tile.trigger")
         .buttonStyle(.plain)
         .help(item.mode == .stinger
               ? (isArmed
@@ -107,6 +108,7 @@ struct MemesView: View {
             .padding(6)
             .background(Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
         }
+        .accessibilityIdentifier("memes.add.tile")
         .buttonStyle(.plain)
         .help("Add an image / GIF / clip as a meme")
     }
@@ -149,17 +151,20 @@ struct AddMemeSheet: View {
                 Text("Insert (placed overlay)").tag(MemeMode.insert)
                 Text("Stinger").tag(MemeMode.stinger)
             }
+            .accessibilityIdentifier("memes.addSheet.mode.picker")
             .pickerStyle(.menu)
 
             HStack {
                 Text(mode == .stinger ? "Duration" : "Hold")
                 Slider(value: $holdSec, in: 0.3...6)
+                    .accessibilityIdentifier("memes.addSheet.hold.slider")
                 Text(String(format: "%.1fs", holdSec)).monospacedDigit().frame(width: 40)
             }
 
             Picker("Placement", selection: $placement) {
                 ForEach(PlacementChoice.allCases) { p in Text(p.label).tag(p) }
             }
+            .accessibilityIdentifier("memes.addSheet.placement.picker")
             .pickerStyle(.menu)
             .disabled(mode != .insert)
             .help(mode == .insert ? "Where the overlay sits on the program"
@@ -172,11 +177,14 @@ struct AddMemeSheet: View {
 
             HStack {
                 Spacer()
-                Button("Cancel") { finish() }.keyboardShortcut(.cancelAction)
+                Button("Cancel") { finish() }
+                    .accessibilityIdentifier("memes.addSheet.cancel")
+                    .keyboardShortcut(.cancelAction)
                 Button("Add") {
                     engine.addMeme(url: url, mode: mode, placement: placement.placement, holdSec: holdSec)
                     finish()
                 }
+                .accessibilityIdentifier("memes.addSheet.confirm")
                 .buttonStyle(.borderedProminent)
             }
         }

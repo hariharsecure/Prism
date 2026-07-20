@@ -60,6 +60,7 @@ struct MixerDrawer: View {
                     Label("Mixer", systemImage: expanded ? "chevron.down" : "chevron.up")
                         .font(.caption.weight(.semibold))
                 }
+                .accessibilityIdentifier("mixer.collapse.toggle")
                 .buttonStyle(.plain)
                 .help(expanded ? "Collapse the audio mixer" : "Expand the audio mixer")
             }
@@ -74,6 +75,7 @@ struct MixerDrawer: View {
                 Label("Monitor", systemImage: "headphones")
             }
             .toggleStyle(.button)
+            .accessibilityIdentifier("mixer.monitor.toggle")
             .controlSize(.small)
             .help("Route the master mix to your output device")
 
@@ -82,6 +84,7 @@ struct MixerDrawer: View {
             } label: {
                 Label("Add System Audio", systemImage: "speaker.wave.2.circle")
             }
+            .accessibilityIdentifier("mixer.addSystemAudio.button")
             .controlSize(.small)
             .disabled(engine.isSystemAudioActive)
             .help(engine.isSystemAudioActive
@@ -138,6 +141,7 @@ struct MixerDrawer: View {
                         channels[id, default: ChannelUI()].gain = newValue
                         engine.setChannelGain(Float(newValue), for: id)
                     }), range: 0...1.5)
+                    .accessibilityIdentifier("mixer.channel.fader")
             }
             .frame(height: 114)
 
@@ -146,6 +150,7 @@ struct MixerDrawer: View {
                     channels[id, default: ChannelUI()].muted.toggle()
                     engine.setChannelMuted(channels[id]?.muted ?? false, for: id)
                 }
+                .accessibilityIdentifier("mixer.channel.mute")
                 .buttonStyle(.bordered)
                 .controlSize(.mini)
                 .tint(ui.muted ? .red : nil)
@@ -155,6 +160,7 @@ struct MixerDrawer: View {
                     channels[id, default: ChannelUI()].solo.toggle()
                     engine.setChannelSolo(channels[id]?.solo ?? false, for: id)
                 }
+                .accessibilityIdentifier("mixer.channel.solo")
                 .buttonStyle(.bordered)
                 .controlSize(.mini)
                 .tint(ui.solo ? .yellow : nil)
@@ -171,6 +177,7 @@ struct MixerDrawer: View {
                 } label: {
                     Text(insertCount > 0 ? "FX \(insertCount)" : "FX")
                 }
+                .accessibilityIdentifier("mixer.channel.fx")
                 .buttonStyle(.bordered)
                 .controlSize(.mini)
                 .tint(insertCount > 0 ? .accentColor : nil)
@@ -184,6 +191,7 @@ struct MixerDrawer: View {
                 } label: {
                     Image(systemName: "waveform.badge.mic")
                 }
+                .accessibilityIdentifier("mixer.channel.voiceIsolation")
                 .buttonStyle(.bordered)
                 .controlSize(.mini)
                 .tint(voiceIso ? .green : nil)
@@ -249,6 +257,7 @@ struct MixerDrawer: View {
             } label: {
                 Label("Add effect", systemImage: "plus")
             }
+            .accessibilityIdentifier("mixer.fx.addEffect.menu")
             .controlSize(.small)
             .disabled(catalog.isEmpty)
 
@@ -256,6 +265,7 @@ struct MixerDrawer: View {
                                  set: { engine.setChannelVoiceIsolation($0, for: id) })) {
                 Label("Voice isolation", systemImage: "waveform.badge.mic")
             }
+            .accessibilityIdentifier("mixer.fx.voiceIsolation.toggle")
             .controlSize(.small)
             .help("Strip low rumble + high hiss to isolate the voice band")
         }
@@ -329,6 +339,7 @@ struct MixerDrawer: View {
                     Text(s.descriptor.name).tag(SourceID?.some(s.id))
                 }
             }
+            .accessibilityIdentifier("mixer.ducking.target.picker")
             .labelsHidden().frame(width: 120)
 
             Text("when").font(.caption).foregroundStyle(.secondary)
@@ -339,24 +350,31 @@ struct MixerDrawer: View {
                     Text(s.descriptor.name).tag(SourceID?.some(s.id))
                 }
             }
+            .accessibilityIdentifier("mixer.ducking.key.picker")
             .labelsHidden().frame(width: 120)
             Text("is loud").font(.caption).foregroundStyle(.secondary)
 
             HStack(spacing: 3) {
                 Text("Thr").font(.caption2).foregroundStyle(.secondary)
-                Slider(value: $duckThreshold, in: -60...0).frame(width: 70)
+                Slider(value: $duckThreshold, in: -60...0)
+                    .accessibilityIdentifier("mixer.ducking.threshold.slider")
+                    .frame(width: 70)
                 Text("\(Int(duckThreshold)) dB").font(.caption2.monospacedDigit()).frame(width: 42)
             }
             HStack(spacing: 3) {
                 Text("Ratio").font(.caption2).foregroundStyle(.secondary)
-                Slider(value: $duckRatio, in: 1...20).frame(width: 60)
+                Slider(value: $duckRatio, in: 1...20)
+                    .accessibilityIdentifier("mixer.ducking.ratio.slider")
+                    .frame(width: 60)
                 Text(String(format: "%.0f:1", duckRatio)).font(.caption2.monospacedDigit()).frame(width: 34)
             }
 
             Button("Apply") { applyDucking() }
+                .accessibilityIdentifier("mixer.ducking.apply")
                 .controlSize(.small)
                 .disabled(duckTarget == nil || duckKey == nil || duckTarget == duckKey)
             Button("Clear") { if let t = duckTarget { engine.clearDucking(target: t) } }
+                .accessibilityIdentifier("mixer.ducking.clear")
                 .controlSize(.small)
                 .disabled(duckTarget == nil)
 

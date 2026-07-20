@@ -56,6 +56,7 @@ struct SourcesSidebar: View {
                     Label("Add Source", systemImage: "plus.rectangle.on.rectangle")
                         .frame(maxWidth: .infinity)
                 }
+                .accessibilityIdentifier("sources.sidebar.addSource.menu")
                 .menuStyle(.button)
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
@@ -72,7 +73,7 @@ struct SourcesSidebar: View {
                     Text("No cameras").foregroundStyle(.secondary)
                 }
                 ForEach(engine.cameras, id: \.id) { descriptor in
-                    sourceRow(descriptor, systemImage: "video",
+                    sourceRow(descriptor, systemImage: "video", idPrefix: "sources.cameras",
                               add: { engine.addCamera(descriptor) })
                 }
             }
@@ -82,7 +83,7 @@ struct SourcesSidebar: View {
                     Text("No microphones").foregroundStyle(.secondary)
                 }
                 ForEach(engine.microphones, id: \.id) { descriptor in
-                    sourceRow(descriptor, systemImage: "mic",
+                    sourceRow(descriptor, systemImage: "mic", idPrefix: "sources.microphones",
                               add: { engine.addMicrophone(descriptor) })
                 }
             }
@@ -94,6 +95,7 @@ struct SourcesSidebar: View {
                 } label: {
                     Label("Add Display/Window…", systemImage: "macwindow.badge.plus")
                 }
+                .accessibilityIdentifier("sources.screen.addDisplayWindow")
                 .buttonStyle(.plain)
                 .foregroundStyle(Color.accentColor)
                 .help("Share a display or app window (prompts for Screen Recording permission)")
@@ -104,7 +106,7 @@ struct SourcesSidebar: View {
                         Label(active.descriptor.name, systemImage: "macwindow")
                             .lineLimit(1)
                         Spacer()
-                        removeButton(for: active.id)
+                        removeButton(for: active.id, id: "sources.screen.remove")
                     }
                 }
             }
@@ -116,6 +118,7 @@ struct SourcesSidebar: View {
                 Toggle("Enable peer connect", isOn: Binding(
                     get: { engine.linkEnabled },
                     set: { engine.setLinkEnabled($0) }))
+                    .accessibilityIdentifier("sources.link.toggle")
                     .help("Start the Prism Camera listener so iPhones can pair over Wi-Fi. Off by default.")
 
                 if engine.linkEnabled {
@@ -156,9 +159,9 @@ struct SourcesSidebar: View {
                         }
                         Spacer()
                         if engine.isActive(entry.id) {
-                            removeButton(for: entry.id)
+                            removeButton(for: entry.id, id: "sources.peers.remove")
                         } else {
-                            addButton { engine.addPeer(entry) }
+                            addButton(id: "sources.peers.add") { engine.addPeer(entry) }
                         }
                     }
                 }
@@ -242,7 +245,7 @@ struct SourcesSidebar: View {
 
     @ViewBuilder
     private func sourceRow(_ descriptor: SourceDescriptor, systemImage: String,
-                           add: @escaping () -> Void) -> some View {
+                           idPrefix: String, add: @escaping () -> Void) -> some View {
         let id = SourceID(descriptor.id)
         HStack {
             Label {
@@ -257,9 +260,9 @@ struct SourcesSidebar: View {
             }
             Spacer()
             if engine.isActive(id) {
-                removeButton(for: id)
+                removeButton(for: id, id: "\(idPrefix).remove")
             } else {
-                addButton(name: descriptor.name, add)
+                addButton(name: descriptor.name, id: "\(idPrefix).add", add)
             }
         }
         .contentShape(Rectangle())
@@ -267,23 +270,27 @@ struct SourcesSidebar: View {
 
     /// An explicit "Add" affordance (label + icon, not a bare glyph) so a row
     /// visibly reads as "click to add this to the scene".
-    private func addButton(name: String? = nil, _ action: @escaping () -> Void) -> some View {
+    private func addButton(name: String? = nil, id: String = "sources.row.add",
+                           _ action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Label("Add", systemImage: "plus.circle")
                 .labelStyle(.titleAndIcon)
         }
+        .accessibilityIdentifier(id)
         .buttonStyle(.bordered)
         .controlSize(.small)
         .tint(.accentColor)
         .help(name.map { "Add \($0) to the scene" } ?? "Add to the scene")
     }
 
-    private func removeButton(for id: SourceID) -> some View {
+    private func removeButton(for id: SourceID,
+                              id accessibilityID: String = "sources.row.remove") -> some View {
         Button {
             engine.removeSource(id)
         } label: {
             Image(systemName: "minus.circle.fill")
         }
+        .accessibilityIdentifier(accessibilityID)
         .buttonStyle(.plain)
         .foregroundStyle(.red)
         .help("Remove source")
@@ -313,6 +320,7 @@ struct ScreenBrowserSheet: View {
             Toggle(isOn: $captureAudio) {
                 Label("Capture audio", systemImage: "speaker.wave.2")
             }
+            .accessibilityIdentifier("screenBrowser.captureAudio.toggle")
             .help("Route this source's app/system audio into the mixer as its own channel (gain/mute/solo), folded into the program mix for recording and streaming.")
 
             if engine.screenBrowserBusy {
@@ -322,6 +330,7 @@ struct ScreenBrowserSheet: View {
                 Label(error, systemImage: "exclamationmark.triangle")
                     .foregroundStyle(.secondary)
                 Button("Try Again") { engine.refreshScreenItems() }
+                    .accessibilityIdentifier("screenBrowser.tryAgain")
             } else {
                 List(engine.screenItems, id: \.id) { descriptor in
                     Button {
@@ -340,6 +349,7 @@ struct ScreenBrowserSheet: View {
                         }
                         .contentShape(Rectangle())
                     }
+                    .accessibilityIdentifier("screenBrowser.item.row")
                     .buttonStyle(.plain)
                 }
                 .frame(minHeight: 260)
@@ -348,6 +358,7 @@ struct ScreenBrowserSheet: View {
             HStack {
                 Spacer()
                 Button("Close") { isPresented = false }
+                    .accessibilityIdentifier("screenBrowser.close")
                     .keyboardShortcut(.cancelAction)
             }
         }

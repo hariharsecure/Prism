@@ -332,20 +332,20 @@ public enum MusicSelfTest {
               bad.stepSeconds.isFinite && bad.stepSeconds > 0 && bad.safeSwing <= 0.75 && bad.safeStepCount >= 1,
               "stepSeconds \(String(format: "%.4f", bad.stepSeconds)), safeSwing \(bad.safeSwing), safeStepCount \(bad.safeStepCount)")
 
-        // ---- 6. A4: live-drain silence skip keeps PTS contiguous ----
+        // ---- 6. A4: live-drain skips PCM but preserves house elapsed time ----
         // Feed the drain clock: silent, silent, LOUD, silent, LOUD. Silent idle
-        // blocks are skipped; the two loud blocks get contiguous offsets (0, 512)
-        // — no gap despite intervening silence, so the first hit isn't delayed by
-        // queued silence.
+        // blocks are skipped, while loud offsets retain the skipped duration.
+        // The mixer has already rendered that silence, so no PCM is queued twice.
         var drainClock = LiveDrainClock(silenceFloor: SamplePlaybackEngine.liveSilenceFloor)
         let n = 512
         let s0 = drainClock.admit(peak: 0.0, frames: n)       // silent → skip
         let s1 = drainClock.admit(peak: 1e-6, frames: n)      // silent → skip
-        let l0 = drainClock.admit(peak: 0.5, frames: n)       // loud → offset 0
+        let l0 = drainClock.admit(peak: 0.5, frames: n)       // loud → offset 1024
         let s2 = drainClock.admit(peak: 0.0, frames: n)       // silent → skip
-        let l1 = drainClock.admit(peak: 0.4, frames: n)       // loud → offset 512
-        check("A4: silent idle blocks skipped, real blocks stay PTS-contiguous",
-              s0 == nil && s1 == nil && s2 == nil && l0 == 0 && l1 == Int64(n),
+        let l1 = drainClock.admit(peak: 0.4, frames: n)       // loud → offset 2048
+        check("A4: silent PCM skipped while real blocks retain house offsets",
+              s0 == nil && s1 == nil && s2 == nil
+                  && l0 == Int64(2 * n) && l1 == Int64(4 * n),
               "skips=[\(s0 == nil),\(s1 == nil),\(s2 == nil)] offsets=[\(l0.map(String.init) ?? "nil"),\(l1.map(String.init) ?? "nil")]")
 
         // ---- 7. A3: RT-safe tap handoff — engine-format frames roundtrip a ring ----

@@ -27,6 +27,7 @@ struct LayerControlsView: View {
                         Text(preset.rawValue).tag(preset)
                     }
                 }
+                .accessibilityIdentifier("layers.layout.picker")
                 .labelsHidden()
                 .pickerStyle(.menu)
                 .fixedSize()
@@ -67,6 +68,7 @@ struct LayerControlsView: View {
                 } label: {
                     Image(systemName: layer.isHidden ? "eye.slash" : "eye")
                 }
+                .accessibilityIdentifier("layers.row.visibility.toggle")
                 .buttonStyle(.plain)
                 .help(layer.isHidden ? "Show layer" : "Hide layer")
 
@@ -84,6 +86,7 @@ struct LayerControlsView: View {
                 } label: {
                     Image(systemName: "chevron.up")
                 }
+                .accessibilityIdentifier("layers.row.moveUp")
                 .buttonStyle(.plain)
                 .help("Bring forward")
 
@@ -92,6 +95,7 @@ struct LayerControlsView: View {
                 } label: {
                     Image(systemName: "chevron.down")
                 }
+                .accessibilityIdentifier("layers.row.moveDown")
                 .buttonStyle(.plain)
                 .help("Send backward")
             }
@@ -101,6 +105,7 @@ struct LayerControlsView: View {
                     Button(preset.rawValue) {
                         engine.setLayerFrame(preset, for: layer.sourceID)
                     }
+                    .accessibilityIdentifier("layers.row.frame.\(preset.rawValue)")
                     .buttonStyle(.bordered)
                     .controlSize(.mini)
                     .help("Position & size this layer: \(preset.rawValue)")
@@ -123,6 +128,7 @@ struct LayerControlsView: View {
                     Image(systemName: engine.animatingSourceID == layer.sourceID
                           ? "play.circle.fill" : "wand.and.rays")
                 }
+                .accessibilityIdentifier("layers.row.entrance.menu")
                 .menuStyle(.borderlessButton)
                 .fixedSize()
                 .controlSize(.mini)
@@ -152,6 +158,7 @@ struct TransitionControlsView: View {
                 Label("Transition", systemImage: "arrow.left.arrow.right.square")
             }
             .toggleStyle(.button)
+            .accessibilityIdentifier("transition.enable.toggle")
             .controlSize(.small)
             .help("Animate between scene presets instead of a hard cut")
 
@@ -166,6 +173,7 @@ struct TransitionControlsView: View {
                     Text(choice.label).tag(choice)
                 }
             }
+            .accessibilityIdentifier("transition.effect.picker")
             .pickerStyle(.menu)
             .labelsHidden()
             .fixedSize()
@@ -177,6 +185,7 @@ struct TransitionControlsView: View {
                 Slider(value: Binding(get: { engine.transitionDuration },
                                       set: { engine.setTransitionDuration($0) }),
                        in: 0...2)
+                    .accessibilityIdentifier("transition.duration.slider")
                     .frame(width: 120)
                     .disabled(!engine.transitionEnabled)
                 Text(String(format: "%.1fs", engine.transitionDuration))
@@ -209,6 +218,7 @@ struct TransitionControlsView: View {
             } label: {
                 Image(systemName: "sparkles.tv")
             }
+            .accessibilityIdentifier("transition.stinger.menu")
             .menuStyle(.borderlessButton)
             .fixedSize()
             .help("Choose live media for cue-frame stinger scene switches; choose None to use the Effect picker")

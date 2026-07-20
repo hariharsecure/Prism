@@ -48,14 +48,16 @@ public final class PCMRingBuffer: @unchecked Sendable {
     /// channel 0 (mono → stereo up-mix).
     public func write(deinterleaved channels: UnsafePointer<UnsafeMutablePointer<Float>>,
                       sourceChannelCount: Int,
+                      sourceFrameOffset: Int = 0,
                       frameCount: Int) {
-        guard frameCount > 0, sourceChannelCount > 0 else { return }
+        guard frameCount > 0, sourceChannelCount > 0, sourceFrameOffset >= 0 else { return }
         lock.withLockUnchecked { idx in
-            var start = 0
+            var start = sourceFrameOffset
             var frames = frameCount
             if frames > capacityFrames { // writing more than capacity: keep only the newest
-                start = frames - capacityFrames
-                idx.droppedFrames += UInt64(start)
+                let skipped = frames - capacityFrames
+                start += skipped
+                idx.droppedFrames += UInt64(skipped)
                 frames = capacityFrames
             }
             // Drop oldest to make room.

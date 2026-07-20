@@ -38,6 +38,7 @@ struct SceneCollectionsMenu: View {
             Label("Scenes", systemImage: "rectangle.stack")
                 .labelStyle(.iconOnly)
         }
+        .accessibilityIdentifier("transport.scenes.menu")
         .menuStyle(.borderlessButton)
         .fixedSize()
         .help("Scenes — save the current layout under a name and switch between saved layouts.")
@@ -61,6 +62,7 @@ private struct SaveCollectionSheet: View {
                 .frame(width: 340, alignment: .leading)
             TextField("Layout name", text: $name)
                 .textFieldStyle(.roundedBorder)
+                .accessibilityIdentifier("scenes.save.name.field")
                 .frame(width: 340)
             if engine.sceneCollections.contains(where: { $0.name == name.trimmingCharacters(in: .whitespaces) }) {
                 Label("Replaces the existing layout with this name.", systemImage: "exclamationmark.triangle")
@@ -70,11 +72,13 @@ private struct SaveCollectionSheet: View {
             HStack {
                 Spacer()
                 Button("Cancel") { isPresented = false }
+                    .accessibilityIdentifier("scenes.save.cancel")
                     .keyboardShortcut(.cancelAction)
                 Button("Save") {
                     engine.saveCurrentAsCollection(name: name)
                     isPresented = false
                 }
+                .accessibilityIdentifier("scenes.save.confirm")
                 .buttonStyle(.borderedProminent)
                 .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
             }

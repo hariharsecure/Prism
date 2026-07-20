@@ -108,6 +108,7 @@ struct ContentView: View {
                 } label: {
                     Label("Use \(cam.name)", systemImage: "video.fill")
                 }
+                .accessibilityIdentifier("content.monitor.useCamera")
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
                 .padding(.top, 6)
@@ -126,6 +127,7 @@ struct ContentView: View {
                     .foregroundStyle(.orange)
                     .lineLimit(1)
                 Button("Dismiss") { engine.lastError = nil }
+                    .accessibilityIdentifier("content.status.dismissError")
                     .controlSize(.mini)
             } else {
                 Text("Program 1920×1080 · 60 fps")

@@ -291,7 +291,12 @@ extension AppEngine {
 
     // MARK: Bookmark helpers
 
-    private static func makeBookmark(_ url: URL) -> Data? {
+    // NOTE: `internal` + `nonisolated` (not `private`) so the source-persistence
+    // file can reuse the SAME security-scoped bookmark round-trip (make/resolve)
+    // rather than reinventing it — image/movie sources persist as bookmarks
+    // exactly like meme tiles do. `nonisolated`: pure, no actor state, so the pure
+    // restore-planner (and its tests) can call it off the main actor.
+    nonisolated static func makeBookmark(_ url: URL) -> Data? {
         if let data = try? url.bookmarkData(options: [.withSecurityScope],
                                             includingResourceValuesForKeys: nil, relativeTo: nil) {
             return data
@@ -300,7 +305,7 @@ extension AppEngine {
         return try? url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil)
     }
 
-    private static func resolveBookmark(_ data: Data) -> URL? {
+    nonisolated static func resolveBookmark(_ data: Data) -> URL? {
         var stale = false
         if let url = try? URL(resolvingBookmarkData: data, options: [.withSecurityScope],
                               relativeTo: nil, bookmarkDataIsStale: &stale), !stale {

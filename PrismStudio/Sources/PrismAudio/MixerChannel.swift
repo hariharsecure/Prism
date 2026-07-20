@@ -101,7 +101,20 @@ public final class MixerChannel: @unchecked Sendable {
     func setSidechainDucker(_ d: Ducker?) { ducker.withLock { $0 = d } }
     private let ring: PCMRingBuffer
     private let internalFormat: AVAudioFormat
+    private let maximumInitialAlignmentFrames: Int
+    private let timeline: MixerTimeline
     private let log: Logger
+
+    /// Serializes initial/discontinuity placement with this channel's render
+    /// callback. The render thread performs only bounded lock/index work here.
+    private struct PlacementState {
+        var renderedThroughFrame: Int64?
+        var needsAbsolutePlacement = true
+        var terminal = false
+        var warnedAlignmentCap = false
+        var ptsAdjustment: CMTime = .zero
+    }
+    private let placement = OSAllocatedUnfairLock<PlacementState>(initialState: PlacementState())
 
     /// The node the mixer connects into its graph.
     let sourceNode: AVAudioSourceNode
@@ -123,9 +136,16 @@ public final class MixerChannel: @unchecked Sendable {
     /// is a stream reset, not a hole worth filling).
     private static let maxGapSilenceSeconds = 1.0
 
-    init(id: SourceID, internalFormat: AVAudioFormat, ringCapacityFrames: Int, soloState: SoloState) {
+    init(id: SourceID,
+         internalFormat: AVAudioFormat,
+         ringCapacityFrames: Int,
+         maximumInitialAlignmentFrames: Int,
+         timeline: MixerTimeline,
+         soloState: SoloState) {
         self.id = id
         self.internalFormat = internalFormat
+        self.maximumInitialAlignmentFrames = maximumInitialAlignmentFrames
+        self.timeline = timeline
         self.soloState = soloState
         self.ring = PCMRingBuffer(channelCount: Int(internalFormat.channelCount),
                                   capacityFrames: ringCapacityFrames)
@@ -138,11 +158,22 @@ public final class MixerChannel: @unchecked Sendable {
         let solo = soloState
         let sidechainLevel = self.sidechainLevel
         let ducker = self.ducker
+        let placement = self.placement
+        let timeline = self.timeline
 
-        self.sourceNode = AVAudioSourceNode(format: internalFormat) { isSilence, _, frameCount, audioBufferList -> OSStatus in
+        self.sourceNode = AVAudioSourceNode(format: internalFormat) { isSilence, timestamp, frameCount, audioBufferList -> OSStatus in
             let frames = Int(frameCount)
-            // Always drain the ring (even when muted) so audio stays current.
-            _ = ring.read(into: audioBufferList, frameCount: frames)
+            let timestampFrame = timeline.sourceRenderFrame(for: timestamp.pointee)
+            // Keep cursor publication and FIFO consumption atomic against the
+            // first-packet commit. This closes the ingest/render boundary race.
+            placement.withLockUnchecked { state in
+                _ = ring.read(into: audioBufferList, frameCount: frames)
+                let start = timestampFrame
+                    ?? state.renderedThroughFrame
+                    ?? timeline.currentRenderFrame
+                let (end, overflow) = start.addingReportingOverflow(Int64(frames))
+                if !overflow { state.renderedThroughFrame = end }
+            }
 
             let p = params.withLock { $0 }
             let effectivelyMuted = p.muted || (solo.isActive && !p.solo)
@@ -193,6 +224,23 @@ public final class MixerChannel: @unchecked Sendable {
     /// Detach-time cleanup: a soloed channel must not leave the solo latch on.
     func willRemoveFromMixer() {
         isSolo = false
+        placement.withLock { state in
+            state.terminal = true
+            ring.reset()
+        }
+    }
+
+    /// Engine sample time restarts at zero, so buffered PCM and channel-local
+    /// timing must restart with the mixer-wide epoch.
+    func resetForMixerRestart() {
+        placement.withLock { state in
+            ring.reset()
+            state = PlacementState()
+            expectedNextPTS = .invalid
+            warnedBackwardPTS = false
+            converter = nil
+            convertedBuffer?.frameLength = 0
+        }
     }
 
     // MARK: Ingest
@@ -201,6 +249,7 @@ public final class MixerChannel: @unchecked Sendable {
     /// the mixer's internal 48 kHz stereo float as needed. Call from the
     /// source's capture queue (one caller at a time per channel).
     public func ingest(_ packet: AudioPacket) {
+        guard !placement.withLock({ $0.terminal }) else { return }
         let sampleBuffer = packet.sampleBuffer
         guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
               let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription),
@@ -212,11 +261,8 @@ public final class MixerChannel: @unchecked Sendable {
         let frames = CMSampleBufferGetNumSamples(sampleBuffer)
         guard frames > 0 else { return }
 
-        // B18: the FIFO ring has no notion of time — use packet PTS to spot
-        // holes in the source timeline and keep the mix aligned by inserting
-        // silence for the missing span (drop-outs must not slide audio early).
-        trackTimeline(pts: CMSampleBufferGetPresentationTimeStamp(sampleBuffer),
-                      frames: frames, inputRate: inputFormat.sampleRate)
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        resetConverterForDiscontinuityIfNeeded(pts: pts)
 
         // Reusable staging buffer in the packet's own format.
         if inputBuffer == nil
@@ -237,13 +283,26 @@ public final class MixerChannel: @unchecked Sendable {
         }
 
         if inputFormat == internalFormat {
-            writeToRing(staging)
+            commit(staging, pts: pts, sourceFrames: frames, inputRate: inputFormat.sampleRate)
             return
         }
-        convertAndWrite(staging, from: inputFormat)
+        convertAndCommit(staging, from: inputFormat, pts: pts, sourceFrames: frames)
     }
 
-    private func convertAndWrite(_ staging: AVAudioPCMBuffer, from inputFormat: AVAudioFormat) {
+    /// A stateful resampler must not leak filter/queued samples across a PTS
+    /// discontinuity. Detection happens before conversion; commit later applies
+    /// the corresponding FIFO placement and source-local rebase.
+    private func resetConverterForDiscontinuityIfNeeded(pts: CMTime) {
+        guard pts.isValid, pts.isNumeric,
+              expectedNextPTS.isValid, expectedNextPTS.isNumeric else { return }
+        let gap = CMTimeSubtract(pts, expectedNextPTS).seconds
+        if abs(gap) > Self.gapThresholdSeconds { converter?.reset() }
+    }
+
+    private func convertAndCommit(_ staging: AVAudioPCMBuffer,
+                                  from inputFormat: AVAudioFormat,
+                                  pts: CMTime,
+                                  sourceFrames: Int) {
         if converter == nil {
             converter = AVAudioConverter(from: inputFormat, to: internalFormat)
             if converter == nil {
@@ -278,43 +337,122 @@ public final class MixerChannel: @unchecked Sendable {
             return
         }
         if converted.frameLength > 0 {
-            writeToRing(converted)
+            commit(converted, pts: pts, sourceFrames: sourceFrames,
+                   inputRate: inputFormat.sampleRate)
         }
     }
 
-    private func writeToRing(_ buffer: AVAudioPCMBuffer) {
+    private func writeToRing(_ buffer: AVAudioPCMBuffer, sourceFrameOffset: Int = 0) {
         guard let channels = buffer.floatChannelData else { return }
+        let available = max(0, Int(buffer.frameLength) - sourceFrameOffset)
         ring.write(deinterleaved: channels,
                    sourceChannelCount: Int(buffer.format.channelCount),
-                   frameCount: Int(buffer.frameLength))
+                   sourceFrameOffset: sourceFrameOffset,
+                   frameCount: available)
     }
 
     // MARK: PTS continuity (B18)
 
-    /// Compares this packet's PTS with where the previous packet ended.
-    /// A forward hole (> threshold) is covered with silence at the internal
-    /// rate; a backward jump only resyncs (the ring's committed FIFO order
-    /// can't be rewound — conservative by design).
-    private func trackTimeline(pts: CMTime, frames: Int, inputRate: Double) {
-        guard pts.isValid, pts.isNumeric, inputRate > 0 else { return }
-        let expected = expectedNextPTS
-        expectedNextPTS = CMTimeAdd(pts, CMTime(value: CMTimeValue(frames),
-                                                timescale: CMTimeScale(inputRate.rounded())))
-        guard expected.isValid, expected.isNumeric else { return } // first packet anchors
-        let gap = CMTimeSubtract(pts, expected).seconds
-        if gap > Self.gapThresholdSeconds {
-            let silenceFrames = Int((min(gap, Self.maxGapSilenceSeconds)
-                                     * internalFormat.sampleRate).rounded())
-            insertSilence(frames: silenceFrames)
-            timing.withLock { t in
-                t.gaps += 1
-                t.silenceFrames += UInt64(silenceFrames)
+    /// Commit converted PCM to the time-blind FIFO. The first surviving packet
+    /// is placed absolutely in the shared epoch; later packets retain B18's
+    /// per-source gap behavior. A gap after the ring has already underrun is a
+    /// source restart, so it is re-placed instead of replaying the pause twice.
+    private func commit(_ buffer: AVAudioPCMBuffer,
+                        pts: CMTime,
+                        sourceFrames: Int,
+                        inputRate: Double) {
+        placement.withLock { state in
+            guard !state.terminal else { return }
+
+            var gap: Double?
+            if pts.isValid, pts.isNumeric, inputRate > 0 {
+                let expected = expectedNextPTS
+                expectedNextPTS = CMTimeAdd(
+                    pts,
+                    CMTime(value: CMTimeValue(sourceFrames),
+                           timescale: CMTimeScale(inputRate.rounded()))
+                )
+                if expected.isValid, expected.isNumeric {
+                    gap = CMTimeSubtract(pts, expected).seconds
+                }
             }
-            log.notice("ingest: \(String(format: "%.1f", gap * 1_000)) ms PTS gap from \(self.id.raw, privacy: .public) — inserted \(silenceFrames) silence frames")
-        } else if gap < -Self.gapThresholdSeconds, !warnedBackwardPTS {
-            warnedBackwardPTS = true
-            log.notice("ingest: backward PTS jump (\(String(format: "%.1f", gap * 1_000)) ms) from \(self.id.raw, privacy: .public) — resynced timeline (logged once)")
+
+            if !state.needsAbsolutePlacement, let gap {
+                if gap > Self.gapThresholdSeconds {
+                    let alreadyRenderedPause = ring.bufferedFrames == 0
+                        && ring.stats.underruns > 0
+                    timing.withLock { $0.gaps += 1 }
+                    if alreadyRenderedPause {
+                        state.needsAbsolutePlacement = true
+                        log.notice("ingest: \(String(format: "%.1f", gap * 1_000)) ms source restart from \(self.id.raw, privacy: .public) — re-aligned to house time")
+                    } else {
+                        let silenceFrames = Int((min(gap, Self.maxGapSilenceSeconds)
+                                                 * internalFormat.sampleRate).rounded())
+                        insertSilence(frames: silenceFrames)
+                        timing.withLock { $0.silenceFrames += UInt64(silenceFrames) }
+                        log.notice("ingest: \(String(format: "%.1f", gap * 1_000)) ms PTS gap from \(self.id.raw, privacy: .public) — inserted \(silenceFrames) silence frames")
+                    }
+                } else if gap < -Self.gapThresholdSeconds {
+                    // A source-local PTS reset must never move the mixer epoch.
+                    // Drop queued old-epoch PCM and locally rebase the reset
+                    // stream at the current render frame.
+                    ring.reset()
+                    state.needsAbsolutePlacement = true
+                    let renderFrame = state.renderedThroughFrame ?? timeline.currentRenderFrame
+                    if let housePTS = timeline.presentationTime(for: renderFrame) {
+                        state.ptsAdjustment = CMTimeSubtract(housePTS, pts)
+                    }
+                    if !warnedBackwardPTS {
+                        warnedBackwardPTS = true
+                        log.notice("ingest: backward PTS jump (\(String(format: "%.1f", gap * 1_000)) ms) from \(self.id.raw, privacy: .public) — channel rebased without resetting house time (logged once)")
+                    }
+                }
+            }
+
+            guard state.needsAbsolutePlacement else {
+                writeToRing(buffer)
+                return
+            }
+            let adjustedPTS = CMTimeAdd(pts, state.ptsAdjustment)
+            placeAbsolutely(buffer, pts: adjustedPTS, state: &state)
         }
+    }
+
+    private func placeAbsolutely(_ buffer: AVAudioPCMBuffer,
+                                 pts: CMTime,
+                                 state: inout PlacementState) {
+        let packetFrames = Int(buffer.frameLength)
+        guard packetFrames > 0 else { return }
+        let renderFrame = state.renderedThroughFrame ?? timeline.currentRenderFrame
+        let availableLead = max(0, ring.capacityFrames - packetFrames)
+        let maximumLead = min(maximumInitialAlignmentFrames, availableLead)
+        guard let mapped = timeline.placement(
+            for: pts,
+            at: renderFrame,
+            packetFrames: packetFrames,
+            maximumLeadingFrames: maximumLead
+        ) else {
+            // Invalid PTS cannot participate in cross-source alignment. Preserve
+            // the historical behavior for malformed callers and resume FIFO mode.
+            writeToRing(buffer)
+            state.needsAbsolutePlacement = false
+            return
+        }
+
+        if mapped.wasCapped, !state.warnedAlignmentCap {
+            state.warnedAlignmentCap = true
+            log.notice("ingest: initial PTS lead from \(self.id.raw, privacy: .public) exceeded bound — capped at \(maximumLead) frames")
+        }
+        if mapped.frameOffset > 0 { insertSilence(frames: mapped.frameOffset) }
+
+        let trim = max(0, -mapped.frameOffset)
+        guard trim < packetFrames else {
+            // Rendering may advance before the next packet. Keep absolute mode
+            // and map that packet afresh instead of carrying a stale trim debt.
+            return
+        }
+        writeToRing(buffer, sourceFrameOffset: trim)
+        state.needsAbsolutePlacement = false
     }
 
     /// Zero-fill the ring for `frames` frames of the internal format. Chunked

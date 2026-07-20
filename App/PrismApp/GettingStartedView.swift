@@ -55,6 +55,7 @@ struct GettingStartedSheet: View {
                     .font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 Button("Got it") { onClose() }
+                    .accessibilityIdentifier("gettingStarted.gotIt")
                     .keyboardShortcut(.defaultAction)
                     .buttonStyle(.borderedProminent)
             }

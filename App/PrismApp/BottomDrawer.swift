@@ -55,6 +55,7 @@ struct BottomDrawer: View {
                 Image(systemName: expanded ? "chevron.down" : "chevron.up")
                     .font(.caption.weight(.semibold))
             }
+            .accessibilityIdentifier("drawer.collapse.toggle")
             .buttonStyle(.plain)
             .help(expanded ? "Collapse the drawer" : "Expand the drawer")
 
@@ -72,6 +73,7 @@ struct BottomDrawer: View {
                                     in: Capsule())
                         .foregroundStyle(tab == t ? Color.accentColor : .secondary)
                 }
+                .accessibilityIdentifier("drawer.tab.\(t.rawValue.lowercased())")
                 .buttonStyle(.plain)
                 .help("Show the \(t.rawValue) tab")
             }

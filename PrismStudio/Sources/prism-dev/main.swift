@@ -8,6 +8,7 @@ import Network
 import os
 import PrismAnimation
 import PrismAudio
+import PrismAVTestKit
 import PrismCapture
 import PrismColor
 import PrismCompose
@@ -46,6 +47,10 @@ prism-dev <command>
   content               enumerate displays/windows/apps (TRIGGERS Screen Recording TCC prompt)
   pipeline [secs] [out] synthetic 2-source → mailboxes → RenderLoop → compositor → recorder
                         (default 3 s; verifies the recorded file afterwards)
+  av-roundtrip [seed] [evidenceRoot]
+                        deterministic fixture → real compositor → VideoToolbox encode
+                        → MOV mux → decode + A/V oracle. Seed accepts decimal or 0x hex;
+                        JSON evidence defaults to a fresh directory under the temp dir.
   playfile <path> [secs] [outDir]
                         network-free proof: MovieSource(video FILE) → compositor → dump ~10
                         spread PNG frames + per-frame timing + frame-to-frame meanDiff
@@ -1601,6 +1606,43 @@ func cmdStream(mode: String, url: String, seconds: Double, audio: Bool,
     }
 }
 
+// MARK: - Deterministic A/V verification
+
+/// Parse the harness's published seed syntax without accepting a bare `0x`.
+func parseAVRoundTripSeed(_ value: String) -> UInt64? {
+    let lower = value.lowercased()
+    if lower.hasPrefix("0x") {
+        let digits = lower.dropFirst(2)
+        guard !digits.isEmpty else { return nil }
+        return UInt64(digits, radix: 16)
+    }
+    return UInt64(value, radix: 10)
+}
+
+func cmdAVRoundtrip(seed: UInt64, evidenceRoot: String?) async {
+    var configuration = AVRoundTripConfiguration()
+    configuration.seed = seed
+    let rootURL = evidenceRoot.map {
+        URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath, isDirectory: true)
+    }
+
+    print("── deterministic A/V round-trip (seed=\(seed), 0x\(String(seed, radix: 16)))")
+    do {
+        let result = try await AVRoundTripRunner.run(
+            configuration: configuration,
+            artifactRoot: rootURL
+        )
+        print("   \(result.verification.description)")
+        for line in result.verification.evidenceLines { print("   \(line)") }
+        print("   evidence: \(result.artifact.evidenceURL.path)")
+        print("   movie:    \(result.movieURL.path)")
+        print("AV-ROUNDTRIP: PASS")
+    } catch {
+        print("AV-ROUNDTRIP: FAIL — \(error)")
+        exit(1)
+    }
+}
+
 // MARK: - Entry
 
 setbuf(stdout, nil) // dev harness output is often piped/teed — keep it live
@@ -1627,6 +1669,24 @@ case "pipeline":
     let secs = args.dropFirst().first.flatMap(Double.init) ?? 3.0
     let out = args.dropFirst(2).first ?? "/tmp/prism_pipeline_test.mov"
     try await cmdPipeline(seconds: secs, outPath: out)
+case "av-roundtrip":
+    let rest = Array(args.dropFirst())
+    guard rest.count <= 2 else {
+        print("av-roundtrip accepts at most [seed] [evidenceRoot]\n\n\(usage)")
+        exit(2)
+    }
+    let seed: UInt64
+    if let rawSeed = rest.first {
+        guard let parsed = parseAVRoundTripSeed(rawSeed) else {
+            print("av-roundtrip: malformed seed '\(rawSeed)' (use decimal or 0x-prefixed hex)")
+            exit(2)
+        }
+        seed = parsed
+    } else {
+        seed = AVRoundTripConfiguration().seed
+    }
+    let evidenceRoot = rest.count == 2 ? rest[1] : nil
+    await cmdAVRoundtrip(seed: seed, evidenceRoot: evidenceRoot)
 case "playfile":
     let rest = Array(args.dropFirst())
     guard let path = rest.first, !path.isEmpty else {

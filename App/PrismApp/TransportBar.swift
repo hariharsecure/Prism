@@ -109,6 +109,7 @@ struct TransportBar: View {
                       systemImage: engine.isStreaming ? "dot.radiowaves.up.forward" : "antenna.radiowaves.left.and.right")
                     .foregroundStyle(engine.isStreaming ? .red : .primary)
             }
+            .accessibilityIdentifier("transport.stream.button")
             .help("Stream the program live to YouTube, Twitch, or any RTMP/SRT platform. Click to set up your destination.")
             .popover(isPresented: $streamPopoverShown, arrowEdge: .bottom) { streamPopover }
 
@@ -156,10 +157,12 @@ struct TransportBar: View {
             Text("Primary (RTMP)").font(.subheadline.weight(.semibold))
             TextField("RTMP URL (rtmp://…)", text: $rtmpURL)
                 .textFieldStyle(.roundedBorder)
+                .accessibilityIdentifier("transport.stream.rtmpURL.field")
                 .disabled(engine.isStreaming)
                 .help("The server/ingest URL from your streaming platform, e.g. rtmp://a.rtmp.youtube.com/live2")
             SecureField("Stream key", text: $streamKey)
                 .textFieldStyle(.roundedBorder)
+                .accessibilityIdentifier("transport.stream.key.field")
                 .disabled(engine.isStreaming)
                 .help("The private stream key from your platform. Keep it secret — anyone with it can stream to your channel.")
 
@@ -178,11 +181,13 @@ struct TransportBar: View {
                 Spacer()
                 if engine.isStreaming {
                     Button("Stop Streaming", role: .destructive) { engine.stopStream() }
+                        .accessibilityIdentifier("transport.stream.stop")
                 } else {
                     Button("Go Live") {
                         engine.goLive(rtmpURL: rtmpURL, streamKey: streamKey)
                         streamPopoverShown = false
                     }
+                    .accessibilityIdentifier("transport.stream.goLive")
                     .buttonStyle(.borderedProminent)
                     // Need a complete primary OR ≥1 enabled destination. An RTMP
                     // primary with an empty key is unpublishable (W9), so it does
@@ -217,6 +222,7 @@ struct TransportBar: View {
                       systemImage: engine.isRecording ? "stop.circle.fill" : "record.circle")
                     .foregroundStyle(engine.isRecording ? .red : .primary)
             }
+            .accessibilityIdentifier("transport.record.toggle")
             .help("Record the program to ~/Movies/Prism")
 
             if let started = engine.recordStartDate {
@@ -233,6 +239,7 @@ struct TransportBar: View {
                     .foregroundStyle(.green)
                     .help("Recording saved to ~/Movies/Prism")
                 Button("Reveal") { engine.revealLastRecording() }
+                    .accessibilityIdentifier("transport.record.reveal")
                     .controlSize(.small)
                     .help("Show the finished recording in ~/Movies/Prism in Finder")
             }
@@ -255,6 +262,7 @@ struct TransportBar: View {
                     .labelStyle(.iconOnly)
                     .foregroundStyle(engine.isoArmedSourceIDs.isEmpty ? Color.primary : .accentColor)
             }
+            .accessibilityIdentifier("transport.iso.button")
             .help(engine.isoArmedSourceIDs.isEmpty
                   ? "ISO recording — save a separate clean file per camera/source, in sync with the program. Arm sources before you press Record."
                   : "ISO recording — \(engine.isoArmedSourceIDs.count) source\(engine.isoArmedSourceIDs.count == 1 ? "" : "s") armed. A clean per-source file will record alongside the program.")
@@ -266,6 +274,7 @@ struct TransportBar: View {
                 Label("Export to Final Cut Pro", systemImage: "film.stack")
                     .labelStyle(.iconOnly)
             }
+            .accessibilityIdentifier("transport.exportFinalCut.button")
             .disabled(!engine.lastMulticamExportable)
             .help(engine.lastMulticamExportable
                   ? "Export the last multi-angle session as a Final Cut Pro multicam project"
@@ -356,6 +365,7 @@ struct TransportBar: View {
                     .labelStyle(.iconOnly)
             }
             .toggleStyle(.button)
+            .accessibilityIdentifier("transport.replay.toggle")
             .help("Instant replay — continuously buffer the last few seconds of program so you can save a replay clip at any moment.")
 
             if engine.replayArmed {
@@ -375,6 +385,7 @@ struct TransportBar: View {
                     Text("\(Int(engine.replayLengthSeconds))s · \(Int(engine.replayBufferedSeconds))s buffered")
                         .font(.caption.monospacedDigit())
                 }
+                .accessibilityIdentifier("transport.replay.length.menu")
                 .menuStyle(.borderlessButton)
                 .fixedSize()
 
@@ -384,6 +395,7 @@ struct TransportBar: View {
                     Label("Save Replay", systemImage: "square.and.arrow.down")
                         .labelStyle(.iconOnly)
                 }
+                .accessibilityIdentifier("transport.replay.save")
                 .help("Save the buffered window (with program audio) to ~/Movies/Prism/Replays and reveal it")
 
                 // "Clip that moment" (feature 3): saves just the last N seconds of
@@ -407,11 +419,13 @@ struct TransportBar: View {
                 } primaryAction: {
                     engine.clipThatMoment()
                 }
+                .accessibilityIdentifier("transport.replay.clip.menu")
                 .menuStyle(.button)
                 .fixedSize()
                 .help("Clip that moment — save the last \(Int(engine.clipLengthSeconds))s of program to ~/Movies/Prism/Clips and reveal it. Use the menu to change the window.")
             } else if engine.lastReplayURL != nil {
                 Button("Reveal Replay") { engine.revealLastReplay() }
+                    .accessibilityIdentifier("transport.replay.reveal")
                     .controlSize(.small)
                     .help("Show the last saved replay in Finder")
             }
@@ -428,6 +442,7 @@ struct TransportBar: View {
                     .labelStyle(.iconOnly)
             }
             .toggleStyle(.button)
+            .accessibilityIdentifier("transport.captions.toggle")
             .help("Live captions — transcribe the program audio on-device and composite a subtitle overlay over the program.")
 
             // Clear one-line note when the on-device captioner can't run (no
@@ -463,6 +478,7 @@ struct TransportBar: View {
                 .labelStyle(.iconOnly)
                 .foregroundStyle(engine.reactiveTrigger == .none ? .primary : Color.accentColor)
         }
+        .accessibilityIdentifier("transport.reactiveTrigger.menu")
         .menuStyle(.button)
         .help("Reactive trigger — on a loud transient, fire a strobe/meme or arm a stinger for the next scene switch. Off by default.")
     }
@@ -479,6 +495,7 @@ struct TransportBar: View {
                     .labelStyle(.iconOnly)
             }
             .toggleStyle(.button)
+            .accessibilityIdentifier("transport.vcam.toggle")
             .help("Virtual Camera — send the Prism program into Zoom, Meet, or any app as a webcam.")
 
             Button {
@@ -486,6 +503,7 @@ struct TransportBar: View {
             } label: {
                 Image(systemName: "info.circle")
             }
+            .accessibilityIdentifier("transport.vcam.info")
             .buttonStyle(.plain)
             .help("Virtual camera status & activate the system extension")
             .popover(isPresented: $vcamPopoverShown, arrowEdge: .bottom) {
@@ -496,6 +514,7 @@ struct TransportBar: View {
                     Button(engine.vcamActivationInFlight ? "Activating…" : "Activate Extension") {
                         engine.activateVirtualCameraExtension()
                     }
+                    .accessibilityIdentifier("transport.vcam.activate")
                     .disabled(engine.vcamActivationInFlight)
                 }
                 .labeledContentStyle(.automatic)
@@ -514,6 +533,7 @@ struct TransportBar: View {
                 .labelStyle(.iconOnly)
         }
         .toggleStyle(.button)
+        .accessibilityIdentifier("transport.controlServer.toggle")
         .help("Remote control server (port 4455) — lets a Stream Deck or OBS-remote app control Prism. Compatible with the obs-websocket protocol.")
     }
 
@@ -527,6 +547,7 @@ struct TransportBar: View {
                 .labelStyle(.iconOnly)
                 .foregroundStyle(broadcastCheckTint)
         }
+        .accessibilityIdentifier("transport.broadcastCheck.button")
         .help("Broadcast Check — run preflight checks (audio, disk space, network, sources) to catch problems before you go live.")
         .popover(isPresented: $broadcastCheckShown, arrowEdge: .bottom) {
             BroadcastCheckView().environmentObject(engine)
@@ -564,6 +585,7 @@ struct TransportBar: View {
                 .labelStyle(.iconOnly)
         }
         .toggleStyle(.button)
+        .accessibilityIdentifier("transport.hdr.toggle")
         .disabled(hdrLocked)
         // When locked, say WHY rather than leaving a mystery grey control (item 4).
         .help(hdrLocked
@@ -581,6 +603,7 @@ struct TransportBar: View {
                 .labelStyle(.iconOnly)
                 .foregroundStyle(engine.autoDirectorEnabled ? .green : .primary)
         }
+        .accessibilityIdentifier("transport.autoDirector.button")
         .help("Auto-Director — automatically cut the program to whichever source is most active and auto-frame it.")
         .popover(isPresented: $directorPopoverShown, arrowEdge: .bottom) {
             AutoDirectorPanel().environmentObject(engine)
@@ -597,6 +620,7 @@ struct TransportBar: View {
                 .labelStyle(.iconOnly)
                 .foregroundStyle(engine.controlSurfaceEnabled ? .green : .primary)
         }
+        .accessibilityIdentifier("transport.midi.button")
         .help("MIDI control surface — map physical knobs, faders, and buttons on a MIDI controller to Prism actions.")
         .popover(isPresented: $midiPopoverShown, arrowEdge: .bottom) {
             MIDIControlPanel().environmentObject(engine)
@@ -611,6 +635,7 @@ struct TransportBar: View {
         } label: {
             Image(systemName: "questionmark.circle")
         }
+        .accessibilityIdentifier("transport.help.button")
         .buttonStyle(.plain)
         .help("Getting Started — how to add sources, apply effects, and go live")
     }

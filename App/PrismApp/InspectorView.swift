@@ -288,6 +288,7 @@ private struct SourceInspector: View {
                         Text(name.capitalized).tag(name)
                     }
                 }
+                .accessibilityIdentifier("inspector.character.expression.picker")
                 .pickerStyle(.menu)
                 .labelsHidden()
                 .fixedSize()
@@ -297,16 +298,19 @@ private struct SourceInspector: View {
                 } label: {
                     Label("React", systemImage: "sparkles")
                 }
+                .accessibilityIdentifier("inspector.character.react")
                 .controlSize(.small)
                 .help("Play a quick impact-pop reaction")
                 Spacer()
             }
 
             Toggle("Lip-sync to program audio", isOn: $lipSyncEnabled)
+                .accessibilityIdentifier("inspector.character.lipSync.toggle")
                 .font(.caption).controlSize(.small)
                 .onChange(of: lipSyncEnabled) { engine.setCharacterLipSync(lipSyncEnabled, for: sourceID) }
                 .help("Drive the mouth from the live program loudness. No audio → the mouth follows the expression.")
             Toggle("Auto-blink", isOn: $autoBlinkEnabled)
+                .accessibilityIdentifier("inspector.character.autoBlink.toggle")
                 .font(.caption).controlSize(.small)
                 .onChange(of: autoBlinkEnabled) { engine.setCharacterAutoBlink(autoBlinkEnabled, for: sourceID) }
 
@@ -326,6 +330,7 @@ private struct SourceInspector: View {
                 set: { engine.setMovieLoop($0, for: sourceID) })) {
                 Text("Loop")
             }
+            .accessibilityIdentifier("inspector.video.loop.toggle")
             .toggleStyle(.switch)
             .controlSize(.small)
             if let size = engine.movieNativeSize(for: sourceID) {
@@ -360,6 +365,7 @@ private struct SourceInspector: View {
                 } label: {
                     Label("Auto Color", systemImage: "wand.and.stars")
                 }
+                .accessibilityIdentifier("inspector.color.auto")
                 .controlSize(.small)
                 .help("Analyze the next frame and apply a suggested grade")
 
@@ -367,6 +373,7 @@ private struct SourceInspector: View {
                     draft = .identity
                     commitGrade(immediate: true)
                 }
+                .accessibilityIdentifier("inspector.color.reset")
                 .controlSize(.small)
             }
 
@@ -382,6 +389,7 @@ private struct SourceInspector: View {
                 Label(lutName ?? "Load LUT…", systemImage: "square.stack.3d.forward.dottedline")
                     .lineLimit(1)
             }
+            .accessibilityIdentifier("inspector.color.lut.load")
             .controlSize(.small)
 
             if lutName != nil {
@@ -391,6 +399,7 @@ private struct SourceInspector: View {
                 } label: {
                     Image(systemName: "xmark.circle.fill")
                 }
+                .accessibilityIdentifier("inspector.color.lut.clear")
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
                 .help("Clear LUT")
@@ -429,6 +438,7 @@ private struct SourceInspector: View {
                     Text(kind.label).tag(kind)
                 }
             }
+            .accessibilityIdentifier("inspector.background.kind.picker")
             .pickerStyle(.menu)
             .labelsHidden()
             .fixedSize()
@@ -443,10 +453,12 @@ private struct SourceInspector: View {
                 Text("Alpha-out the background (transparent).")
                     .font(.caption).foregroundStyle(.secondary)
             case .blur:
-                labeledSlider("Radius", value: $blurRadius, in: 1...63,
+                labeledSlider("Radius", id: "inspector.background.radius.slider",
+                              value: $blurRadius, in: 1...63,
                               format: { "\(Int($0)) px" }) { commitBackground() }
             case .replace:
                 ColorPicker("Replace color", selection: $replaceColor, supportsOpacity: false)
+                    .accessibilityIdentifier("inspector.background.replaceColor.picker")
                     .onChange(of: replaceColor) { commitBackground() }
             }
         }
@@ -459,6 +471,7 @@ private struct SourceInspector: View {
             sectionHeader("Chroma Key", systemImage: "eyedropper.halffull")
 
             Toggle("Enable green/blue-screen key", isOn: $chromaEnabled)
+                .accessibilityIdentifier("inspector.chroma.enable.toggle")
                 .font(.caption)
                 .controlSize(.small)
                 .onChange(of: chromaEnabled) { commitChroma() }
@@ -466,18 +479,24 @@ private struct SourceInspector: View {
             if chromaEnabled {
                 HStack(spacing: 8) {
                     ColorPicker("Key color", selection: $chromaColor, supportsOpacity: false)
+                        .accessibilityIdentifier("inspector.chroma.color.picker")
                         .onChange(of: chromaColor) { commitChroma() }
                     Spacer()
                     Button("Green") { applyChromaPreset(.greenScreen) }
+                        .accessibilityIdentifier("inspector.chroma.preset.green")
                         .controlSize(.small)
                     Button("Blue") { applyChromaPreset(.blueScreen) }
+                        .accessibilityIdentifier("inspector.chroma.preset.blue")
                         .controlSize(.small)
                 }
-                labeledSlider("Similarity", value: $chromaSimilarity, in: 0...1,
+                labeledSlider("Similarity", id: "inspector.chroma.similarity.slider",
+                              value: $chromaSimilarity, in: 0...1,
                               format: { String(format: "%.2f", $0) }) { commitChroma() }
-                labeledSlider("Smoothness", value: $chromaSmoothness, in: 0...0.3,
+                labeledSlider("Smoothness", id: "inspector.chroma.smoothness.slider",
+                              value: $chromaSmoothness, in: 0...0.3,
                               format: { String(format: "%.2f", $0) }) { commitChroma() }
-                labeledSlider("Spill removal", value: $chromaSpill, in: 0...1,
+                labeledSlider("Spill removal", id: "inspector.chroma.spill.slider",
+                              value: $chromaSpill, in: 0...1,
                               format: { String(format: "%.2f", $0) }) { commitChroma() }
                 Text("Keys out the backdrop (transparent) — an alternative to Background → Remove.")
                     .font(.caption).foregroundStyle(.secondary)
@@ -495,6 +514,7 @@ private struct SourceInspector: View {
             sectionHeader("Luma Key", systemImage: "circle.lefthalf.filled")
 
             Toggle("Enable luminance key", isOn: $lumaEnabled)
+                .accessibilityIdentifier("inspector.luma.enable.toggle")
                 .font(.caption)
                 .controlSize(.small)
                 .onChange(of: lumaEnabled) { commitLuma() }
@@ -502,18 +522,24 @@ private struct SourceInspector: View {
             if lumaEnabled {
                 HStack(spacing: 8) {
                     Button("Bright bg") { applyLumaPreset(.brightBackground) }
+                        .accessibilityIdentifier("inspector.luma.preset.bright")
                         .controlSize(.small)
                     Button("Dark bg") { applyLumaPreset(.darkBackground) }
+                        .accessibilityIdentifier("inspector.luma.preset.dark")
                         .controlSize(.small)
                     Spacer()
                 }
-                labeledSlider("Low luma", value: $lumaLow, in: -0.01...1.01,
+                labeledSlider("Low luma", id: "inspector.luma.low.slider",
+                              value: $lumaLow, in: -0.01...1.01,
                               format: { String(format: "%.2f", $0) }) { commitLuma() }
-                labeledSlider("High luma", value: $lumaHigh, in: -0.01...1.01,
+                labeledSlider("High luma", id: "inspector.luma.high.slider",
+                              value: $lumaHigh, in: -0.01...1.01,
                               format: { String(format: "%.2f", $0) }) { commitLuma() }
-                labeledSlider("Smoothness", value: $lumaSmoothness, in: 0...0.3,
+                labeledSlider("Smoothness", id: "inspector.luma.smoothness.slider",
+                              value: $lumaSmoothness, in: 0...0.3,
                               format: { String(format: "%.2f", $0) }) { commitLuma() }
                 Toggle("Invert (keep the band, key outside it)", isOn: $lumaInvert)
+                    .accessibilityIdentifier("inspector.luma.invert.toggle")
                     .font(.caption)
                     .controlSize(.small)
                     .onChange(of: lumaInvert) { commitLuma() }
@@ -535,6 +561,7 @@ private struct SourceInspector: View {
             Toggle(isOn: $matteView) {
                 Label("View matte", systemImage: "square.on.square.dashed")
             }
+            .accessibilityIdentifier("inspector.matte.toggle")
             .font(.caption)
             .controlSize(.small)
             .onChange(of: matteView) { engine.setMatteView(matteView, for: sourceID) }
@@ -550,7 +577,8 @@ private struct SourceInspector: View {
             sectionHeader("Montage", systemImage: "rectangle.stack.badge.play")
             Text("\(engine.montageItemCount(for: sourceID)) items")
                 .font(.caption).foregroundStyle(.secondary).lineLimit(1)
-            labeledSlider("Interval", value: $montageInterval, in: 0.3...10,
+            labeledSlider("Interval", id: "inspector.montage.interval.slider",
+                          value: $montageInterval, in: 0.3...10,
                           format: { String(format: "%.1f s", $0) }) {
                 engine.reconfigureMontage(for: sourceID, interval: montageInterval)
             }
@@ -559,25 +587,30 @@ private struct SourceInspector: View {
                 Picker("", selection: $montageTransition) {
                     ForEach(AppEngine.MontageTransitionKind.allCases) { k in Text(k.label).tag(k) }
                 }
+                .accessibilityIdentifier("inspector.montage.transition.picker")
                 .pickerStyle(.menu).labelsHidden().fixedSize()
                 .onChange(of: montageTransition) { commitMontageTransition() }
                 Spacer()
             }
             if montageTransition == .crossfade {
-                labeledSlider("Fade", value: $montageCrossfade, in: 0.1...2,
+                labeledSlider("Fade", id: "inspector.montage.fade.slider",
+                              value: $montageCrossfade, in: 0.1...2,
                               format: { String(format: "%.1f s", $0) }) { commitMontageTransition() }
             }
             Toggle("Ken Burns pan/zoom", isOn: $montageKenBurns)
+                .accessibilityIdentifier("inspector.montage.kenBurns.toggle")
                 .font(.caption).controlSize(.small)
                 .onChange(of: montageKenBurns) {
                     engine.reconfigureMontage(for: sourceID, kenBurns: montageKenBurns)
                 }
             Toggle("Shuffle order", isOn: $montageShuffle)
+                .accessibilityIdentifier("inspector.montage.shuffle.toggle")
                 .font(.caption).controlSize(.small)
                 .onChange(of: montageShuffle) {
                     engine.reconfigureMontage(for: sourceID, shuffle: montageShuffle)
                 }
             Toggle("Cut on beat", isOn: $montageCutOnBeat)
+                .accessibilityIdentifier("inspector.montage.cutOnBeat.toggle")
                 .font(.caption).controlSize(.small)
                 .onChange(of: montageCutOnBeat) {
                     engine.setMontageCutOnBeat(montageCutOnBeat, for: sourceID)
@@ -587,6 +620,7 @@ private struct SourceInspector: View {
                     Text("Cut every \(montageCutEvery) beat\(montageCutEvery == 1 ? "" : "s")")
                         .font(.caption).lineLimit(1)
                 }
+                .accessibilityIdentifier("inspector.montage.cutEvery.stepper")
                 .controlSize(.small)
                 .onChange(of: montageCutEvery) {
                     engine.setMontageCutEveryBeats(montageCutEvery, for: sourceID)
@@ -612,6 +646,7 @@ private struct SourceInspector: View {
         VStack(alignment: .leading, spacing: 8) {
             sectionHeader("Tiles / Grid", systemImage: "square.grid.3x3")
             Toggle("Enable tile grid", isOn: $tileEnabled)
+                .accessibilityIdentifier("inspector.tile.enable.toggle")
                 .font(.caption).controlSize(.small)
                 .onChange(of: tileEnabled) { commitTile() }
 
@@ -622,6 +657,7 @@ private struct SourceInspector: View {
                     Picker("", selection: $tileMode) {
                         ForEach(TileGridMode.allCases) { m in Text(m.label).tag(m) }
                     }
+                    .accessibilityIdentifier("inspector.tile.mode.picker")
                     .pickerStyle(.menu).labelsHidden().fixedSize()
                     .onChange(of: tileMode) { commitTile() }
                     Spacer()
@@ -634,6 +670,7 @@ private struct SourceInspector: View {
                                 Text(d.rawValue.capitalized).tag(d)
                             }
                         }
+                        .accessibilityIdentifier("inspector.tile.direction.picker")
                         .pickerStyle(.menu).labelsHidden().fixedSize()
                         .onChange(of: tileDirection) { commitTile() }
                         Spacer()
@@ -642,26 +679,32 @@ private struct SourceInspector: View {
                 Stepper(value: $tileRows, in: 1...64) {
                     Text("Rows: \(tileRows)").font(.caption).lineLimit(1)
                 }
+                .accessibilityIdentifier("inspector.tile.rows.stepper")
                 .controlSize(.small)
                 .onChange(of: tileRows) { commitTile() }
                 Stepper(value: $tileCols, in: 1...64) {
                     Text("Columns: \(tileCols)").font(.caption).lineLimit(1)
                 }
+                .accessibilityIdentifier("inspector.tile.cols.stepper")
                 .controlSize(.small)
                 .onChange(of: tileCols) { commitTile() }
-                labeledSlider("Softness", value: $tileSoftness, in: 0...1,
+                labeledSlider("Softness", id: "inspector.tile.softness.slider",
+                              value: $tileSoftness, in: 0...1,
                               format: { String(format: "%.2f", $0) }) { commitTile() }
                 Toggle("Sync to beat", isOn: $tileSyncToBeat)
+                    .accessibilityIdentifier("inspector.tile.syncToBeat.toggle")
                     .font(.caption).controlSize(.small)
                     .onChange(of: tileSyncToBeat) { commitTile() }
                 if tileSyncToBeat {
-                    labeledSlider("Flips/beat", value: $tileFlipsPerBeat, in: 0.25...8,
+                    labeledSlider("Flips/beat", id: "inspector.tile.flipsPerBeat.slider",
+                                  value: $tileFlipsPerBeat, in: 0.25...8,
                                   format: { String(format: "%.2f×", $0) }) { commitTile() }
                     Text("Tiles flip on the beat while the beat maker plays; free-runs at the Speed above when stopped.")
                         .font(.caption).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 } else {
-                    labeledSlider("Speed", value: $tileSpeed, in: 0.1...5,
+                    labeledSlider("Speed", id: "inspector.tile.speed.slider",
+                                  value: $tileSpeed, in: 0.1...5,
                                   format: { String(format: "%.2f×", $0) }) { commitTile() }
                 }
                 if tileMode.usesSeed {
@@ -671,6 +714,7 @@ private struct SourceInspector: View {
                     } label: {
                         Label("Randomize pattern", systemImage: "die.face.5")
                     }
+                    .accessibilityIdentifier("inspector.tile.randomize")
                     .controlSize(.small)
                 }
                 Text("Punches animated holes so the layer BELOW shows through — add this over another layer.")
@@ -705,6 +749,7 @@ private struct SourceInspector: View {
         VStack(alignment: .leading, spacing: 8) {
             sectionHeader("Video Wall (grid)", systemImage: "square.grid.2x2")
             Toggle("Tile this source into a grid", isOn: $wallEnabled)
+                .accessibilityIdentifier("inspector.wall.enable.toggle")
                 .font(.caption).controlSize(.small)
                 .onChange(of: wallEnabled) { commitWall() }
 
@@ -712,14 +757,17 @@ private struct SourceInspector: View {
                 Stepper(value: $wallRows, in: 1...16) {
                     Text("Rows: \(wallRows)").font(.caption).lineLimit(1)
                 }
+                .accessibilityIdentifier("inspector.wall.rows.stepper")
                 .controlSize(.small)
                 .onChange(of: wallRows) { commitWall() }
                 Stepper(value: $wallCols, in: 1...16) {
                     Text("Columns: \(wallCols)").font(.caption).lineLimit(1)
                 }
+                .accessibilityIdentifier("inspector.wall.cols.stepper")
                 .controlSize(.small)
                 .onChange(of: wallCols) { commitWall() }
                 Toggle("Mirror (kaleidoscope)", isOn: $wallMirror)
+                    .accessibilityIdentifier("inspector.wall.mirror.toggle")
                     .font(.caption).controlSize(.small)
                     .onChange(of: wallMirror) { commitWall() }
             } else {
@@ -742,6 +790,7 @@ private struct SourceInspector: View {
         VStack(alignment: .leading, spacing: 8) {
             sectionHeader("Beat Pulse", systemImage: "waveform.path.ecg")
             Toggle("Pulse on beat", isOn: $pulseEnabled)
+                .accessibilityIdentifier("inspector.pulse.enable.toggle")
                 .font(.caption).controlSize(.small)
                 .onChange(of: pulseEnabled) { commitPulse() }
 
@@ -754,11 +803,13 @@ private struct SourceInspector: View {
                             Text(pulseStyleLabel(s)).tag(s)
                         }
                     }
+                    .accessibilityIdentifier("inspector.pulse.style.picker")
                     .pickerStyle(.menu).labelsHidden().fixedSize()
                     .onChange(of: pulseStyle) { commitPulse() }
                     Spacer()
                 }
-                labeledSlider("Intensity", value: $pulseIntensity, in: 0...2,
+                labeledSlider("Intensity", id: "inspector.pulse.intensity.slider",
+                              value: $pulseIntensity, in: 0...2,
                               format: { String(format: "%.2f", $0) }) { commitPulse() }
                 Text("Layer booms/shakes on each beat while the beat maker plays; rests untouched when stopped.")
                     .font(.caption).foregroundStyle(.secondary)
@@ -799,18 +850,21 @@ private struct SourceInspector: View {
             // CTA label for the subscribe bug; the countdown needs no text).
             if overlayKind == .lowerThird || overlayKind == .nameTag {
                 TextField("Name", text: $overlayName)
+                    .accessibilityIdentifier("inspector.overlay.name.field")
                     .textFieldStyle(.roundedBorder).lineLimit(1)
                     .onSubmit(commitOverlay)
                     .onChange(of: overlayName) { commitOverlay() }
             }
             if overlayKind == .lowerThird {
                 TextField("Subtitle", text: $overlaySubtitle)
+                    .accessibilityIdentifier("inspector.overlay.subtitle.field")
                     .textFieldStyle(.roundedBorder).lineLimit(1)
                     .onSubmit(commitOverlay)
                     .onChange(of: overlaySubtitle) { commitOverlay() }
             }
             if overlayKind == .subscribeBug {
                 TextField("Label", text: $overlayCTA)
+                    .accessibilityIdentifier("inspector.overlay.cta.field")
                     .textFieldStyle(.roundedBorder).lineLimit(1)
                     .onSubmit(commitOverlay)
                     .onChange(of: overlayCTA) { commitOverlay() }
@@ -819,6 +873,7 @@ private struct SourceInspector: View {
                 Stepper(value: $overlayCountdown, in: 1...600) {
                     Text("Start at \(overlayCountdown)s").font(.caption).lineLimit(1)
                 }
+                .accessibilityIdentifier("inspector.overlay.countdown.stepper")
                 .controlSize(.small)
                 .onChange(of: overlayCountdown) { commitOverlay() }
             }
@@ -831,19 +886,24 @@ private struct SourceInspector: View {
                         Text(cornerLabel(c)).tag(c)
                     }
                 }
+                .accessibilityIdentifier("inspector.overlay.corner.picker")
                 .pickerStyle(.menu).labelsHidden().fixedSize()
                 .onChange(of: overlayCorner) { commitOverlay() }
                 Spacer()
             }
             ColorPicker("Accent", selection: $overlayAccent, supportsOpacity: false)
+                .accessibilityIdentifier("inspector.overlay.accent.picker")
                 .onChange(of: overlayAccent) { commitOverlay() }
 
             // Entrance timing (slide-in / hold / slide-out), driven live off the clock.
-            labeledSlider("Slide in", value: $overlayIn, in: 0.1...3,
+            labeledSlider("Slide in", id: "inspector.overlay.slideIn.slider",
+                          value: $overlayIn, in: 0.1...3,
                           format: { String(format: "%.1f s", $0) }) { commitOverlay() }
-            labeledSlider("Hold", value: $overlayHold, in: 0...30,
+            labeledSlider("Hold", id: "inspector.overlay.hold.slider",
+                          value: $overlayHold, in: 0...30,
                           format: { String(format: "%.1f s", $0) }) { commitOverlay() }
-            labeledSlider("Slide out", value: $overlayOut, in: 0.1...3,
+            labeledSlider("Slide out", id: "inspector.overlay.slideOut.slider",
+                          value: $overlayOut, in: 0.1...3,
                           format: { String(format: "%.1f s", $0) }) { commitOverlay() }
 
             Button {
@@ -851,6 +911,7 @@ private struct SourceInspector: View {
             } label: {
                 Label("Play / Replay", systemImage: "play.circle")
             }
+            .accessibilityIdentifier("inspector.overlay.replay")
             .controlSize(.small)
             .help("Replay the slide-in / hold / slide-out from the start")
             Text("Animated broadcast overlay — the entrance plays live off the house clock.")
@@ -893,6 +954,7 @@ private struct SourceInspector: View {
                 Picker("", selection: $logoConfig.entrance) {
                     ForEach(LogoEntranceChoice.allCases) { c in Text(c.label).tag(c) }
                 }
+                .accessibilityIdentifier("inspector.logo.entrance.picker")
                 .pickerStyle(.menu).labelsHidden().fixedSize()
                 .onChange(of: logoConfig.entrance) { commitLogo() }
                 Spacer()
@@ -902,6 +964,7 @@ private struct SourceInspector: View {
                 Picker("", selection: $logoConfig.idle) {
                     ForEach(LogoIdle.allCases, id: \.self) { i in Text(i.rawValue.capitalized).tag(i) }
                 }
+                .accessibilityIdentifier("inspector.logo.idle.picker")
                 .pickerStyle(.menu).labelsHidden().fixedSize()
                 .onChange(of: logoConfig.idle) { commitLogo() }
                 Spacer()
@@ -911,17 +974,22 @@ private struct SourceInspector: View {
                 Picker("", selection: $logoConfig.anchor) {
                     ForEach(LogoAnchor.allCases, id: \.self) { a in Text(anchorLabel(a)).tag(a) }
                 }
+                .accessibilityIdentifier("inspector.logo.corner.picker")
                 .pickerStyle(.menu).labelsHidden().fixedSize()
                 .onChange(of: logoConfig.anchor) { commitLogo() }
                 Spacer()
             }
-            labeledSlider("Size", value: $logoConfig.sizeFraction, in: 0.05...0.5,
+            labeledSlider("Size", id: "inspector.logo.size.slider",
+                          value: $logoConfig.sizeFraction, in: 0.05...0.5,
                           format: { String(format: "%.0f%%", $0 * 100) }) { commitLogo() }
-            labeledSlider("Slide in", value: $logoConfig.inSec, in: 0.1...3,
+            labeledSlider("Slide in", id: "inspector.logo.slideIn.slider",
+                          value: $logoConfig.inSec, in: 0.1...3,
                           format: { String(format: "%.1f s", $0) }) { commitLogo() }
-            labeledSlider("Hold", value: $logoConfig.holdSec, in: 0...30,
+            labeledSlider("Hold", id: "inspector.logo.hold.slider",
+                          value: $logoConfig.holdSec, in: 0...30,
                           format: { String(format: "%.1f s", $0) }) { commitLogo() }
-            labeledSlider("Slide out", value: $logoConfig.outSec, in: 0.1...3,
+            labeledSlider("Slide out", id: "inspector.logo.slideOut.slider",
+                          value: $logoConfig.outSec, in: 0.1...3,
                           format: { String(format: "%.1f s", $0) }) { commitLogo() }
 
             Button {
@@ -929,6 +997,7 @@ private struct SourceInspector: View {
             } label: {
                 Label("Play / Replay", systemImage: "play.circle")
             }
+            .accessibilityIdentifier("inspector.logo.replay")
             .controlSize(.small)
             .help("Replay the entrance from the start")
             Text("Animated logo overlay — entrance plays live, then idles (float / pulse / shimmer / sway).")
@@ -955,9 +1024,11 @@ private struct SourceInspector: View {
         VStack(alignment: .leading, spacing: 8) {
             sectionHeader("Ticker", systemImage: "text.line.first.and.arrowtriangle.forward")
             TextField("Crawl text", text: $tickerText, axis: .vertical)
+                .accessibilityIdentifier("inspector.ticker.text.field")
                 .textFieldStyle(.roundedBorder).lineLimit(1...3)
                 .onChange(of: tickerText) { commitTicker() }
-            labeledSlider("Speed", value: $tickerSpeed, in: 20...500,
+            labeledSlider("Speed", id: "inspector.ticker.speed.slider",
+                          value: $tickerSpeed, in: 20...500,
                           format: { String(format: "%.0f px/s", $0) }) { commitTicker() }
             HStack(spacing: 8) {
                 Text("Position").font(.caption)
@@ -965,11 +1036,13 @@ private struct SourceInspector: View {
                     Text("Bottom").tag(TickerPosition.bottom)
                     Text("Top").tag(TickerPosition.top)
                 }
+                .accessibilityIdentifier("inspector.ticker.position.picker")
                 .pickerStyle(.menu).labelsHidden().fixedSize()
                 .onChange(of: tickerPosition) { commitTicker() }
                 Spacer()
             }
             ColorPicker("Accent", selection: $tickerAccent, supportsOpacity: false)
+                .accessibilityIdentifier("inspector.ticker.accent.picker")
                 .onChange(of: tickerAccent) { commitTicker() }
             Text("A news crawl scrolling right→left; the text updates live.")
                 .font(.caption).foregroundStyle(.secondary).lineLimit(1)
@@ -991,9 +1064,11 @@ private struct SourceInspector: View {
     private var creditsSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             sectionHeader("Credits", systemImage: "list.bullet.rectangle")
-            labeledSlider("Speed", value: $creditsSpeed, in: 20...400,
+            labeledSlider("Speed", id: "inspector.credits.speed.slider",
+                          value: $creditsSpeed, in: 20...400,
                           format: { String(format: "%.0f px/s", $0) }) { commitCredits() }
             Toggle("Loop", isOn: $creditsLoop)
+                .accessibilityIdentifier("inspector.credits.loop.toggle")
                 .toggleStyle(.switch).controlSize(.small)
                 .onChange(of: creditsLoop) { commitCredits() }
             Text("A vertical credits roll (bottom→top). Loop repeats it seamlessly.")
@@ -1022,11 +1097,13 @@ private struct SourceInspector: View {
                         Text(revealStyleLabel(style)).tag(TextRevealStyle?.some(style))
                     }
                 }
+                .accessibilityIdentifier("inspector.textReveal.style.picker")
                 .pickerStyle(.menu).labelsHidden().fixedSize()
                 .onChange(of: textRevealStyle) { engine.setTextRevealStyle(textRevealStyle, for: sourceID) }
                 Spacer()
             }
-            labeledSlider("Duration", value: $textRevealDuration, in: 0.3...4,
+            labeledSlider("Duration", id: "inspector.textReveal.duration.slider",
+                          value: $textRevealDuration, in: 0.3...4,
                           format: { String(format: "%.1f s", $0) }) {
                 engine.setTextRevealDuration(textRevealDuration, for: sourceID)
             }
@@ -1037,6 +1114,7 @@ private struct SourceInspector: View {
             } label: {
                 Label("Play / Replay", systemImage: "play.circle")
             }
+            .accessibilityIdentifier("inspector.textReveal.replay")
             .controlSize(.small)
             .disabled(textRevealStyle == nil)
             .help("Replay the reveal animation from the start")
@@ -1065,12 +1143,14 @@ private struct SourceInspector: View {
                 Picker("", selection: $motionKind) {
                     ForEach(LayerMotionKind.allCases) { k in Text(k.label).tag(k) }
                 }
+                .accessibilityIdentifier("inspector.motion.path.picker")
                 .pickerStyle(.menu).labelsHidden().fixedSize()
                 .onChange(of: motionKind) { commitMotion() }
                 Spacer()
             }
             if motionKind != .none {
-                labeledSlider("Speed", value: $motionSpeed, in: 0.1...4,
+                labeledSlider("Speed", id: "inspector.motion.speed.slider",
+                              value: $motionSpeed, in: 0.1...4,
                               format: { String(format: "%.2f×", $0) }) { commitMotion() }
             }
             Text("Animate this layer along a path each frame — glide, orbit, bounce, or float.")
@@ -1089,17 +1169,21 @@ private struct SourceInspector: View {
         VStack(alignment: .leading, spacing: 8) {
             sectionHeader("Remove Background", systemImage: "person.and.background.dotted")
             Toggle("Cut me out (person over the layers below)", isOn: $cutoutEnabled)
+                .accessibilityIdentifier("inspector.cutout.enable.toggle")
                 .font(.caption).controlSize(.small)
                 .onChange(of: cutoutEnabled) { commitCutout() }
 
             if cutoutEnabled {
-                labeledSlider("Feather", value: $cutoutFeather, in: 0...64,
+                labeledSlider("Feather", id: "inspector.cutout.feather.slider",
+                              value: $cutoutFeather, in: 0...64,
                               format: { "\(Int($0)) px" }) { commitCutout() }
                 Toggle("Fill with a solid color", isOn: $cutoutSolid)
+                    .accessibilityIdentifier("inspector.cutout.solid.toggle")
                     .font(.caption).controlSize(.small)
                     .onChange(of: cutoutSolid) { commitCutout() }
                 if cutoutSolid {
                     ColorPicker("Background color", selection: $cutoutColor, supportsOpacity: false)
+                        .accessibilityIdentifier("inspector.cutout.color.picker")
                         .onChange(of: cutoutColor) { commitCutout() }
                 }
                 Text("Segments the person and drops the background — transparent (composite over the layers beneath) or a solid fill.")
@@ -1128,19 +1212,24 @@ private struct SourceInspector: View {
         VStack(alignment: .leading, spacing: 8) {
             sectionHeader("Strobe / Flash", systemImage: "bolt.fill")
             Toggle("Enable strobe", isOn: $strobeEnabled)
+                .accessibilityIdentifier("inspector.strobe.enable.toggle")
                 .font(.caption).controlSize(.small)
                 .onChange(of: strobeEnabled) { commitStrobe() }
 
             if strobeEnabled {
-                labeledSlider("Intensity", value: $strobeIntensity, in: 0...1,
+                labeledSlider("Intensity", id: "inspector.strobe.intensity.slider",
+                              value: $strobeIntensity, in: 0...1,
                               format: { String(format: "%.2f", $0) }) { commitStrobe() }
                 ColorPicker("Flash color", selection: $strobeColor, supportsOpacity: false)
+                    .accessibilityIdentifier("inspector.strobe.color.picker")
                     .onChange(of: strobeColor) { commitStrobe() }
                 Toggle("Sync to beat", isOn: $strobeSyncToBeat)
+                    .accessibilityIdentifier("inspector.strobe.syncToBeat.toggle")
                     .font(.caption).controlSize(.small)
                     .onChange(of: strobeSyncToBeat) { commitStrobe() }
                 if !strobeSyncToBeat {
-                    labeledSlider("Rate", value: $strobeRate, in: 0.5...20,
+                    labeledSlider("Rate", id: "inspector.strobe.rate.slider",
+                                  value: $strobeRate, in: 0.5...20,
                                   format: { String(format: "%.1f Hz", $0) }) { commitStrobe() }
                 }
                 Text("Flashes on the beat while the beat maker plays; free-runs at the Rate when off or stopped.")
@@ -1174,6 +1263,8 @@ private struct SourceInspector: View {
     }
 
     /// A grade slider with a live numeric readout; writes are debounced.
+    /// Accessibility id derived from the (unique) grade-parameter title, e.g.
+    /// `inspector.color.exposure.slider`.
     private func gradeSlider(_ title: String, value: Binding<Double>,
                              in range: ClosedRange<Double>, identity: Double) -> some View {
         VStack(alignment: .leading, spacing: 1) {
@@ -1187,11 +1278,12 @@ private struct SourceInspector: View {
             Slider(value: value, in: range) { editing in
                 if !editing { commitGrade(immediate: true) }
             }
+            .accessibilityIdentifier("inspector.color.\(title.lowercased()).slider")
             .onChange(of: value.wrappedValue) { commitGrade() }
         }
     }
 
-    private func labeledSlider(_ title: String, value: Binding<Double>,
+    private func labeledSlider(_ title: String, id: String, value: Binding<Double>,
                                in range: ClosedRange<Double>,
                                format: @escaping (Double) -> String,
                                onCommit: @escaping () -> Void) -> some View {
@@ -1202,7 +1294,9 @@ private struct SourceInspector: View {
                 Text(format(value.wrappedValue))
                     .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
             }
-            Slider(value: value, in: range).onChange(of: value.wrappedValue) { onCommit() }
+            Slider(value: value, in: range)
+                .accessibilityIdentifier(id)
+                .onChange(of: value.wrappedValue) { onCommit() }
         }
     }
 
@@ -1216,19 +1310,20 @@ private struct SourceInspector: View {
                 Text(title).font(.caption.weight(.medium))
                 Text("· \(plain)").font(.caption).foregroundStyle(.secondary)
             }
-            channelSlider("R", value: triple.red, in: range, tint: .red)
-            channelSlider("G", value: triple.green, in: range, tint: .green)
-            channelSlider("B", value: triple.blue, in: range, tint: .blue)
+            channelSlider("R", group: title, value: triple.red, in: range, tint: .red)
+            channelSlider("G", group: title, value: triple.green, in: range, tint: .green)
+            channelSlider("B", group: title, value: triple.blue, in: range, tint: .blue)
         }
     }
 
-    private func channelSlider(_ label: String, value: Binding<Double>,
+    private func channelSlider(_ label: String, group: String, value: Binding<Double>,
                                in range: ClosedRange<Double>, tint: Color) -> some View {
         HStack(spacing: 6) {
             Text(label).font(.caption2.monospaced()).foregroundStyle(tint).frame(width: 10)
             Slider(value: value, in: range) { editing in
                 if !editing { commitGrade(immediate: true) }
             }
+            .accessibilityIdentifier("inspector.color.\(group.lowercased()).\(label.lowercased()).slider")
             .onChange(of: value.wrappedValue) { commitGrade() }
             .tint(tint)
         }

@@ -34,6 +34,9 @@ public final class AudioMixer: @unchecked Sendable {
         public var ringSeconds: Double = 0.5
         /// Master tap granularity in frames.
         public var tapBufferFrames: AVAudioFrameCount = 1024
+        /// Maximum silence synthesized to place a channel's first packet in the
+        /// future. The actual lead is also limited by that channel's fixed ring.
+        public var maximumInitialAlignmentSeconds: Double = 1.0
 
         public init() {}
     }
@@ -111,6 +114,7 @@ public final class AudioMixer: @unchecked Sendable {
     private let masterPeak = OSAllocatedUnfairLock<Float>(initialState: 0)
     private let masterLoudness = OSAllocatedUnfairLock<LoudnessMeter?>(initialState: nil)
     private let log = EngineLog.logger("audio.mixer")
+    private let timeline: MixerTimeline
 
     private var running = false
     private var manualMode = false
@@ -127,6 +131,7 @@ public final class AudioMixer: @unchecked Sendable {
             preconditionFailure("AVAudioFormat rejected \(configuration.sampleRate) Hz / \(configuration.channelCount) ch")
         }
         self.internalFormat = format
+        self.timeline = MixerTimeline(sampleRate: configuration.sampleRate)
 
         // Scratch for interleaving master-tap buffers (tap thread, no per-callback allocation).
         let scratchFrames = Int(configuration.tapBufferFrames) * 4
@@ -151,9 +156,17 @@ public final class AudioMixer: @unchecked Sendable {
     @discardableResult
     public func addChannel(id: SourceID, format: AVAudioFormat? = nil) throws -> MixerChannel {
         let ringFrames = max(Int(configuration.sampleRate * configuration.ringSeconds), 4800)
+        let configuredAlignmentFrames = configuration.maximumInitialAlignmentSeconds.isFinite
+            ? max(0, configuration.maximumInitialAlignmentSeconds * configuration.sampleRate)
+            : 0
+        // Clamp in Double space to the already-bounded ring before converting;
+        // even an extreme finite configuration cannot overflow Int here.
+        let maximumAlignmentFrames = Int(min(Double(ringFrames), configuredAlignmentFrames))
         let channel = MixerChannel(id: id,
                                    internalFormat: internalFormat,
                                    ringCapacityFrames: ringFrames,
+                                   maximumInitialAlignmentFrames: maximumAlignmentFrames,
+                                   timeline: timeline,
                                    soloState: soloState)
         _ = format // expected-format hint; converters build lazily on first mismatched packet
 
@@ -221,6 +234,7 @@ public final class AudioMixer: @unchecked Sendable {
     public func start() throws {
         guard !running else { return }
         manualMode = false
+        timeline.beginRun(manual: false)
         try installMasterTap()
         engine.prepare()
         do {
@@ -239,6 +253,7 @@ public final class AudioMixer: @unchecked Sendable {
         guard !running else { return }
         manualMode = true
         manualSampleTime = 0
+        timeline.beginRun(manual: true)
         try engine.enableManualRenderingMode(.offline, format: internalFormat,
                                              maximumFrameCount: maximumFrameCount)
         try installMasterTap()
@@ -271,6 +286,7 @@ public final class AudioMixer: @unchecked Sendable {
             throw PrismAudioError.invalidState("renderOffline returned \(String(describing: status))")
         }
         manualSampleTime += Int64(frameCount)
+        timeline.publishManualRenderCompleted(manualSampleTime)
         return buffer
     }
 
@@ -283,6 +299,10 @@ public final class AudioMixer: @unchecked Sendable {
             manualMode = false
         }
         running = false
+        timeline.reset()
+        for channel in channelsLock.withLock({ Array($0.values) }) {
+            channel.resetForMixerRestart()
+        }
         log.info("mixer stopped")
     }
 
@@ -311,6 +331,7 @@ public final class AudioMixer: @unchecked Sendable {
         let frames = Int(buffer.frameLength)
         guard frames > 0, let channels = buffer.floatChannelData else { return }
         let channelCount = Int(buffer.format.channelCount)
+        let masterTiming = timeline.observeMasterRender(when: when, frameCount: frames)
 
         // Master peak meter.
         var framePeak: Float = 0
@@ -340,10 +361,17 @@ public final class AudioMixer: @unchecked Sendable {
             for f in 0..<frames { interleaveScratch[f * channelCount + ch] = data[f] }
         }
 
-        // House PTS: host time when available (live mode — this *is* house time);
-        // manual mode has no host time, so PTS counts samples from render start.
+        // Project the master render position through the shared mixer epoch.
+        // In manual mode the first input packet lazily establishes that epoch.
         let pts: CMTime
-        if when.isHostTimeValid {
+        if let mappedPTS = masterTiming.pts {
+            pts = mappedPTS
+        } else if manualMode {
+            // Until an input establishes the manual PTS epoch, publishing
+            // sample-time fallback packets would make the later epoch switch
+            // discontinuous. Keep metering/rendering, but withhold program PCM.
+            return
+        } else if when.isHostTimeValid {
             pts = CMClockMakeHostTimeFromSystemUnits(when.hostTime)
         } else if when.isSampleTimeValid {
             pts = CMTime(value: CMTimeValue(when.sampleTime), timescale: CMTimeScale(when.sampleRate.rounded()))

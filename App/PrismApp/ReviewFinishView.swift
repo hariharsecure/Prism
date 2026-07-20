@@ -56,6 +56,7 @@ struct ReviewFinishView: View {
             } label: {
                 Label("Turn on Director's Cut", systemImage: "wand.and.stars")
             }
+            .accessibilityIdentifier("review.directorsCut.enable")
             .buttonStyle(.borderedProminent)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -169,8 +170,10 @@ private struct QueueRow: View {
             if candidate.hasFinishableAsset
                 && candidate.state != .approved && candidate.state != .rejected {
                 Button(action: onApprove) { Image(systemName: "checkmark.circle") }
+                    .accessibilityIdentifier("review.queue.approve")
                     .buttonStyle(.plain).foregroundStyle(.green).help("Approve for export")
                 Button(action: onReject) { Image(systemName: "xmark.circle") }
+                    .accessibilityIdentifier("review.queue.reject")
                     .buttonStyle(.plain).foregroundStyle(.red).help("Reject")
             }
         }
@@ -274,6 +277,7 @@ private struct CandidateDetail: View {
                         Text(a == .horizontal ? "16:9 horizontal" : "9:16 vertical").tag(a)
                     }
                 }
+                .accessibilityIdentifier("review.detail.aspect.picker")
                 .pickerStyle(.menu).labelsHidden().frame(width: 180)
             if candidate.variantURL(candidate.effectiveAspect) == nil {
                 Text("no \(candidate.effectiveAspect.label) variant")
@@ -296,9 +300,11 @@ private struct CandidateDetail: View {
             Slider(value: $trimIn, in: candidate.windowStart...candidate.windowEnd) { editing in
                 if !editing { commitTrim() }
             }
+            .accessibilityIdentifier("review.detail.trimIn.slider")
             Slider(value: $trimOut, in: candidate.windowStart...candidate.windowEnd) { editing in
                 if !editing { commitTrim() }
             }
+            .accessibilityIdentifier("review.detail.trimOut.slider")
         }
         .onAppear { syncLocal() }
         .onChange(of: candidate.id) { _ in syncLocal() }
@@ -319,10 +325,12 @@ private struct CandidateDetail: View {
                     set: { model.setCaptionStyle(id: candidate.id, style: $0) })) {
                         ForEach(HighlightCaptionStyle.allCases) { s in Text(s.label).tag(s) }
                     }
+                    .accessibilityIdentifier("review.detail.captionStyle.picker")
                     .pickerStyle(.menu).labelsHidden().frame(width: 130)
                 Spacer()
             }
             TextField("Correct the burned caption…", text: $captionText, axis: .vertical)
+                .accessibilityIdentifier("review.detail.caption.field")
                 .textFieldStyle(.roundedBorder).lineLimit(1...3)
                 .onSubmit { model.setCaption(id: candidate.id, text: captionText) }
                 .onChange(of: candidate.id) { _ in captionText = candidate.captionText ?? "" }
@@ -341,6 +349,7 @@ private struct CandidateDetail: View {
                 } label: {
                     Label("Approve", systemImage: "checkmark.circle")
                 }
+                .accessibilityIdentifier("review.detail.approve")
                 .disabled(!candidate.hasFinishableAsset)
                 .help(candidate.hasFinishableAsset ? "Approve this clip for export" : "No finished clip to approve yet")
             }
@@ -354,6 +363,7 @@ private struct CandidateDetail: View {
             } label: {
                 Label("Export…", systemImage: "square.and.arrow.up")
             }
+            .accessibilityIdentifier("review.detail.export")
             .buttonStyle(.borderedProminent)
             .disabled(candidate.state != .approved)
             .help("Share the approved clip (no auto-posting)")
@@ -365,6 +375,7 @@ private struct CandidateDetail: View {
             } label: {
                 Image(systemName: "folder")
             }
+            .accessibilityIdentifier("review.detail.revealInFinder")
             .disabled(candidate.state != .approved)
             .help("Reveal the approved clip in Finder")
         }
