@@ -677,6 +677,32 @@ final class AppEngine: ObservableObject {
     /// companion file name when the vertical recorder starts).
     private var currentRecordingBaseURL: URL?
 
+    // MARK: Studio mode (preview program + hard-cut TAKE — Phase 3a Stage 1)
+
+    /// Second full composite of the SAME per-tick source frames at the program
+    /// canvas size, rendered from `previewScene` (nil only if Metal init failed).
+    /// Fed from the same render-loop tick snapshot as `dualProgram`; its own
+    /// compositor/queue run concurrently with the primary and it delivers ONLY to
+    /// `previewSink` (a preview-only store) — it NEVER touches `fanOut`, so an
+    /// off-air preview edit can never reach the live program/recorder/stream/vcam.
+    ///
+    /// `var` (not `let`) so `setHDREnabled` can REBUILD it in the matching
+    /// `ColorMode` alongside the primary + vertical programs.
+    private var previewProgram: PreviewProgram?
+    /// The dynamic range the preview program currently composites in (nil if there
+    /// is no preview program). Test-visible so HDR parity can be asserted.
+    var previewProgramColorMode: MetalCompositor.ColorMode? { previewProgram?.colorMode }
+    /// Preview program-frame consumer: an off-air preview store ONLY (no recorder,
+    /// no vcam, no fan-out).
+    private let previewSink = PreviewProgramSink()
+    /// The preview store the studio preview monitor pulls from (Stage 3 UI).
+    var previewProgramStore: ProgramPreviewStore { previewSink.preview }
+    /// Thread-safe mirror of `studioMode` for the render-thread tick closure to
+    /// gate preview feeding without touching main-actor state — so when studio
+    /// mode is OFF the preview program is never submitted a frame (zero cost,
+    /// exactly like the vertical program's `verticalTap.enabled` gate).
+    private let studioActive = OSAllocatedUnfairLock<Bool>(initialState: false)
+
     // Discovery & transport
     private let deviceManager = CaptureDeviceManager()
     private let linkServer: LinkServer
@@ -835,6 +861,49 @@ final class AppEngine: ObservableObject {
         }
     }
     @Published private(set) var selectedPreset: ScenePreset = .fullscreen
+
+    // MARK: Studio mode — off-air preview scene (Phase 3a Stage 1)
+
+    /// Studio mode: when ON, layer/scene edits target `previewScene` (off-air)
+    /// instead of the live `scene`, and `take()` hard-cuts preview → program.
+    /// **DEFAULT OFF** — while false, EVERY edit path routes to `scene` exactly as
+    /// before (no behavior change, no regression). Only the operator turns it on.
+    @Published var studioMode = false {
+        didSet {
+            guard studioMode != oldValue else { return }
+            let active = studioMode // local: the lock's closure is @Sendable
+            studioActive.withLock { $0 = active }
+            if studioMode {
+                // Entering studio mode: seed the preview with the current live
+                // program so the operator edits from what is on-air right now.
+                previewScene = scene
+                previewProgram?.scene = previewScene
+            }
+        }
+    }
+
+    /// The scene the current layer/scene edit targets: `previewScene` (off-air)
+    /// while `studioMode` is on, else the live `scene`. This is the edit-routing
+    /// SEAM — every layer mutator reads/writes through it, so when studioMode is
+    /// OFF the setter falls straight through to `scene` and the path is
+    /// byte-identical to today (no regression). When ON, edits divert to
+    /// `previewScene` and the live program is never touched.
+    private var editScene: ProgramScene {
+        get { studioMode ? previewScene : scene }
+        set {
+            if studioMode { previewScene = newValue }
+            else { scene = newValue }
+        }
+    }
+
+    /// The off-air scene the operator edits while `studioMode` is on. Rendered by
+    /// `previewProgram` onto the SAME program canvas and shown in the preview
+    /// monitor; committed to the live program by `take()`. Initialized to a copy
+    /// of `scene`; kept a full `ProgramScene` so `take()` can hand it straight to
+    /// `performSceneCommit`. Never read by the live render loop.
+    @Published private(set) var previewScene = ProgramScene(name: "Preview") {
+        didSet { previewProgram?.scene = previewScene }
+    }
 
     /// Set while `commitSceneAnimated` mutates `scene`, so the didSet above does
     /// not also hard-cut the render loop (the animated transition already did).
@@ -1917,6 +1986,15 @@ final class AppEngine: ObservableObject {
                              width: Self.verticalCanvasSize.width,
                              height: Self.verticalCanvasSize.height)
         }
+        // Studio-mode preview program: a second full composite at the SAME program
+        // canvas size, on its own compositor/queue (same device → MetalLibraryCache
+        // hit). Built in SDR to match the primary at launch; rebuilt in setHDREnabled.
+        previewProgram = device.flatMap {
+            try? PreviewProgram(device: $0,
+                                width: canvasConfig.width,
+                                height: canvasConfig.height,
+                                colorMode: .sdr)
+        }
         if let loop = buildRenderLoop(colorMode: .sdr) {
             loop.start()
             renderLoop = loop
@@ -1930,6 +2008,11 @@ final class AppEngine: ObservableObject {
             DispatchQueue.main.async { self?.verticalRecorderFailed(failed) }
         }
         dualProgram?.scene = scene
+        // Studio preview program frame → preview-only store (never any output).
+        previewProgram?.onPreviewFrame = { [previewSink] frame in previewSink.consume(frame) }
+        // Seed the off-air preview with a copy of the live program scene.
+        previewScene = scene
+        previewProgram?.scene = previewScene
 
         Self.current = self // reachable by App Intents (all stored props now initialized)
         controlBackend.engine = self
@@ -2209,7 +2292,15 @@ final class AppEngine: ObservableObject {
         // Feed 9:16 the exact deadline-qualified frames the primary consumed,
         // paired with the provider scene/reframe evaluated during that same tick.
         // Non-blocking + coalescing on the secondary's own queue/compositor.
-        loop.onTickSnapshot = { [dualProgram, verticalTap] tick in
+        loop.onTickSnapshot = { [dualProgram, verticalTap, previewProgram, studioActive] tick in
+            // Studio preview (Phase 3a Stage 1): feed the preview program the SAME
+            // deadline-qualified frames the primary consumed (off `TickSnapshot`,
+            // never the destructive mailboxes). It renders its OWN `previewScene`
+            // (kept in sync via `previewScene.didSet`), so pass no scene here. Gated
+            // by `studioActive` so it costs nothing when studio mode is off.
+            if let previewProgram, studioActive.withLock({ $0 }) {
+                previewProgram.submit(frames: tick.frames, pts: tick.pts, duration: tick.duration)
+            }
             if let dualProgram, verticalTap.enabled {
                 let routing = verticalTap.routingSnapshot()
                 let reframe = tick.evaluatedScene.map { evaluated -> ReframeMap in
@@ -2330,6 +2421,7 @@ final class AppEngine: ObservableObject {
             renderLoop?.removeMailbox(for: id)
             verticalTap.forget(id)
             dualProgram?.forget(source: id)
+            previewProgram?.forget(source: id)
         }
         auxiliarySources.removeAll()
         for url in memeScopedURLs.values { url.stopAccessingSecurityScopedResource() }
@@ -3451,6 +3543,10 @@ final class AppEngine: ObservableObject {
         if let mailbox = source.mailbox {
             renderLoop?.setMailbox(mailbox, for: source.id)
             dualProgram?.attach(source: source.id)
+            // Studio mode: register the source on the preview compositor too, so a
+            // pending/draining preview tick can fold its frames and the preview
+            // never desyncs when the source set changes (mirror `dualProgram`).
+            previewProgram?.attach(source: source.id)
             var layers = scene.layers
             let nextZ = (layers.map(\.zIndex).max() ?? -1) + 1
             // Text/image/browser sources render premultiplied alpha with a
@@ -3467,6 +3563,15 @@ final class AppEngine: ObservableObject {
                         premultipliedAlpha: layerNeedsPremultipliedAlpha(source.id))
             layers.append(newLayer)
             scene.layers = layers
+            // Studio mode: mirror the new input into the off-air preview scene too
+            // (so the preview shows the just-added source), before `applyPreset`
+            // arranges the edit target. When studio mode is off this is skipped and
+            // the path is byte-identical to before.
+            if studioMode {
+                var previewLayers = previewScene.layers
+                previewLayers.append(newLayer)
+                previewScene.layers = previewLayers
+            }
             applyPreset(selectedPreset)
             // Announce the new layer so the Inspector can auto-select it.
             lastAddedVideoSourceID = source.id
@@ -3700,6 +3805,11 @@ final class AppEngine: ObservableObject {
         if source.isVideo {
             renderLoop?.removeMailbox(for: id)
             scene.layers.removeAll { $0.sourceID == id }
+            // Studio mode: drop the layer from the off-air preview too and tombstone
+            // the source on the preview compositor, so a stale pending/draining
+            // preview tick cannot re-pin the removed source (mirror `dualProgram`).
+            if studioMode { previewScene.layers.removeAll { $0.sourceID == id } }
+            previewProgram?.forget(source: id)
             linkDebugMonitor?.forgetSource(id)
             verticalTap.forget(id)
             isoTap.formats.forget(id) // drop the removed source's native-format probe entry
@@ -3760,27 +3870,32 @@ final class AppEngine: ObservableObject {
     }
 
     /// Move a layer one step toward the front (`up == true`) or back.
+    ///
+    /// Edit-routing SEAM: reads/writes `editScene` — the live `scene` normally,
+    /// the off-air `previewScene` while studio mode is on. Off → identical to today.
     func moveLayer(_ id: SourceID, up: Bool) {
-        var ordered = scene.layers.sorted { $0.zIndex < $1.zIndex }
+        var ordered = editScene.layers.sorted { $0.zIndex < $1.zIndex }
         guard let index = ordered.firstIndex(where: { $0.sourceID == id }) else { return }
         let target = up ? index + 1 : index - 1
         guard ordered.indices.contains(target) else { return }
         ordered.swapAt(index, target)
         for (i, _) in ordered.enumerated() { ordered[i].zIndex = i }
-        scene.layers = ordered
+        editScene.layers = ordered
     }
 
+    /// Edit-routing SEAM: mutate a layer on `editScene` (live `scene` off-studio,
+    /// `previewScene` in studio mode). Off → byte-identical to today's `scene` path.
     private func mutateLayer(_ id: SourceID, _ mutate: (inout Layer) -> Void) {
-        var layers = scene.layers
+        var layers = editScene.layers
         guard let index = layers.firstIndex(where: { $0.sourceID == id }) else { return }
         mutate(&layers[index])
-        scene.layers = layers
+        editScene.layers = layers
     }
 
     func applyPreset(_ preset: ScenePreset) {
         guard !didShutdown else { return } // Codex #4: no control-tier mutation after shutdown
         selectedPreset = preset
-        var ordered = scene.layers.sorted { $0.zIndex < $1.zIndex }
+        var ordered = editScene.layers.sorted { $0.zIndex < $1.zIndex }
         let visible = ordered.indices.filter { !ordered[$0].isHidden }
         switch preset {
         case .fullscreen:
@@ -3799,9 +3914,15 @@ final class AppEngine: ObservableObject {
                 for i in visible { ordered[i].frame = LayerFramePreset.full.rect }
             }
         }
-        var next = scene
+        var next = editScene
         next.layers = ordered
-        commitSceneAnimated(next) // preset switch = animated transition (deliverable 4)
+        if studioMode {
+            // Off-air: apply the preset to the preview scene directly. No program
+            // transition — the change reaches the program only on `take()`.
+            previewScene = next
+        } else {
+            commitSceneAnimated(next) // preset switch = animated transition (deliverable 4)
+        }
         controlServer.publish(.currentProgramSceneChanged(sceneName: preset.rawValue))
     }
 
@@ -6015,9 +6136,14 @@ final class AppEngine: ObservableObject {
         }
     }
 
+    /// - Parameter hardCut: force a NIL/zero-duration transition so
+    ///   `RenderLoop.switchScene` does an atomic hard swap — the studio `take()`
+    ///   path (Stage 2 will add transitions). Existing callers omit it (default
+    ///   `false`) and keep the configured transition behavior unchanged.
     private func performSceneCommit(_ newScene: ProgramScene,
                                     outgoing: ProgramScene,
-                                    stingerItem: MemeItem?) {
+                                    stingerItem: MemeItem?,
+                                    hardCut: Bool = false) {
         if let loop = renderLoop {
             if let stingerItem {
                 let token = UUID()
@@ -6045,12 +6171,28 @@ final class AppEngine: ObservableObject {
                     })
             } else {
                 loop.switchScene(to: newScene,
-                                 transition: transitionSchedule(outgoing: outgoing, incoming: newScene))
+                                 transition: hardCut ? nil
+                                     : transitionSchedule(outgoing: outgoing, incoming: newScene))
             }
         }
         suppressSceneRenderApply = true
         scene = newScene
         suppressSceneRenderApply = false
+    }
+
+    /// Studio hard-cut TAKE (Phase 3a Stage 1): commit the off-air `previewScene`
+    /// to the live program as an atomic HARD CUT, reusing `performSceneCommit`
+    /// with a nil transition (`RenderLoop.switchScene` does the immediate swap).
+    /// After this the program shows `previewScene`; `scene` and `previewScene`
+    /// are left equal so the next off-air edit starts from what is now live.
+    /// No-op unless studio mode is on. (Stage 2 adds transitions to TAKE.)
+    func take() {
+        guard studioMode else { return }
+        let incoming = previewScene
+        let outgoing = scene
+        performSceneCommit(incoming, outgoing: outgoing, stingerItem: nil, hardCut: true)
+        // `performSceneCommit` set `scene = incoming`; keep the preview equal to it.
+        previewScene = scene
     }
 
     /// Pure cue evaluator used by the live schedule and App regression tests.
@@ -6168,7 +6310,9 @@ extension AppEngine {
         if let preset = ScenePreset(rawValue: collection.presetRawValue) {
             selectedPreset = preset
         }
-        var restored = scene
+        // Edit-routing SEAM: load onto `editScene` (live off-studio, preview in
+        // studio mode). Off → identical to today's `scene`-based restore.
+        var restored = editScene
         restored.layers = collection.scene.layers
         // `premultipliedAlpha` is persisted per layer, but the correct value
         // depends on the CURRENT effect state, not what was saved (Codex #1):
@@ -6179,7 +6323,11 @@ extension AppEngine {
             let want = layerNeedsPremultipliedAlpha(restored.layers[i].sourceID)
             restored.layers[i].premultipliedAlpha = want
         }
-        commitSceneAnimated(restored)
+        if studioMode {
+            previewScene = restored // off-air: reaches the program only on take()
+        } else {
+            commitSceneAnimated(restored)
+        }
     }
 
     func deleteCollection(_ collection: SceneCollection) {
@@ -6714,8 +6862,30 @@ extension AppEngine {
             return
         }
         dualProgram = newDual ?? oldDual
+        // Rebuild the studio PREVIEW program in the SAME color mode alongside the
+        // vertical program (Stage 1 HDR parity), so a stale-colormode preview frame
+        // can't survive the swap. Same fence discipline as the vertical program
+        // (`quiesce` the old, `resume` on the failure path). Built at the current
+        // program canvas size; every failure path below restores `oldPreview`.
+        let oldPreview = previewProgram
+        let newPreview: PreviewProgram? = metalDevice.flatMap { dev -> PreviewProgram? in
+            guard let p = try? PreviewProgram(device: dev,
+                                              width: canvasConfig.width,
+                                              height: canvasConfig.height,
+                                              colorMode: mode) else { return nil }
+            p.onPreviewFrame = { [previewSink] frame in previewSink.consume(frame) }
+            p.scene = previewScene
+            return p
+        }
+        if oldPreview != nil && newPreview == nil {
+            dualProgram = oldDual // undo the vertical swap already applied above
+            lastError = "Couldn't rebuild the preview program in \(on ? "HDR" : "SDR") mode."
+            return
+        }
+        previewProgram = newPreview ?? oldPreview
         guard let newLoop = buildRenderLoop(colorMode: mode) else {
             dualProgram = oldDual
+            previewProgram = oldPreview
             lastError = "Couldn't rebuild the compositor in \(on ? "HDR" : "SDR") mode."
             return
         }
@@ -6742,6 +6912,7 @@ extension AppEngine {
             // exits — a frozen preview is not an acceptable fail-safe (N1).
             renderLoop = old
             dualProgram = oldDual // old loop's tick closure references oldDual — keep consistent
+            previewProgram = oldPreview // old loop's tick closure references oldPreview too
             resumeRenderLoopAfterFailedQuiesce(old)
             lastError = "HDR change couldn't proceed — the current render pass didn't quiesce. Preview kept running; try again."
             return
@@ -6755,6 +6926,11 @@ extension AppEngine {
         // vertical sink AFTER the new program's first frame. Revived on the start-fail
         // path below (which restores `oldDual`).
         if newDual !== oldDual { oldDual?.quiesce() }
+        // Same fence for the OLD preview program: it can still be draining enqueued
+        // preview work fed off the old loop's tick snapshot, so a stale old-mode
+        // preview frame could reach the preview sink after the new program's first
+        // frame. Revived on the start-fail path below (which restores `oldPreview`).
+        if newPreview !== oldPreview { oldPreview?.quiesce() }
         invalidatePendingStingerCue(drain: true)
         cancelActiveStingerTransition()
         cancelLayerAnimation()
@@ -6769,6 +6945,8 @@ extension AppEngine {
             renderLoop = old
             dualProgram = oldDual // restore the old loop's captured vertical program
             oldDual?.resume()     // sol #5 #9: revive the fenced old vertical program
+            previewProgram = oldPreview // restore the old loop's captured preview program
+            oldPreview?.resume()        // revive the fenced old preview program
             old?.scene = scene
             refreshSceneProvider()
             _ = old?.start()
@@ -7709,6 +7887,7 @@ extension AppEngine {
         auxiliarySources[source.id] = AuxiliaryVideoSource(source: source, mailbox: mailbox)
         renderLoop?.setMailbox(mailbox, for: source.id)
         dualProgram?.attach(source: source.id)
+        previewProgram?.attach(source: source.id) // keep the preview compositor in sync
     }
 
     /// Remove an auxiliary registration from both programs and release each
@@ -7720,6 +7899,7 @@ extension AppEngine {
         renderLoop?.removeMailbox(for: id)
         verticalTap.forget(id)
         dualProgram?.forget(source: id)
+        previewProgram?.forget(source: id) // keep the preview compositor in sync
         return source
     }
 

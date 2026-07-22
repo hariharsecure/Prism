@@ -178,3 +178,21 @@ final class VerticalProgramSink: @unchecked Sendable {
         if shouldReport { onRecorderFailure?(recorder) }
     }
 }
+
+/// Consumer of the **preview** program frame (`PreviewProgram.onPreviewFrame`,
+/// invoked on the preview's serial queue) — studio mode, Stage 1.
+///
+/// Deliberately a preview-ONLY sink: it owns a single `ProgramPreviewStore`
+/// (the off-air monitor) and NOTHING else. Unlike `VerticalProgramSink` there
+/// is no recorder / vcam / encoder — a preview edit must never reach ANY output.
+/// It has no reference to `ProgramFanOut`, so there is structurally no path from
+/// an off-air preview frame to the live program buffer, recorder, stream, or
+/// virtual camera. That isolation is the off-air guarantee.
+final class PreviewProgramSink: @unchecked Sendable {
+    let preview = ProgramPreviewStore()
+
+    /// Preview serial queue, once per preview program frame.
+    func consume(_ frame: VideoFrame) {
+        preview.store(frame)
+    }
+}
