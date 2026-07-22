@@ -79,6 +79,23 @@ public final class MetalCompositor {
     public let device: MTLDevice
     public let width: Int
     public let height: Int
+
+    /// Perf instrumentation sink (Phase 1d). When set, each composite records its
+    /// command buffer's true GPU time (`gpuEndTime − gpuStartTime`) against a
+    /// subsystem. Set by `RenderLoop` (shares the loop's aggregator). Nil = no
+    /// overhead. Reading `gpuStartTime/gpuEndTime` after `waitUntilCompleted`
+    /// costs nothing extra — the buffer already completed.
+    public var metrics: RenderMetrics?
+
+    /// Record a completed command buffer's GPU span for `subsystem`. Safe to call
+    /// only after the buffer has finished (its gpu timestamps are then valid).
+    @inline(__always)
+    func recordGPU(_ subsystem: RenderMetrics.Subsystem, _ buffer: MTLCommandBuffer) {
+        guard let metrics else { return }
+        let seconds = buffer.gpuEndTime - buffer.gpuStartTime
+        guard seconds > 0 else { return } // driver may report 0 if timestamps unavailable
+        metrics.recordGPU(subsystem, nanos: Int64(seconds * 1_000_000_000))
+    }
     /// The program output color mode fixed at construction.
     public let colorMode: ColorMode
 
@@ -576,6 +593,7 @@ public final class MetalCompositor {
 
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
+        recordGPU(.transition, commandBuffer)
         withExtendedLifetime(retained) {}
         try throwIfExecutionFailed(commandBuffer) // HIGH-4: never publish a fault frame
         return VideoFrame(pixelBuffer: target.buffer, pts: pts, duration: duration,
@@ -633,6 +651,7 @@ public final class MetalCompositor {
 
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
+        recordGPU(.transition, commandBuffer)
         withExtendedLifetime(retained) {}
         try throwIfExecutionFailed(commandBuffer) // HIGH-4: never publish a fault frame
         return VideoFrame(pixelBuffer: target.buffer, pts: pts, duration: duration,
@@ -742,6 +761,7 @@ public final class MetalCompositor {
         // while the pass costs <4 ms — blocking here is the simple, correct
         // v0 choice. Async triple-buffered handoff is a later optimization.
         commandBuffer.waitUntilCompleted()
+        recordGPU(.compositor, commandBuffer)
         withExtendedLifetime(retained) {}
         try throwIfExecutionFailed(commandBuffer) // HIGH-4: never publish a fault frame
 

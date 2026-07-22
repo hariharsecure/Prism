@@ -940,6 +940,28 @@ final class AppEngine: ObservableObject {
     @Published private(set) var channelStates: [SourceID: ChannelState] = [:]
     private var meterTimer: Timer?
 
+    /// Shared render-perf aggregator (Phase 1d). Created once and reused across
+    /// HDR rebuilds so the metric window and counters are continuous. Read by
+    /// `EngineControlBackend.stats()` via `renderLoop.metrics`.
+    let renderMetrics = RenderMetrics()
+    /// Light 1 Hz sampler for phys_footprint + Metal-allocated size + process CPU%.
+    /// Deliberately NOT per-frame — memory/CPU reads are syscalls; a periodic
+    /// timer keeps them off the render thread (non-perturbing).
+    private var perfSampleTimer: Timer?
+
+    /// (Re)start the memory/CPU sampler. Idempotent; called when a render loop
+    /// is built. Runs on the main runloop at 1 Hz.
+    private func startPerfSampler() {
+        guard perfSampleTimer == nil else { return }
+        perfSampleTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            let metalBytes = UInt64(self.metalDevice?.currentAllocatedSize ?? 0)
+            self.renderMetrics.recordMemory(physFootprintBytes: ProcessMetrics.physFootprintBytes(),
+                                            metalAllocatedBytes: metalBytes)
+            self.renderMetrics.recordCPUPercent(ProcessMetrics.cpuUsagePercent())
+        }
+    }
+
     struct ChannelState: Equatable {
         var peakLinear: Float
         var gain: Float
@@ -2127,6 +2149,13 @@ final class AppEngine: ObservableObject {
                                                     height: Self.canvasSize.height,
                                                     colorMode: colorMode) else { return nil }
         let loop = RenderLoop(compositor: compositor, fps: 60)
+        // Phase 1d: attach the shared perf aggregator so this loop's ticks, its
+        // compositor's GPU spans, and its mailboxes' drop/depth counters all land
+        // in one place that `EngineControlBackend.stats()` reads. Persist it on the
+        // engine (survives an HDR rebuild that swaps the loop) and (re)start the
+        // light memory/CPU sampler.
+        loop.metrics = renderMetrics
+        startPerfSampler()
         loop.scene = scene
         // Feed 9:16 the exact deadline-qualified frames the primary consumed,
         // paired with the provider scene/reframe evaluated during that same tick.

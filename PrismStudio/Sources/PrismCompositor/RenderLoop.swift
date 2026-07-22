@@ -85,6 +85,14 @@ public final class RenderLoop: @unchecked Sendable {
 
     public let fps: Double
 
+    /// Perf instrumentation sink (Phase 1d). When set, each tick records total
+    /// frame work + deadline slack and the render-mailbox queue depths; attached
+    /// mailboxes and the compositor share this same instance so GPU spans and
+    /// drop counters land in one aggregator. Nil = no instrumentation overhead.
+    public var metrics: RenderMetrics? {
+        didSet { compositor.metrics = metrics }
+    }
+
     private let compositor: MetalCompositor
     private let logger = EngineLog.logger("renderloop")
     private let signposter = EngineLog.signposter("compositor")
@@ -242,6 +250,7 @@ public final class RenderLoop: @unchecked Sendable {
     /// forget-tombstone in the compositor so a re-registered source composites
     /// again (see `MetalCompositor.forget`/`attach`).
     public func setMailbox(_ mailbox: FrameMailbox, for id: SourceID) {
+        mailbox.metrics = metrics // single choke point: attribute this input's drops/deliveries
         shared.withLock { $0.mailboxes[id] = mailbox }
         compositor.attach(source: id)
     }
@@ -345,6 +354,10 @@ public final class RenderLoop: @unchecked Sendable {
         let intervalTicks = intervalNs * denom / numer
         let frameDuration = CMTime(value: Int64(intervalNs), timescale: 1_000_000_000)
 
+        // Host-tick → nanosecond conversion for the perf spans (numer/denom are
+        // the mach timebase). Deltas are sub-frame, so the multiply cannot overflow.
+        func toNanos(_ ticks: UInt64) -> Int64 { Int64(ticks &* numer / denom) }
+
         var nextTick = mach_absolute_time() + intervalTicks
 
         while shared.withLock({ $0.running }) {
@@ -394,6 +407,24 @@ public final class RenderLoop: @unchecked Sendable {
             #endif
 
             let deadline = CMTimeSubtract(pts, CMTime(seconds: compensation, preferredTimescale: 1_000_000_000))
+
+            // Queue-depth instrumentation: sample the render mailboxes' occupancy
+            // BEFORE the take loop drains them — items/bytes/oldest-age the
+            // producers built up since the last tick. A brief per-mailbox lock;
+            // no effect on the frames actually pulled.
+            if let metrics {
+                var items = 0, bytes = 0
+                var oldestAgeMs = 0.0
+                let nowSec = pts.seconds
+                for (_, mailbox) in mailboxes {
+                    let d = mailbox.depthSample(nowSeconds: nowSec)
+                    items += d.items
+                    bytes += d.bytes
+                    oldestAgeMs = max(oldestAgeMs, d.oldestAgeMs)
+                }
+                metrics.recordQueueDepth(items: items, bytes: bytes, oldestAgeMs: oldestAgeMs, media: .video)
+            }
+
             var frames: [SourceID: VideoFrame] = [:]
             frames.reserveCapacity(mailboxes.count)
             for (id, mailbox) in mailboxes {
@@ -409,7 +440,11 @@ public final class RenderLoop: @unchecked Sendable {
             // against each source's held raw frame, at this one tick PTS — so a
             // still/low-fps source still flickers/pulses at render cadence and
             // every source shares one coherent phase clock.
-            if let frameProcessor { frames = frameProcessor(frames, pts) }
+            if let frameProcessor {
+                let fxStart = mach_absolute_time()
+                frames = frameProcessor(frames, pts)
+                metrics?.recordCPU(.sourceFX, nanos: toNanos(mach_absolute_time() &- fxStart))
+            }
 
             // Hand the pull-time epoch snapshot to the compositor for this tick's
             // fold (HIGH-3). Set every tick (fully replaced), so a stale carry-over
@@ -514,6 +549,20 @@ public final class RenderLoop: @unchecked Sendable {
                 _ = compositor.consumeLastCompositeSnapshot()
                 shared.withLock { $0.stats.compositeErrors += 1 }
                 logger.error("composite failed: \(String(describing: error), privacy: .public)")
+            }
+
+            // THE number that matters most (Phase 1d): total CPU work this tick,
+            // and how much of the frame budget was left before the next scheduled
+            // tick (negative = the frame overran its deadline). `now` was captured
+            // at the very start of tick processing; `nextTick` is the next
+            // scheduled wake. Two integer writes under an unfair lock — the
+            // measurement cannot perturb the frame it measures.
+            if let metrics {
+                let workEnd = mach_absolute_time()
+                let workNs = toNanos(workEnd &- now)
+                let slackNs = (Int64(bitPattern: nextTick) &- Int64(bitPattern: workEnd))
+                    * Int64(numer) / Int64(denom)
+                metrics.recordFrame(workNanos: workNs, deadlineSlackNanos: slackNs)
             }
         }
     }

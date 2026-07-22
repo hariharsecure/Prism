@@ -1,4 +1,5 @@
 import CoreMedia
+import CoreVideo
 import Foundation
 import os
 
@@ -21,6 +22,12 @@ public final class FrameMailbox: @unchecked Sendable {
 
     public let depth: Int
 
+    /// Optional perf sink. Set by `RenderLoop.setMailbox` (its single choke
+    /// point for render inputs) so drops/deliveries/depths are attributed
+    /// without touching any other call site. Recording is a brief unfair-lock
+    /// write — cheap enough for the capture thread's `post`.
+    public var metrics: RenderMetrics?
+
     public init(depth: Int = 3) {
         precondition(depth >= 1)
         self.depth = depth
@@ -28,13 +35,36 @@ public final class FrameMailbox: @unchecked Sendable {
 
     /// Producer side: newest frame in, oldest dropped beyond `depth`.
     public func post(_ frame: VideoFrame) {
+        var droppedNow: UInt64 = 0
         lock.withLock { state in
             state.delivered += 1
             state.slots.append(frame)
             if state.slots.count > depth {
+                let n = UInt64(state.slots.count - depth)
                 state.slots.removeFirst(state.slots.count - depth)
-                state.dropped += 1
+                state.dropped += n
+                droppedNow = n
             }
+        }
+        metrics?.recordDelivered(.video)
+        if droppedNow > 0 { metrics?.recordDrop(.queueOverflow, media: .video, count: droppedNow) }
+    }
+
+    /// Cheap occupancy sample for depth instrumentation: current item count,
+    /// total resident bytes, and the age (ms) of the oldest queued frame
+    /// relative to house time `nowSeconds`. Computed under the mailbox lock over
+    /// the ≤`depth` resident slots.
+    public func depthSample(nowSeconds: Double) -> (items: Int, bytes: Int, oldestAgeMs: Double) {
+        lock.withLock { state in
+            var bytes = 0
+            for f in state.slots { bytes += CVPixelBufferGetDataSize(f.pixelBuffer) }
+            let oldestAgeMs: Double
+            if let oldest = state.slots.first {
+                oldestAgeMs = max(0, (nowSeconds - oldest.pts.seconds) * 1000.0)
+            } else {
+                oldestAgeMs = 0
+            }
+            return (state.slots.count, bytes, oldestAgeMs)
         }
     }
 

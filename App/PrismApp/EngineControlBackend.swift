@@ -1,6 +1,7 @@
 import Foundation
 import PrismCompositor
 import PrismControl
+import PrismCore
 
 /// obs-websocket seam (DESIGN §2.7): maps ControlServer requests onto the
 /// AppEngine. "Scenes" are the layout presets (SetCurrentProgramScene now
@@ -92,18 +93,43 @@ final class EngineControlBackend: ControlBackend, @unchecked Sendable {
     }
 
     func stats() async -> EngineStats {
-        let loopStats = (try? await withEngine { $0.renderLoop?.stats }) ?? nil
+        // Pull the loop's frame counters, its live perf aggregator, and its fps in
+        // one MainActor hop.
+        let loop: (stats: RenderLoop.Stats, perf: RenderMetrics.Snapshot?, fps: Double)? =
+            (try? await withEngine { engine -> (RenderLoop.Stats, RenderMetrics.Snapshot?, Double)? in
+                guard let rl = engine.renderLoop else { return nil }
+                return (rl.stats, rl.metrics?.snapshot(), rl.fps)
+            }) ?? nil
+
         let disk = (try? URL(filePath: NSHomeDirectory())
             .resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
             .volumeAvailableCapacityForImportantUsage) ?? 0
-        return EngineStats(cpuUsage: 0,
-                           memoryUsageMB: 0,
-                           availableDiskSpaceMB: Double(disk) / 1_048_576,
-                           activeFps: 60,
-                           averageFrameRenderTimeMs: 0,
-                           renderSkippedFrames: loopStats?.lateTicks ?? 0,
-                           renderTotalFrames: loopStats?.ticks ?? 0,
+        let diskMB = Double(disk) / 1_048_576
+
+        guard let loop else {
+            // No engine/loop yet: only disk is known.
+            return EngineStats(availableDiskSpaceMB: diskMB)
+        }
+        let ls = loop.stats
+        // activeFps: measured over the sampling window would need a delta; report
+        // the configured output rate (the loop resynchronizes rather than drifting).
+        let fps = loop.fps > 0 ? loop.fps : 60
+        guard let perf = loop.perf else {
+            // Loop exists but no metrics attached: still return the real counters.
+            return EngineStats(availableDiskSpaceMB: diskMB,
+                               activeFps: fps,
+                               renderSkippedFrames: ls.lateTicks,
+                               renderTotalFrames: ls.ticks,
+                               outputSkippedFrames: 0,
+                               outputTotalFrames: ls.framesDelivered)
+        }
+        return EngineStats(perf: perf,
+                           availableDiskSpaceMB: diskMB,
+                           activeFps: fps,
+                           frameIntervalMs: 1000.0 / fps,
+                           renderSkippedFrames: ls.lateTicks,
+                           renderTotalFrames: ls.ticks,
                            outputSkippedFrames: 0,
-                           outputTotalFrames: loopStats?.framesDelivered ?? 0)
+                           outputTotalFrames: ls.framesDelivered)
     }
 }
