@@ -51,6 +51,7 @@ struct TransportBar: View {
                     Divider().frame(height: 22)
 
                     // Cluster 3 — tools
+                    studioModeToggle
                     reactiveTriggerControl
                     autoDirectorButton
                     midiButton
@@ -455,6 +456,26 @@ struct TransportBar: View {
                     .help(note)
             }
         }
+    }
+
+    // MARK: Studio mode (Phase 3a Stage 3)
+
+    /// Toggle the preview/program studio workflow. ON splits the center monitor
+    /// into a PREVIEW (off-air) + PROGRAM (on-air) pair with a TAKE button
+    /// (ContentView branches on `engine.studioMode`). Entering studio mode seeds
+    /// preview from the live program (Stage 1) — no extra work here.
+    private var studioModeToggle: some View {
+        Toggle(isOn: Binding(get: { engine.studioMode },
+                             set: { engine.studioMode = $0 })) {
+            Label("Studio", systemImage: "rectangle.split.2x1")
+                .foregroundStyle(engine.studioMode ? Color.accentColor : .primary)
+        }
+        .toggleStyle(.button)
+        .accessibilityIdentifier("transport.studioMode.toggle")
+        .accessibilityLabel("Studio mode")
+        .accessibilityValue(engine.studioMode ? "On" : "Off")
+        .accessibilityHint("Show preview and program monitors with a TAKE button to cut the off-air preview to air.")
+        .help("Studio mode — edit an off-air PREVIEW, then TAKE it to the live PROGRAM. Shows preview + program monitors side by side.")
     }
 
     // MARK: Reactive trigger (feature 4)

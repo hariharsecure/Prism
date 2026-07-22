@@ -31,6 +31,18 @@ struct ContentView: View {
                     if let fault = engine.engineFault {
                         Label(fault, systemImage: "exclamationmark.octagon")
                             .padding()
+                    } else if engine.studioMode {
+                        // Studio mode: preview (left) + program (right) monitors
+                        // with a TAKE button. The single-monitor branch below is
+                        // left untouched for the default (non-studio) layout.
+                        StudioView()
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        Divider()
+                        TransitionControlsView()
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                        Divider()
+                        VerticalProgramPanel()
                     } else {
                         ProgramMonitorView(store: engine.previewStore)
                             .aspectRatio(16.0 / 9.0, contentMode: .fit)

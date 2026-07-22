@@ -39,6 +39,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         // stack sample). A runloop timer fires in the same context as a real
         // menu action, which is exactly the path this hook must emulate.
         let env = ProcessInfo.processInfo.environment
+        //   PRISM_DEBUG_STUDIO=1 → flip studio mode on at launch so the dual
+        // (preview/program) monitor layout can be screenshotted headlessly (there
+        // is no other launch-time state driver for studioMode). View-layer only —
+        // this just sets the published flag the UI branches on.
+        if env["PRISM_DEBUG_STUDIO"] == "1" {
+            engine.studioMode = true
+        }
         if let seconds = env["PRISM_DEBUG_AUTO_RECORD_SECONDS"].flatMap(Double.init) {
             Timer.scheduledTimer(withTimeInterval: seconds, repeats: false) { [weak self] _ in
                 MainActor.assumeIsolated { self?.engine.toggleRecording() }
