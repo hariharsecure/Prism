@@ -102,6 +102,18 @@ public final class ReplayBuffer: @unchecked Sendable {
 
     /// Configured retention window (seconds of program covered).
     public let duration: CMTime
+    /// Retention-window bounds (seconds). The floor keeps the `CMTime` valid and
+    /// the ring non-degenerate; the ceiling stops an absurd window (e.g. `1e18`,
+    /// which overflows `CMTimeValue` at the 600 timescale) from producing an
+    /// invalid duration. Any realistic replay window passes through unchanged.
+    public static let minimumDurationSeconds: Double = 0.1
+    public static let maximumDurationSeconds: Double = 86_400   // 24 h
+    /// Clamp a requested retention window into `[min, max]`; a non-finite request
+    /// falls back to the 30 s default.
+    static func clampDuration(_ seconds: Double) -> Double {
+        guard seconds.isFinite else { return 30 }
+        return min(max(seconds, minimumDurationSeconds), maximumDurationSeconds)
+    }
     /// Timescale used to build the retention window CMTime.
     private static let ts: CMTimeScale = 600
     private let fragmentInterval: Double
@@ -113,9 +125,15 @@ public final class ReplayBuffer: @unchecked Sendable {
     ///   - fragmentInterval: movie-fragment cadence for the saved `.mov`
     ///     (crash safety mirrors `MovieRecorder`); default 1 s.
     public init(seconds: Double = 30, fragmentInterval: Double = 1.0) {
-        precondition(seconds > 0, "replay window must be positive")
-        self.duration = CMTime(seconds: seconds, preferredTimescale: Self.ts)
-        self.fragmentInterval = fragmentInterval
+        // Clamp instead of aborting on bad public input: a non-positive or
+        // non-finite window used to `precondition`-crash the process (a live-show
+        // hazard) and would feed `CMTime(seconds:)` with garbage. Clamp to a safe
+        // range; realistic windows are unchanged.
+        let clampedSeconds = Self.clampDuration(seconds)
+        self.duration = CMTime(seconds: clampedSeconds, preferredTimescale: Self.ts)
+        // The fragment cadence must be a finite positive interval; fall back to
+        // the 1 s default for a non-positive/non-finite request.
+        self.fragmentInterval = (fragmentInterval.isFinite && fragmentInterval > 0) ? fragmentInterval : 1.0
     }
 
     /// Appends one encoded program frame and trims the ring to the window,
@@ -271,13 +289,19 @@ public final class ReplayBuffer: @unchecked Sendable {
     /// and a concurrent append during the mux is safe — the snapshot is an
     /// immutable COW copy that later mutations don't touch.
     public func saveHighlight(lastSeconds: Double, to url: URL) async throws -> ClipReport {
-        precondition(lastSeconds > 0, "lastSeconds must be positive")
+        // Clamp instead of `precondition`-crashing on bad public input: a
+        // non-positive or non-finite request used to abort the process. Floor it
+        // to a tiny positive window (the tail-selection below already clamps an
+        // over-large value to the whole buffer). Every positive finite request is
+        // used unchanged, so existing valid behavior is identical. An empty
+        // buffer still throws a typed error, never crashes.
+        let safeLastSeconds = (lastSeconds.isFinite && lastSeconds > 0) ? lastSeconds : Self.minimumDurationSeconds
         let (entries, audioAll): ([Entry], [AudioEntry]) = state.withLock { ($0.entries, $0.audio) }
         guard let last = entries.last else { throw ReplayError.empty }
 
         // Tail cutoff on the house timeline. Clamp is implicit: a cutoff before
         // the oldest retained keyframe leaves `startIndex` at 0 → whole buffer.
-        let cutoff = CMTimeSubtract(last.end, CMTime(seconds: lastSeconds, preferredTimescale: Self.ts))
+        let cutoff = CMTimeSubtract(last.end, CMTime(seconds: safeLastSeconds, preferredTimescale: Self.ts))
         var startIndex = 0
         for (i, e) in entries.enumerated() where e.isKeyframe && CMTimeCompare(e.pts, cutoff) <= 0 {
             startIndex = i

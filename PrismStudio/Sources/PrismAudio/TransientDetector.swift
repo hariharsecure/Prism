@@ -65,6 +65,24 @@ public struct TransientInfo: Sendable, CustomStringConvertible {
 /// released, so callbacks never re-enter the lock. `reset()` clears running stats.
 public final class TransientDetector: @unchecked Sendable {
 
+    // MARK: Analysis-hop bounds (config-clamp safety)
+
+    /// Analysis-hop floor in frames. `process` never uses a hop below this, so
+    /// its block loop always advances the cursor. A 0/negative hop reached
+    /// through the mutable `Configuration.blockSize` would otherwise make
+    /// `while cursor + block <= pending.count` spin forever on the audio-callback
+    /// thread (the reported hang) — the floor makes the loop terminate.
+    public static let minimumBlockSize = 32
+    /// Analysis-hop ceiling in frames. Caps an absurd hop (e.g. `Int.max`) so
+    /// `pending` can always fill a block and never grows without bound (a block
+    /// that never completes would append every packet to `pending` until OOM).
+    public static let maximumBlockSize = 96_000
+    /// Clamp a configured hop into `[minimumBlockSize, maximumBlockSize]`.
+    /// Idempotent for any value produced by `Configuration.init`.
+    static func effectiveBlockSize(_ configured: Int) -> Int {
+        min(max(configured, minimumBlockSize), maximumBlockSize)
+    }
+
     // MARK: Configuration
 
     public struct Configuration: Sendable {
@@ -86,11 +104,29 @@ public final class TransientDetector: @unchecked Sendable {
                     attackThreshold: Float = 0.01,
                     blockSize: Int = 512,
                     baselineTimeConstant: Double = 0.15) {
-            self.sensitivity = min(max(sensitivity, 0), 1)
-            self.minIntervalSeconds = max(minIntervalSeconds, 0)
-            self.attackThreshold = max(attackThreshold, 0)
-            self.blockSize = max(blockSize, 32)
-            self.baselineTimeConstant = max(baselineTimeConstant, 1e-3)
+            // Reject non-finite (NaN/±inf) values that would poison the ratio
+            // test / baseline EMA, then clamp into a safe range. The hop is
+            // clamped into [min, max]: the floor stops a zero/negative hop from
+            // spinning `process`; the ceiling stops an absurd hop from growing
+            // the pending buffer without bound.
+            self.sensitivity = sensitivity.isFinite ? min(max(sensitivity, 0), 1) : 0.5
+            self.minIntervalSeconds = minIntervalSeconds.isFinite ? max(minIntervalSeconds, 0) : 0.10
+            self.attackThreshold = attackThreshold.isFinite ? max(attackThreshold, 0) : 0.01
+            self.blockSize = TransientDetector.effectiveBlockSize(blockSize)
+            self.baselineTimeConstant = baselineTimeConstant.isFinite ? max(baselineTimeConstant, 1e-3) : 0.15
+        }
+
+        /// Re-run the clamps on this value, returning a guaranteed in-range copy.
+        /// Idempotent for anything produced by `init`; a safety net so a
+        /// replacement `configuration` (whose fields are mutable `var`s and can
+        /// be set to e.g. `blockSize = 0`, bypassing `init`) can never install an
+        /// out-of-range field that would hang or destabilise `process`.
+        public func normalized() -> Configuration {
+            Configuration(sensitivity: sensitivity,
+                          minIntervalSeconds: minIntervalSeconds,
+                          attackThreshold: attackThreshold,
+                          blockSize: blockSize,
+                          baselineTimeConstant: baselineTimeConstant)
         }
 
         /// Maps `sensitivity` (0…1) to the required RMS-over-baseline ratio.
@@ -107,9 +143,15 @@ public final class TransientDetector: @unchecked Sendable {
 
     /// The active configuration. Re-reading/replacing is thread-safe; changes
     /// take effect on the next block.
+    /// A replacement is **normalized** (clamps re-run) before it is stored, so a
+    /// caller cannot install an out-of-range field such as `blockSize = 0`
+    /// (legal Swift on the mutable struct) that would hang `process`.
     public var configuration: Configuration {
         get { lock.withLock { $0.config } }
-        set { lock.withLock { $0.config = newValue } }
+        set {
+            let normalized = newValue.normalized()
+            lock.withLock { $0.config = normalized }
+        }
     }
 
     // MARK: State (all guarded by `lock`)
@@ -147,9 +189,20 @@ public final class TransientDetector: @unchecked Sendable {
     public let sampleRate: Double
 
     public init(sampleRate: Double = 48_000, configuration: Configuration = Configuration()) {
-        self.sampleRate = sampleRate
-        self.lock = OSAllocatedUnfairLock(initialState: State(config: configuration))
+        // Reject a non-finite or non-positive sample rate: it feeds the block
+        // duration / EMA coefficient and the `CMTimeScale(sampleRate.rounded())`
+        // used to stamp fires — 0 or NaN would yield invalid timing. Fall back
+        // to the standard 48 kHz. Normalize the config so a directly-mutated
+        // struct (e.g. `blockSize = 0`) can't reach `process`.
+        self.sampleRate = (sampleRate.isFinite && sampleRate > 0) ? sampleRate : 48_000
+        self.lock = OSAllocatedUnfairLock(initialState: State(config: configuration.normalized()))
     }
+
+    #if DEBUG
+    /// TEST HOOK: count of buffered mono samples not yet consumed into a block.
+    /// Used to assert the pending buffer stays bounded under a hostile blockSize.
+    var _test_pendingSampleCount: Int { lock.withLock { $0.pending.count } }
+    #endif
 
     /// Clear all running statistics and buffered audio. Config and `onTransient`
     /// are kept.
@@ -175,7 +228,10 @@ public final class TransientDetector: @unchecked Sendable {
 
         let fires: [TransientInfo] = lock.withLock { s in
             var fired: [TransientInfo] = []
-            let block = s.config.blockSize
+            // Clamp the hop wherever the loop consumes it — even if a future
+            // change reintroduces a way to store an out-of-range blockSize, the
+            // block loop still advances (never spins) and stays bounded.
+            let block = Self.effectiveBlockSize(s.config.blockSize)
 
             // Re-sync the timeline when the pending buffer is empty (contiguous
             // streams stay exact). C7: also detect a PTS discontinuity that lands
@@ -192,7 +248,7 @@ public final class TransientDetector: @unchecked Sendable {
                     s.headPTS,
                     CMTime(value: bufferedFrames, timescale: CMTimeScale(sampleRate.rounded())))
                 let deviation = abs(CMTimeGetSeconds(CMTimeSubtract(mono.startPTS, expectedPTS)))
-                let tolerance = 0.5 * Double(s.config.blockSize) / sampleRate
+                let tolerance = 0.5 * Double(block) / sampleRate
                 if deviation > tolerance {
                     s.pending.removeAll(keepingCapacity: true)
                     s.headPTS = mono.startPTS

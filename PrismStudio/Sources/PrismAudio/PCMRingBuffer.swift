@@ -28,8 +28,14 @@ public final class PCMRingBuffer: @unchecked Sendable {
         var underrunFrames: UInt64 = 0
     }
 
-    public init(channelCount: Int, capacityFrames: Int) {
-        precondition(channelCount >= 1 && capacityFrames >= 1)
+    public init(channelCount rawChannelCount: Int, capacityFrames rawCapacityFrames: Int) {
+        // Clamp to a safe floor instead of aborting on bad public input: both
+        // feed the storage-allocation size and the index math, and a 0/negative
+        // value would `precondition`-crash (or allocate nonsense). A ring must
+        // have at least one channel and one frame; every valid value is used
+        // unchanged.
+        let channelCount = max(rawChannelCount, 1)
+        let capacityFrames = max(rawCapacityFrames, 1)
         self.channelCount = channelCount
         self.capacityFrames = capacityFrames
         self.storage = .allocate(capacity: channelCount * capacityFrames)

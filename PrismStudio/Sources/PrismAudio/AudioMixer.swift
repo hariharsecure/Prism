@@ -39,6 +39,24 @@ public final class AudioMixer: @unchecked Sendable {
         public var maximumInitialAlignmentSeconds: Double = 1.0
 
         public init() {}
+
+        /// Re-applies safe clamps so an out-of-range field can never reach graph
+        /// construction. In particular `sampleRate = 0` makes
+        /// `AVAudioFormat(standardFormatWithSampleRate:channels:)` return `nil`
+        /// and the mixer's `init` used to abort (`preconditionFailure`,
+        /// exit 134); a non-finite `ringSeconds` would crash `Int(_:)` in
+        /// `addChannel`. Invalid values fall back to the documented defaults;
+        /// every valid configuration passes through unchanged.
+        func normalized() -> Configuration {
+            var c = self
+            c.sampleRate = (sampleRate.isFinite && sampleRate > 0) ? sampleRate : 48_000
+            c.channelCount = max(channelCount, 1)
+            c.ringSeconds = (ringSeconds.isFinite && ringSeconds > 0) ? ringSeconds : 0.5
+            c.tapBufferFrames = max(tapBufferFrames, 1)
+            c.maximumInitialAlignmentSeconds = maximumInitialAlignmentSeconds.isFinite
+                ? max(maximumInitialAlignmentSeconds, 0) : 1.0
+            return c
+        }
     }
 
     /// Where the master-mix packets claim to come from.
@@ -124,12 +142,17 @@ public final class AudioMixer: @unchecked Sendable {
     private var interleaveScratchFrames: Int
     private var manualSampleTime: Int64 = 0
 
-    public init(configuration: Configuration = Configuration()) {
+    public init(configuration rawConfiguration: Configuration = Configuration()) {
+        // Sanitize at the boundary: clamp every field into a safe range so bad
+        // public input (e.g. `sampleRate = 0`) can NEVER abort graph construction.
+        let configuration = rawConfiguration.normalized()
         self.configuration = configuration
-        guard let format = AVAudioFormat(standardFormatWithSampleRate: configuration.sampleRate,
-                                         channels: configuration.channelCount) else {
-            preconditionFailure("AVAudioFormat rejected \(configuration.sampleRate) Hz / \(configuration.channelCount) ch")
-        }
+        // After normalization the rate/channels are valid; still fall back to a
+        // guaranteed-valid 48 kHz stereo format rather than aborting if AVAudio
+        // ever rejects the request — never crash on public input.
+        let format = AVAudioFormat(standardFormatWithSampleRate: configuration.sampleRate,
+                                   channels: configuration.channelCount)
+            ?? AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
         self.internalFormat = format
         self.timeline = MixerTimeline(sampleRate: configuration.sampleRate)
 
