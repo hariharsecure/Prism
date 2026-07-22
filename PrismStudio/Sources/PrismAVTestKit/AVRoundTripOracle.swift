@@ -189,19 +189,37 @@ public struct AVOracleFailure: Error, Equatable, Sendable, CustomStringConvertib
 // MARK: - Oracle
 
 public enum AVRoundTripOracle {
+    /// Every gate. The default `verify` runs all of them; the live-loopback
+    /// path restricts to the subset that survives an RTMP/SRT socket round trip
+    /// (see `verify(_:gates:)`).
+    public static let allGates: Set<AVOracleAssertionCode> = Set(AVOracleAssertionCode.allCases)
+
     /// Verify all independent evidence, collecting every failure before throwing.
     public static func verify(_ evidence: AVRoundTripEvidence) throws -> AVVerificationReport {
+        try verify(evidence, gates: allGates)
+    }
+
+    /// Verify only the requested gates. Used by the live RTMP/SRT loopback
+    /// harness, where the receiver rebaselines PTS to the capture window and
+    /// carries only millisecond-quantized container timestamps — so absolute
+    /// A/V skew (`.avSkew`) is verified by the deterministic MOV path and the
+    /// operator harness, not the live socket path. Every other gate applies
+    /// identically to a captured stream.
+    public static func verify(_ evidence: AVRoundTripEvidence,
+                              gates: Set<AVOracleAssertionCode>) throws -> AVVerificationReport {
         var violations: [AVOracleViolation] = []
 
-        verifyFinalization(evidence, into: &violations)
-        verifyFrameCount(evidence, into: &violations)
-        verifyFrameIdentity(evidence, into: &violations)
-        verifyFrameOrdering(evidence, into: &violations)
-        verifyPatchMedians(evidence, into: &violations)
-        verifyVideoPTS(evidence, into: &violations)
-        verifyAudioPTS(evidence, into: &violations)
-        verifyRangeTag(evidence, into: &violations)
-        let maximumSkewMilliseconds = verifyAVSkew(evidence, into: &violations)
+        if gates.contains(.cleanFinalization) { verifyFinalization(evidence, into: &violations) }
+        if gates.contains(.frameCount) { verifyFrameCount(evidence, into: &violations) }
+        if gates.contains(.frameIdentity) { verifyFrameIdentity(evidence, into: &violations) }
+        if gates.contains(.frameOrdering) { verifyFrameOrdering(evidence, into: &violations) }
+        if gates.contains(.patchMedians) { verifyPatchMedians(evidence, into: &violations) }
+        if gates.contains(.videoPTSMonotonicity) { verifyVideoPTS(evidence, into: &violations) }
+        if gates.contains(.audioPTSMonotonicity) { verifyAudioPTS(evidence, into: &violations) }
+        if gates.contains(.rangeTag) { verifyRangeTag(evidence, into: &violations) }
+        let maximumSkewMilliseconds = gates.contains(.avSkew)
+            ? verifyAVSkew(evidence, into: &violations)
+            : 0.0
 
         guard violations.isEmpty else { throw AVOracleFailure(violations: violations) }
 
@@ -220,9 +238,11 @@ public enum AVRoundTripOracle {
                             evidence.configuration.avSkewBudgetMilliseconds,
                             maximumSkewMilliseconds),
         ]
-        let assertions = AVOracleAssertionCode.allCases.map {
-            AVOracleAssertionResult(code: $0, passed: true, message: assertionMessages[$0] ?? "passed")
-        }
+        let assertions = AVOracleAssertionCode.allCases
+            .filter { gates.contains($0) }
+            .map {
+                AVOracleAssertionResult(code: $0, passed: true, message: assertionMessages[$0] ?? "passed")
+            }
         let finalization = evidence.finalization
         let evidenceLines = [
             "finalization: writer/readers complete, tracks=\(finalization.videoTrackCount)V+\(finalization.audioTrackCount)A, bytes=\(finalization.bytesWritten)",
@@ -509,6 +529,9 @@ public enum AVRoundTripFault: String, Codable, Equatable, Sendable {
     case audioPTSShift
     case rangeTagSwap
     case frameDrop
+    /// A stream cut short before finalization: the tail of the decoded video is
+    /// missing (models a truncated container / interrupted publish).
+    case truncateTail
 }
 
 public extension AVRoundTripEvidence {
@@ -530,6 +553,10 @@ public extension AVRoundTripEvidence {
         case .frameDrop:
             guard !copy.decodedFrames.isEmpty else { return copy }
             copy.decodedFrames.remove(at: copy.decodedFrames.count / 2)
+        case .truncateTail:
+            guard copy.decodedFrames.count > 1 else { return copy }
+            let drop = max(1, copy.decodedFrames.count / 6)
+            copy.decodedFrames.removeLast(min(drop, copy.decodedFrames.count - 1))
         }
         return copy
     }

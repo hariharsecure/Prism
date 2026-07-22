@@ -71,13 +71,13 @@ public enum AVRoundTripRunner {
         }
     }
 
-    private struct VideoDecodeResult {
+    struct VideoDecodeResult {
         let frames: [DecodedVideoFrameEvidence]
         let rangeTag: VideoRangeTag
         let readerCompleted: Bool
     }
 
-    private struct AudioDecodeResult {
+    struct AudioDecodeResult {
         let samplePTS: [Double]
         let impulsePTS: [Double]
         let readerCompleted: Bool
@@ -242,13 +242,13 @@ public enum AVRoundTripRunner {
         }
     }
 
-    private static func isEncoderCapabilityStatus(_ status: OSStatus) -> Bool {
+    static func isEncoderCapabilityStatus(_ status: OSStatus) -> Bool {
         status == kVTCouldNotFindVideoEncoderErr
             || status == kVTVideoEncoderNotAvailableNowErr
             || status == kVTVideoEncoderNeedsRosettaErr
     }
 
-    private static func decodeVideo(asset: AVAsset,
+    static func decodeVideo(asset: AVAsset,
                                     track: AVAssetTrack,
                                     expectedPatches: [ExpectedVideoPatch]) async throws -> VideoDecodeResult {
         let reader: AVAssetReader
@@ -311,7 +311,7 @@ public enum AVRoundTripRunner {
                                  readerCompleted: completed)
     }
 
-    private static func decodeAudio(asset: AVAsset,
+    static func decodeAudio(asset: AVAsset,
                                     track: AVAssetTrack,
                                     sampleRate: Double) async throws -> AudioDecodeResult {
         let reader: AVAssetReader
@@ -366,7 +366,7 @@ public enum AVRoundTripRunner {
                                  readerCompleted: reader.status == .completed)
     }
 
-    private static func matchImpulses(_ detected: [Double],
+    static func matchImpulses(_ detected: [Double],
                                       expected: [ExpectedAudioEvent]) -> [DetectedAudioEventEvidence] {
         var available = detected
         var matches: [DetectedAudioEventEvidence] = []

@@ -51,6 +51,10 @@ prism-dev <command>
                         deterministic fixture → real compositor → VideoToolbox encode
                         → MOV mux → decode + A/V oracle. Seed accepts decimal or 0x hex;
                         JSON evidence defaults to a fresh directory under the temp dir.
+  rtmp-loopback [seed]  LIVE socket proof: oracle fixture → RTMPStreamOutput (FLV mux)
+                        → real RTMP → headless MediaMTX → recording → decode + live oracle,
+                        with negative controls. Auto-skips if mediamtx/ffmpeg absent.
+                        Reconnect/slow-consumer/real-ingest → `stream rtmp <url>`.
   playfile <path> [secs] [outDir]
                         network-free proof: MovieSource(video FILE) → compositor → dump ~10
                         spread PNG frames + per-frame timing + frame-to-frame meanDiff
@@ -1619,6 +1623,43 @@ func parseAVRoundTripSeed(_ value: String) -> UInt64? {
     return UInt64(value, radix: 10)
 }
 
+/// Live RTMP loopback harness (feasibility path a): the deterministic oracle
+/// sequence → production RTMPStreamOutput (FLV mux) → real RTMP socket → headless
+/// MediaMTX → recording → decode + live oracle. Auto-skips (exit 0) when the
+/// mediamtx/ffmpeg toolchain is missing. The reconnect / slow-consumer / real
+/// ingest cases need a provisioned server — use `prism-dev stream rtmp <url>`.
+func cmdRTMPLoopback(seed: UInt64) async {
+    var configuration = AVRoundTripConfiguration()
+    configuration.seed = seed
+    print("── live RTMP loopback (seed=0x\(String(seed, radix: 16)))")
+    print("   mediamtx: \(RTMPLoopbackRunner.locateMediaMTX()?.path ?? "NOT FOUND")")
+    print("   ffmpeg:   \(RTMPLoopbackRunner.locateFFmpeg()?.path ?? "NOT FOUND")")
+    do {
+        let r = try await RTMPLoopbackRunner.run(configuration: configuration)
+        let d = r.diagnostics
+        print("   rtmp url: \(d.rtmpURL)")
+        print("   states:   \(d.publishStates.joined(separator: " → "))")
+        print("   published=\(d.publishedFrameCount) captured=\(d.capturedFrameCount) "
+              + "verifiedRun=\(d.verifiedRunLength) fullSequence=\(d.fullSequenceCaptured)")
+        print("   \(r.verification.description)")
+        for line in r.verification.evidenceLines { print("   \(line)") }
+        print("   recording: \(r.recordingURL.path)")
+        print("   movie:     \(r.movieURL.path)")
+        // Prove the live oracle rejects a corrupted capture.
+        for fault in [AVRoundTripFault.frameDrop, .truncateTail, .rangeTagSwap] {
+            let rejected = (try? AVRoundTripOracle.verify(r.evidence.injecting(fault),
+                                                          gates: RTMPLoopbackRunner.liveGates)) == nil
+            print("   negative-control \(fault.rawValue): \(rejected ? "REJECTED ✓" : "ACCEPTED ✗")")
+        }
+        print("RTMP-LOOPBACK: PASS (live socket verified; reconnect/slow-consumer/real-ingest → operator)")
+    } catch let e as RTMPLoopbackRunner.LoopbackError where e.isInfrastructureUnavailable {
+        print("RTMP-LOOPBACK: SKIP — \(e)")
+    } catch {
+        print("RTMP-LOOPBACK: FAIL — \(error)")
+        exit(1)
+    }
+}
+
 func cmdAVRoundtrip(seed: UInt64, evidenceRoot: String?) async {
     var configuration = AVRoundTripConfiguration()
     configuration.seed = seed
@@ -1687,6 +1728,11 @@ case "av-roundtrip":
     }
     let evidenceRoot = rest.count == 2 ? rest[1] : nil
     await cmdAVRoundtrip(seed: seed, evidenceRoot: evidenceRoot)
+case "rtmp-loopback":
+    let rest = Array(args.dropFirst())
+    let seedArg = rest.first(where: { !$0.hasPrefix("--") })
+    let seed = seedArg.flatMap(parseAVRoundTripSeed) ?? AVRoundTripConfiguration().seed
+    await cmdRTMPLoopback(seed: seed)
 case "playfile":
     let rest = Array(args.dropFirst())
     guard let path = rest.first, !path.isEmpty else {

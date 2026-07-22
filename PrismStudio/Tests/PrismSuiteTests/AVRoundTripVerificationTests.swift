@@ -65,6 +65,16 @@ final class AVRoundTripVerificationTests: XCTestCase {
                             expectedAnyOf: [.frameCount, .frameIdentity])
     }
 
+    func testOracleRejectsTruncatedStream() async throws {
+        let result = try await runBaseline()
+        defer { removeArtifacts(for: result) }
+
+        XCTAssertTrue(result.verification.passed, "negative control requires a passing baseline")
+        assertOracleRejects(result.evidence.injecting(.truncateTail),
+                            fault: .truncateTail,
+                            expectedAnyOf: [.frameCount, .frameIdentity, .cleanFinalization])
+    }
+
     /// Capability skips are intentionally narrow. Every other runner error is
     /// rethrown so an encode, mux, decode, evidence, or oracle regression fails.
     private func runBaseline() async throws -> AVRoundTripRunner.Result {
