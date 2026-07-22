@@ -43,6 +43,34 @@ extension AppEngine {
         static let userMemes         = "studio.prism.memes.userItems"
         static let sourceFX          = "studio.prism.sourceFX"
         static let montageDefaults   = "studio.prism.montage.defaults"
+        static let canvasResolution  = "studio.prism.canvas.resolution"
+        static let canvasFPS         = "studio.prism.canvas.fps"
+    }
+
+    // MARK: Canvas config (resolution + framerate)
+
+    /// Persist the chosen canvas as two flat scalar keys (resolution rawValue +
+    /// integer fps) — mirrors the transition-settings scalar pattern above. Both
+    /// keys are written together so a half-written pair can't decode.
+    static func persistCanvasConfig(_ config: CanvasConfig) {
+        let d = UserDefaults.standard
+        d.set(config.resolution.rawValue, forKey: PersistKey.canvasResolution)
+        d.set(config.frameRate.rawValue, forKey: PersistKey.canvasFPS)
+    }
+
+    /// The persisted canvas, or `.default` (1080p60) if nothing was ever written
+    /// or the stored values are malformed. Called from `init` BEFORE the first
+    /// render loop is built so a saved non-default canvas applies at launch.
+    /// `static` so it can run before `self` is fully initialized.
+    static func loadPersistedCanvasConfig() -> CanvasConfig {
+        let d = UserDefaults.standard
+        guard d.object(forKey: PersistKey.canvasResolution) != nil,
+              let rawRes = d.string(forKey: PersistKey.canvasResolution),
+              let resolution = CanvasConfig.Resolution(rawValue: rawRes),
+              d.object(forKey: PersistKey.canvasFPS) != nil,
+              let frameRate = CanvasConfig.FrameRate(rawValue: d.integer(forKey: PersistKey.canvasFPS))
+        else { return .default }
+        return CanvasConfig(resolution: resolution, frameRate: frameRate)
     }
 
     // MARK: Restore (called once from init, after the on-disk stores load)

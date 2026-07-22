@@ -746,6 +746,17 @@ final class AppEngine: ObservableObject {
 
     @Published private(set) var engineFault: String?
 
+    /// The current program canvas (resolution + framerate). Loaded from
+    /// persistence in `init` BEFORE the first render loop is built, mutated only
+    /// through `setCanvasConfig` (which is guarded off-air and rebuilds the
+    /// render loop). The live consumers — compositor render target, render-loop
+    /// cadence, record/stream encoders, and generated-source raster — read this,
+    /// so a non-default preset propagates everywhere the old `canvasSize`
+    /// constant reached. `canvasSize` (below) is kept as the DEFAULT/aspect
+    /// reference for the few nonisolated-static aspect-only call sites; every
+    /// preset is 16:9 so those stay correct.
+    @Published private(set) var canvasConfig: CanvasConfig = .default
+
     @Published private(set) var cameras: [SourceDescriptor] = []
     @Published private(set) var microphones: [SourceDescriptor] = []
     @Published private(set) var peers: [PeerEntry] = []
@@ -1893,6 +1904,11 @@ final class AppEngine: ObservableObject {
         linkDebugMonitor = (env["PRISM_LINK_STATE_FILE"]?.isEmpty == false)
             ? LinkDebugMonitor() : nil
 
+        // Restore the persisted canvas (resolution + fps) BEFORE building the
+        // render loop so a saved non-default preset applies at launch. Defaults
+        // to 1080p60 (unchanged out-of-the-box behavior) if nothing was saved.
+        canvasConfig = Self.loadPersistedCanvasConfig()
+
         let device = MTLCreateSystemDefaultDevice()
         metalDevice = device
         // Second (vertical) program on its own compositor/queue — same device.
@@ -2176,10 +2192,12 @@ final class AppEngine: ObservableObject {
     private func buildRenderLoop(colorMode: MetalCompositor.ColorMode) -> RenderLoop? {
         guard let device = metalDevice,
               let compositor = try? MetalCompositor(device: device,
-                                                    width: Self.canvasSize.width,
-                                                    height: Self.canvasSize.height,
+                                                    width: canvasConfig.width,
+                                                    height: canvasConfig.height,
                                                     colorMode: colorMode) else { return nil }
-        let loop = RenderLoop(compositor: compositor, fps: 60)
+        // Render-loop cadence follows the configured framerate (RenderLoop derives
+        // the frame duration / PTS spacing from `fps`, so the encoders inherit it).
+        let loop = RenderLoop(compositor: compositor, fps: Double(canvasConfig.fps))
         // Phase 1d: attach the shared perf aggregator so this loop's ticks, its
         // compositor's GPU spans, and its mailboxes' drop/depth counters all land
         // in one place that `EngineControlBackend.stats()` reads. Persist it on the
@@ -2797,8 +2815,13 @@ final class AppEngine: ObservableObject {
 
     /// Canvas size for generated sources — the program raster, so a full-frame
     /// title/still lands 1:1 in the compositor.
-    private static var sourceCanvas: CanvasSize {
-        CanvasSize(width: canvasSize.width, height: canvasSize.height)
+    /// Canvas size for generated sources — the CURRENT program raster, so a
+    /// full-frame title/still lands 1:1 in the compositor at whatever resolution
+    /// the canvas is configured to. Instance-level (was static) so it tracks
+    /// `canvasConfig`. The two nominal admission-cost `static func`s below use
+    /// `Self.canvasSize` (the 1080p reference) for their estimate instead.
+    private var sourceCanvas: CanvasSize {
+        CanvasSize(width: canvasConfig.width, height: canvasConfig.height)
     }
 
     /// Wire a freshly-created generated `VideoSource` into the scene exactly like
@@ -2828,7 +2851,7 @@ final class AppEngine: ObservableObject {
         let style = TextSource.Style(fontSize: fontSize, weight: .semibold, color: color,
                                      horizontalAlignment: .center, verticalAlignment: .center)
         do {
-            let source = try TextSource(text: text, style: style, canvasSize: Self.sourceCanvas)
+            let source = try TextSource(text: text, style: style, canvasSize: sourceCanvas)
             let descriptor = SourceDescriptor(kind: .virtual, id: source.id.raw,
                                               name: text.isEmpty ? "Text" : text)
             try registerGenerated(source, descriptor: descriptor)
@@ -2840,7 +2863,7 @@ final class AppEngine: ObservableObject {
     /// Add a still-image source (BRB screen, logo, bumper).
     func addImageSource(fileURL: URL) {
         do {
-            let source = try ImageSource(fileURL: fileURL, canvasSize: Self.sourceCanvas,
+            let source = try ImageSource(fileURL: fileURL, canvasSize: sourceCanvas,
                                          contentMode: .aspectFit)
             let descriptor = SourceDescriptor(kind: .media, id: source.id.raw,
                                               name: fileURL.deletingPathExtension().lastPathComponent)
@@ -2868,7 +2891,7 @@ final class AppEngine: ObservableObject {
         // unbounded. Estimate + admit BEFORE decoding (reject over-budget without a
         // decode); a fitting one may evict the oldest animated sources.
         let cost = AnimatedGIFSource.estimatedResidentBytes(url: fileURL,
-                                                            canvasSize: Self.sourceCanvas,
+                                                            canvasSize: sourceCanvas,
                                                             contentMode: .aspectFit)
         // sol #4: reject an over-budget GIF without decoding; a fitting one evicts the
         // oldest animated sources BEFORE decoding (peak ceiling), with a rollback that
@@ -2889,7 +2912,7 @@ final class AppEngine: ObservableObject {
             #if DEBUG
             try Self._test_throwIfForcedConstructionFailure()
             #endif
-            let source = try AnimatedGIFSource(fileURL: fileURL, canvasSize: Self.sourceCanvas,
+            let source = try AnimatedGIFSource(fileURL: fileURL, canvasSize: sourceCanvas,
                                                contentMode: .aspectFit, loop: true)
             let descriptor = SourceDescriptor(kind: .media, id: source.id.raw,
                                               name: fileURL.deletingPathExtension().lastPathComponent)
@@ -2914,7 +2937,7 @@ final class AppEngine: ObservableObject {
             return
         }
         do {
-            let source = try BrowserSource(content: .url(url), canvasSize: Self.sourceCanvas)
+            let source = try BrowserSource(content: .url(url), canvasSize: sourceCanvas)
             let descriptor = SourceDescriptor(kind: .virtual, id: source.id.raw,
                                               name: url.host ?? "Browser", detail: url.absoluteString)
             try registerGenerated(source, descriptor: descriptor)
@@ -2936,7 +2959,7 @@ final class AppEngine: ObservableObject {
         // error path. Harmless no-op when the app is not sandboxed (Debug).
         let scoped = fileURL.startAccessingSecurityScopedResource()
         do {
-            let source = try MovieSource(fileURL: fileURL, canvasSize: Self.sourceCanvas,
+            let source = try MovieSource(fileURL: fileURL, canvasSize: sourceCanvas,
                                          contentMode: .aspectFit, loop: loop)
             let descriptor = SourceDescriptor(kind: .media, id: source.id.raw,
                                               name: fileURL.deletingPathExtension().lastPathComponent)
@@ -3044,7 +3067,7 @@ final class AppEngine: ObservableObject {
                 }
                 #endif
                 let source = try MovieSource(id: id, fileURL: entry.fileURL,
-                                             canvasSize: Self.sourceCanvas,
+                                             canvasSize: sourceCanvas,
                                              contentMode: .aspectFit, loop: loop)
                 let pipeline = self.effectPipelines[id]
                 source.onFrame = { [mailbox, monitor = self.linkDebugMonitor, pipeline, isoTap = self.isoTap, verticalTap = self.verticalTap, directorTap = self.directorTap, sid = id] frame in
@@ -3130,7 +3153,7 @@ final class AppEngine: ObservableObject {
             return
         }
         do {
-            let source = try MontageSource(items: items, canvasSize: Self.sourceCanvas,
+            let source = try MontageSource(items: items, canvasSize: sourceCanvas,
                                            interval: interval, transition: transition,
                                            kenBurns: kenBurns, shuffle: shuffle, loop: loop)
             let descriptor = SourceDescriptor(kind: .media, id: source.id.raw,
@@ -3315,7 +3338,7 @@ final class AppEngine: ObservableObject {
                 }
                 #endif
                 let source = try MontageSource(id: id, items: entry.items,
-                                               canvasSize: Self.sourceCanvas,
+                                               canvasSize: sourceCanvas,
                                                interval: entry.interval, transition: entry.transition,
                                                kenBurns: entry.kenBurns, shuffle: entry.shuffle,
                                                loop: entry.loop)
@@ -3992,8 +4015,8 @@ final class AppEngine: ObservableObject {
         // HDR program (rebuilt compositor emits 10-bit .hdr frames) → tag the
         // recording HDR so MovieRecorder writes HEVC Main10 + Rec.2020 HLG.
         let settings = RecordingSettings(codec: .h264,
-                                         width: Self.canvasSize.width,
-                                         height: Self.canvasSize.height,
+                                         width: canvasConfig.width,
+                                         height: canvasConfig.height,
                                          includeAudio: hasAudio,
                                          dynamicRange: hdrEnabled ? .hdr : .sdr)
         let newRecorder = try MovieRecorder(url: url, settings: settings)
@@ -4218,8 +4241,8 @@ final class AppEngine: ObservableObject {
         // Fallback only (a source that has not yet delivered a frame): canvas-size
         // SDR. Each armed source below overrides this with its OWN native format.
         let defaultSettings = RecordingSettings(codec: .h264,
-                                                width: Self.canvasSize.width,
-                                                height: Self.canvasSize.height,
+                                                width: canvasConfig.width,
+                                                height: canvasConfig.height,
                                                 includeAudio: false)
         let bank = ISORecorderBank(directory: isoDir, defaultSettings: defaultSettings)
         var meta: [SourceID: FinishedMulticamSession.AngleMeta] = [:]
@@ -4275,7 +4298,7 @@ final class AppEngine: ObservableObject {
                     // materialized recorder's actual settings at finish (finishISOSession).
                     meta[source.id] = FinishedMulticamSession.AngleMeta(
                         name: source.descriptor.name,
-                        width: Self.canvasSize.width, height: Self.canvasSize.height,
+                        width: canvasConfig.width, height: canvasConfig.height,
                         fps: recordingFPS(for: source.id), hasAudio: false)
                 }
             }
@@ -4336,8 +4359,8 @@ final class AppEngine: ObservableObject {
             }
         }
         meta[programSource] = FinishedMulticamSession.AngleMeta(
-            name: "Program", width: Self.canvasSize.width, height: Self.canvasSize.height,
-            fps: 60, hasAudio: program.audioBuffersWritten > 0)
+            name: "Program", width: canvasConfig.width, height: canvasConfig.height,
+            fps: Double(canvasConfig.fps), hasAudio: program.audioBuffersWritten > 0)
 
         lastFinishedSession = FinishedMulticamSession(
             projectName: isoSessionProjectName ?? "Prism Multicam",
@@ -4465,10 +4488,10 @@ final class AppEngine: ObservableObject {
             // Rec.2020-HLG so a saved replay matches the HDR recording (was 8-bit
             // H.264). SDR unchanged.
             let encoder = ProgramEncoder(settings: .init(codec: .h264,
-                                                         width: Self.canvasSize.width,
-                                                         height: Self.canvasSize.height,
+                                                         width: canvasConfig.width,
+                                                         height: canvasConfig.height,
                                                          averageBitrate: 12_000_000,
-                                                         expectedFrameRate: 60,
+                                                         expectedFrameRate: Double(canvasConfig.fps),
                                                          dynamicRange: hdrEnabled ? .hdr : .sdr))
             encoder.onEncodedFrame = { [buffer] sampleBuffer in buffer.append(sampleBuffer) }
             do {
@@ -4565,18 +4588,18 @@ final class AppEngine: ObservableObject {
         let multicam = FCPXMLExporter.makeSession(
             projectName: session.projectName,
             sessionStart: session.sessionStart,
-            frameRate: .fps60,
-            width: Self.canvasSize.width,
-            height: Self.canvasSize.height,
+            frameRate: FrameRate(fps: Double(canvasConfig.fps)),
+            width: canvasConfig.width,
+            height: canvasConfig.height,
             program: (report: session.program, source: session.programSource),
             isoResults: session.isoResults,
-            metadata: { id in
+            metadata: { [canvasConfig] id in
                 let m = session.meta[id]
                 return FCPXMLExporter.AngleMetadata(
                     name: m?.name ?? id.raw,
-                    width: m?.width ?? Self.canvasSize.width,
-                    height: m?.height ?? Self.canvasSize.height,
-                    fps: m?.fps ?? 60,
+                    width: m?.width ?? canvasConfig.width,
+                    height: m?.height ?? canvasConfig.height,
+                    fps: m?.fps ?? Double(canvasConfig.fps),
                     hasAudio: m?.hasAudio ?? false)
             })
         // sol #17 (data-loss class): the exporter overwrites any existing file at
@@ -4791,7 +4814,11 @@ final class AppEngine: ObservableObject {
     /// source. Returns nil if Metal is unavailable (frames pass through untouched).
     private func makeEffectPipeline(for id: SourceID) -> SourceEffectPipeline? {
         guard let device = metalDevice else { return nil }
-        let pipeline = SourceEffectPipeline(device: device, sourceID: id)
+        // Size the per-source effect canvas from the CURRENT program canvas so
+        // tile/video-wall/strobe geometry matches the configured resolution.
+        let pipeline = SourceEffectPipeline(device: device, sourceID: id,
+                                            canvasWidth: canvasConfig.width,
+                                            canvasHeight: canvasConfig.height)
         pipeline.onGradeComputed = { [weak self] sid, grade in
             DispatchQueue.main.async { self?.gradeComputed(sid, grade) }
         }
@@ -5310,7 +5337,8 @@ final class AppEngine: ObservableObject {
             lastError = "No stream target — enter an RTMP URL and key, or enable a destination."
             return
         }
-        let w = Self.canvasSize.width, h = Self.canvasSize.height
+        let w = canvasConfig.width, h = canvasConfig.height
+        let streamFPS = Double(canvasConfig.fps)   // encoder cadence follows the canvas
         // HDR sink-parity (Stage O): an HDR show streams 10-bit HEVC Main10 /
         // Rec.2020-HLG (was 8-bit H.264). The single ProgramEncoder feeds both the
         // RTMP primary and every SRT destination, so all broadcast paths carry the
@@ -5332,7 +5360,7 @@ final class AppEngine: ObservableObject {
         let streamRange: ProgramEncoder.Settings.DynamicRange = hdr ? .hdr : .sdr
         let encoder = ProgramEncoder(settings: .init(codec: .h264, width: w, height: h,
                                                      averageBitrate: 6_000_000,
-                                                     expectedFrameRate: 60,
+                                                     expectedFrameRate: streamFPS,
                                                      dynamicRange: streamRange))
         // Optional single-RTMP primary (drives the existing hardened published
         // stream state/stats/reconnect surface). Codec follows the program range
@@ -5340,7 +5368,7 @@ final class AppEngine: ObservableObject {
         let rtmp: RTMPStreamOutput? = hasPrimary
             ? RTMPStreamOutput(settings: .init(codec: hdr ? .hevc : .h264, width: w, height: h,
                                                videoBitrate: 6_000_000,
-                                               expectedFrameRate: 60))
+                                               expectedFrameRate: streamFPS))
             : nil
         // Program audio is sent to destinations whenever the mixer is running
         // (the master tap fans master-mix packets to `broadcast(audio:)`), so
@@ -5351,7 +5379,7 @@ final class AppEngine: ObservableObject {
         let broadcaster: MultiDestinationBroadcaster? = enabledDestinations.isEmpty ? nil
             : MultiDestinationBroadcaster(videoSettings: .init(
                 codec: hdr ? .hevc : .h264, width: w, height: h, videoBitrate: 6_000_000,
-                expectedFrameRate: 60, includeAudio: sendingAudio))
+                expectedFrameRate: streamFPS, includeAudio: sendingAudio))
         // Encoded program video → the single RTMP (if any) AND the broadcaster.
         // Both appends are nonisolated + fire-and-forget (safe from the encoder
         // queue); a down destination drops on its own queue, never here.
@@ -6760,6 +6788,88 @@ extension AppEngine {
         writeLinkDebugState()
     }
 
+    // MARK: - Canvas resolution / framerate
+
+    /// Whether the canvas can be changed right now. FALSE while any output is
+    /// on-air (recording / streaming / replay-armed / virtual camera) — changing
+    /// the program raster size or cadence under a live, fixed-dimension encoder
+    /// would corrupt the in-progress recording / stream. The Settings picker
+    /// binds `.disabled(!engine.canC...)` to this; `setCanvasConfig` re-checks it
+    /// as the authoritative guard (UI disable alone is not a safety boundary).
+    var canChangeCanvas: Bool {
+        !isRecording && !isStreaming && !replayArmed
+            && !vcamOutputEnabled && !vcamOutputRequested
+    }
+
+    /// Apply a new program canvas (resolution + framerate) and persist it.
+    /// SAFETY: refuses while on-air (see `canChangeCanvas`) so an in-progress
+    /// recording/stream is never corrupted — the caller is told to stop outputs
+    /// first. Otherwise it rebuilds the compositor + render loop at the new
+    /// dimensions/cadence in the CURRENT color mode, migrating the source
+    /// mailboxes + scene, then swaps it in — the same quiesce-first discipline as
+    /// the HDR rebuild (the shared animated-FX GPU state forbids two render
+    /// threads at once). The vertical (9:16) program is a fixed-size deliverable
+    /// and is left untouched.
+    func setCanvasConfig(_ config: CanvasConfig) {
+        guard !didShutdown else { return }
+        guard config != canvasConfig else { return }
+        // Authoritative on-air guard (the disabled picker is only the UI cue).
+        guard canChangeCanvas else {
+            lastError = "Stop recording, streaming, replay, and the virtual camera before changing the canvas."
+            return
+        }
+        // No Metal: still record + persist the choice so it applies on next launch.
+        guard metalDevice != nil else {
+            canvasConfig = config
+            Self.persistCanvasConfig(config)
+            return
+        }
+        let previous = canvasConfig
+        canvasConfig = config   // buildRenderLoop reads the CURRENT canvasConfig
+        let mode: MetalCompositor.ColorMode = hdrEnabled ? .hdr : .sdr
+        guard let newLoop = buildRenderLoop(colorMode: mode) else {
+            canvasConfig = previous
+            lastError = "Couldn't rebuild the compositor at \(config.resolution.label)."
+            return
+        }
+        let old = renderLoop
+        // Quiesce the old render thread FIRST (shared animated-FX GPU / mailboxes
+        // are single-consumer): a failed quiesce is a near-no-op that leaves the
+        // old loop intact — resume it and abort.
+        if let old, old.stop() == false {
+            canvasConfig = previous
+            renderLoop = old
+            resumeRenderLoopAfterFailedQuiesce(old)
+            lastError = "Canvas change couldn't proceed — the current render pass didn't quiesce. Preview kept running; try again."
+            return
+        }
+        invalidatePendingStingerCue(drain: true)
+        cancelActiveStingerTransition()
+        cancelLayerAnimation()
+        old?.sceneProvider = nil
+        installAllMailboxes(on: newLoop)
+        newLoop.scene = scene
+        renderLoop = newLoop
+        refreshSceneProvider()
+        guard newLoop.start() else {
+            // Rebuild + restart the OLD-size loop so preview isn't left frozen.
+            canvasConfig = previous
+            if let revived = buildRenderLoop(colorMode: mode) {
+                installAllMailboxes(on: revived)
+                revived.scene = scene
+                renderLoop = revived
+                refreshSceneProvider()
+                _ = revived.start()
+            } else {
+                renderLoop = nil
+            }
+            lastError = "Couldn't start the render loop at \(config.resolution.label)."
+            return
+        }
+        Self.persistCanvasConfig(config)
+        writeLinkDebugState()
+    }
+
     /// Rebuild every live screen source so its ScreenCaptureKit capture matches the
     /// current HDR state (sol #5 #3). `ScreenCaptureConfiguration` (and thus the
     /// SCStream pixel format / dynamic range) is fixed at construction, so an HDR
@@ -7719,7 +7829,7 @@ extension AppEngine {
         let type = UTType(filenameExtension: url.pathExtension.lowercased())
         if type?.conforms(to: .gif) == true {
             // background defaults to `.clear` → transparent areas show program through.
-            let source = try AnimatedGIFSource(fileURL: url, canvasSize: Self.sourceCanvas,
+            let source = try AnimatedGIFSource(fileURL: url, canvasSize: sourceCanvas,
                                                contentMode: fitMode, loop: true)
             return (source, nil)
         }
@@ -7728,7 +7838,7 @@ extension AppEngine {
             // addMovieSource); balanced in removeMeme / deactivateAll.
             let scoped = url.startAccessingSecurityScopedResource()
             do {
-                let source = try MovieSource(fileURL: url, canvasSize: Self.sourceCanvas,
+                let source = try MovieSource(fileURL: url, canvasSize: sourceCanvas,
                                              contentMode: fitMode, loop: true)
                 return (source, scoped ? url : nil)
             } catch {
@@ -7736,7 +7846,7 @@ extension AppEngine {
                 throw error
             }
         }
-        let source = try ImageSource(fileURL: url, canvasSize: Self.sourceCanvas,
+        let source = try ImageSource(fileURL: url, canvasSize: sourceCanvas,
                                      contentMode: fitMode, background: .clear)
         return (source, nil)
     }
@@ -7751,7 +7861,8 @@ extension AppEngine {
         }
         if source is MovieSource {
             // Streamed: a handful of canvas-sized decode buffers, not the whole clip.
-            return sourceCanvas.width * sourceCanvas.height * 4 * 3
+            // Nominal 1080p reference (static context — no live canvasConfig here).
+            return Self.canvasSize.width * Self.canvasSize.height * 4 * 3
         }
         return 0
     }
@@ -7781,13 +7892,15 @@ extension AppEngine {
     /// movie's bounded streamed decode footprint, or 0 for a still. Lets admission
     /// run BEFORE the source is constructed/decoded.
     static func estimatedAnimatedByteCost(url: URL, mode: MemeMode) -> Int {
+        // Nominal 1080p reference (static context — no live canvasConfig here).
+        let nominal = CanvasSize(width: Self.canvasSize.width, height: Self.canvasSize.height)
         let type = UTType(filenameExtension: url.pathExtension.lowercased())
         if type?.conforms(to: .gif) == true {
             let fit: ImageSource.ContentMode = mode == .insert ? .aspectFit : .aspectFill
-            return AnimatedGIFSource.estimatedResidentBytes(url: url, canvasSize: sourceCanvas, contentMode: fit)
+            return AnimatedGIFSource.estimatedResidentBytes(url: url, canvasSize: nominal, contentMode: fit)
         }
         if type?.conforms(to: .movie) == true {
-            return sourceCanvas.width * sourceCanvas.height * 4 * 3   // streamed nominal
+            return nominal.width * nominal.height * 4 * 3   // streamed nominal
         }
         return 0
     }
@@ -8533,7 +8646,7 @@ extension AppEngine {
                 config.accentR = 0.90; config.accentG = 0.16; config.accentB = 0.20
             }
             let source = try MotionGraphicsOverlaySource(
-                width: Self.sourceCanvas.width, height: Self.sourceCanvas.height,
+                width: sourceCanvas.width, height: sourceCanvas.height,
                 config: config)
             let descriptor = SourceDescriptor(kind: .virtual, id: source.id.raw, name: kind.label)
             try registerGenerated(source, descriptor: descriptor)
@@ -8559,7 +8672,7 @@ extension AppEngine {
     private func addOverlaySource(config: MGOverlayConfig) -> SourceID? {
         do {
             let source = try MotionGraphicsOverlaySource(
-                width: Self.sourceCanvas.width, height: Self.sourceCanvas.height,
+                width: sourceCanvas.width, height: sourceCanvas.height,
                 config: config)
             let descriptor = SourceDescriptor(kind: .virtual, id: source.id.raw,
                                               name: config.kind.label)
@@ -8619,7 +8732,7 @@ extension AppEngine {
         let scoped = fileURL.startAccessingSecurityScopedResource()
         let config = LogoConfig()
         do {
-            let source = try AnimatedLogoSource(logoURL: fileURL, canvasSize: Self.sourceCanvas,
+            let source = try AnimatedLogoSource(logoURL: fileURL, canvasSize: sourceCanvas,
                                                 style: config.style, timing: config.timing)
             let descriptor = SourceDescriptor(kind: .media, id: source.id.raw,
                                               name: fileURL.deletingPathExtension().lastPathComponent)
@@ -8642,7 +8755,7 @@ extension AppEngine {
         entry.config = config
         do {
             let source = try AnimatedLogoSource(id: id, logoURL: entry.url,
-                                                canvasSize: Self.sourceCanvas,
+                                                canvasSize: sourceCanvas,
                                                 style: config.style, timing: config.timing)
             try swapGeneratedBacking(id: id, to: source)
             logoEntries[id] = entry
@@ -8658,7 +8771,7 @@ extension AppEngine {
     /// position/accent change rebuilds the source in place.
     func addTickerSource(config: TickerConfig) {
         do {
-            let source = try TickerSource(text: config.text, canvasSize: Self.sourceCanvas,
+            let source = try TickerSource(text: config.text, canvasSize: sourceCanvas,
                                           style: config.style, speed: config.speed)
             let descriptor = SourceDescriptor(kind: .virtual, id: source.id.raw, name: "Ticker")
             try registerGenerated(source, descriptor: descriptor)
@@ -8683,7 +8796,7 @@ extension AppEngine {
             return
         }
         do {
-            let source = try TickerSource(id: id, text: config.text, canvasSize: Self.sourceCanvas,
+            let source = try TickerSource(id: id, text: config.text, canvasSize: sourceCanvas,
                                           style: config.style, speed: config.speed)
             try swapGeneratedBacking(id: id, to: source)
             tickerEntries[id] = config
@@ -8698,7 +8811,7 @@ extension AppEngine {
     /// source (premultiplied overlay). Speed/loop are live-editable (rebuild).
     func addCreditsSource(config: CreditsConfig) {
         do {
-            let source = try CreditsSource(lines: config.lines, canvasSize: Self.sourceCanvas,
+            let source = try CreditsSource(lines: config.lines, canvasSize: sourceCanvas,
                                            speed: config.speed, loop: config.loop)
             let descriptor = SourceDescriptor(kind: .virtual, id: source.id.raw, name: "Credits")
             try registerGenerated(source, descriptor: descriptor)
@@ -8715,7 +8828,7 @@ extension AppEngine {
     func setCreditsConfig(_ config: CreditsConfig, for id: SourceID) {
         guard let old = creditsEntries[id], old != config else { return }
         do {
-            let source = try CreditsSource(id: id, lines: config.lines, canvasSize: Self.sourceCanvas,
+            let source = try CreditsSource(id: id, lines: config.lines, canvasSize: sourceCanvas,
                                            speed: config.speed, loop: config.loop)
             try swapGeneratedBacking(id: id, to: source)
             creditsEntries[id] = config
@@ -9134,7 +9247,7 @@ extension AppEngine {
             if isMovie {
                 guard let entry = movieSources[id] else { return }
                 let mv = try MovieSource(id: id, fileURL: entry.fileURL,
-                                         canvasSize: Self.sourceCanvas,
+                                         canvasSize: sourceCanvas,
                                          contentMode: .aspectFit, loop: entry.loop)
                 underlying = mv; rebuiltMovie = mv; movieEntry = entry
                 // Re-wire the clip's soundtrack into its existing mixer channel.
@@ -9203,7 +9316,7 @@ extension AppEngine {
                 if isMovie {
                     guard let entry = movieSources[id] else { return }
                     let mv = try MovieSource(id: id, fileURL: entry.fileURL,
-                                             canvasSize: Self.sourceCanvas,
+                                             canvasSize: sourceCanvas,
                                              contentMode: .aspectFit, loop: entry.loop)
                     if mv.hasAudioTrack, let channel = audioMixer.channel(id: id) {
                         mv.onAudio = { [multitrackTap] packet in
@@ -9253,8 +9366,8 @@ extension AppEngine {
 
     private func startCaptions() {
         do {
-            let overlay = try LiveCaptionOverlaySource(width: Self.sourceCanvas.width,
-                                                       height: Self.sourceCanvas.height)
+            let overlay = try LiveCaptionOverlaySource(width: sourceCanvas.width,
+                                                       height: sourceCanvas.height)
             let cap = LiveCaptioner()
             // onCaption fires off the recognizer's queue; overlay.apply is thread-safe.
             // The flagship's caption feed CHAINS onto the overlay apply (both fire,

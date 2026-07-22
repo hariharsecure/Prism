@@ -15,6 +15,8 @@ struct HotKeysSettingsView: View {
 
     var body: some View {
         Form {
+            CanvasSettingsSection()
+
             Section {
                 ForEach(HotKeyAction.toggles, id: \.id) { action in
                     HotKeyRow(action: action)
@@ -38,6 +40,56 @@ struct HotKeysSettingsView: View {
         .formStyle(.grouped)
         .frame(width: 460, height: 420)
         .accessibilityIdentifier("hotkeys.settings.root")
+    }
+}
+
+// MARK: - Canvas section (resolution + framerate)
+
+/// Project canvas picker: resolution + framerate presets (default 1080p60).
+/// Disabled while any output is on-air — changing the program raster under a
+/// live, fixed-dimension encoder would corrupt the recording/stream (the
+/// engine's `setCanvasConfig` re-checks this as the authoritative guard).
+private struct CanvasSettingsSection: View {
+    @EnvironmentObject private var engine: AppEngine
+
+    private var resolutionBinding: Binding<CanvasConfig.Resolution> {
+        Binding(
+            get: { engine.canvasConfig.resolution },
+            set: { engine.setCanvasConfig(CanvasConfig(resolution: $0,
+                                                       frameRate: engine.canvasConfig.frameRate)) })
+    }
+
+    private var frameRateBinding: Binding<CanvasConfig.FrameRate> {
+        Binding(
+            get: { engine.canvasConfig.frameRate },
+            set: { engine.setCanvasConfig(CanvasConfig(resolution: engine.canvasConfig.resolution,
+                                                       frameRate: $0)) })
+    }
+
+    var body: some View {
+        Section {
+            Picker("Resolution", selection: resolutionBinding) {
+                ForEach(CanvasConfig.Resolution.allCases) { res in
+                    Text(res.label).tag(res)
+                }
+            }
+            .accessibilityIdentifier("canvas.resolution.picker")
+
+            Picker("Frame rate", selection: frameRateBinding) {
+                ForEach(CanvasConfig.FrameRate.allCases) { rate in
+                    Text(rate.label).tag(rate)
+                }
+            }
+            .accessibilityIdentifier("canvas.fps.picker")
+        } header: {
+            Text("Canvas")
+        } footer: {
+            Text(engine.canChangeCanvas
+                 ? "The program canvas size and framerate. Every recorder, stream, and the virtual camera follow this. Default is 1920 × 1080 at 60 fps."
+                 : "Stop recording, streaming, replay, and the virtual camera to change the canvas — it can't change while you're on-air.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        .disabled(!engine.canChangeCanvas)
     }
 }
 

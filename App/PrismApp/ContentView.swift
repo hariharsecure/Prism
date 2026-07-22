@@ -130,9 +130,10 @@ struct ContentView: View {
                     .accessibilityIdentifier("content.status.dismissError")
                     .controlSize(.mini)
             } else {
-                Text("Program 1920×1080 · 60 fps")
+                Text(engine.canvasConfig.statusLine)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("content.status.canvas")
             }
             Spacer()
             Text("\(engine.activeSources.count) source\(engine.activeSources.count == 1 ? "" : "s")")
