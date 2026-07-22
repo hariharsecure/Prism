@@ -1013,8 +1013,18 @@ final class AppEngine: ObservableObject {
     private var streamStatsTimer: Timer?
     private var configuredStreamURL: String?
     private var configuredStreamKey: String?
-    @Published private(set) var isStreaming = false
-    @Published private(set) var streamStateDescription = "idle"
+    /// The streaming output's requested-vs-confirmed state (2f) — the SINGLE
+    /// SOURCE OF TRUTH for `isStreaming`, `streamStateDescription`, and the
+    /// streaming half of `isOnAir`. Written only through the RTMP-state / stop /
+    /// failure paths below (which funnel through `StreamOutputState.reduce`).
+    @Published private(set) var streamOutputState: StreamOutputState = .idle
+    /// Derived: any active streaming output (preparing/live/reconnecting/…). Kept
+    /// as a computed mirror of `streamOutputState` so a live stream can never be
+    /// dropped from the on-air predicate again (the pre-2f bug). `isOnAir` reads
+    /// this via `computeOnAir`.
+    var isStreaming: Bool { streamOutputState.isActiveOutput }
+    /// Derived UI/obs status string — never diverges from `streamOutputState`.
+    var streamStateDescription: String { streamOutputState.description }
     /// When the current stream attempt started (nil while idle). Backs the
     /// obs-websocket GetStreamStatus `outputDuration`/`outputTimecode`.
     @Published private(set) var streamStartDate: Date?
@@ -1050,6 +1060,18 @@ final class AppEngine: ObservableObject {
     @Published private(set) var broadcastVideoFrames: UInt64 = 0
     @Published private(set) var broadcastAudioFrames: UInt64 = 0
     private var broadcastStatsTimer: Timer?
+
+    /// OWNED handles for in-flight external-output CLOSES (2c). When a stream
+    /// tears down, the RTMP socket `close()` and the broadcaster/SRT `shutdown()`
+    /// run as detached async work; screen `stopCapture()` and the virtual-camera
+    /// DAL teardown do the same in their own modules. Historically these were
+    /// fire-and-forget, so `shutdown()` could return — and AppKit could exit —
+    /// before the RTMP socket flushed (corrupt stream tail) or the vcam detached
+    /// (lingering virtual camera). We now register each as a handle here so
+    /// `awaitExternalOutputsClosed(timeout:)` can AWAIT them (bounded) before the
+    /// process quits. Each handle self-removes when it finishes.
+    private var externalOutputTeardowns: [UInt64: Task<Void, Never>] = [:]
+    private var externalOutputTeardownSeq: UInt64 = 0
 
     /// Live bytes written by the active program recorder (obs GetRecordStatus).
     var recordByteCount: Int64 { recorder?.liveStats.bytesWritten ?? 0 }
@@ -2306,7 +2328,12 @@ final class AppEngine: ObservableObject {
             switch source.backing {
             case .camera(let camera): camera.stop()
             case .microphone(let mic): mic.stop()
-            case .screen(let screen): screen.stop()
+            case .screen(let screen):
+                screen.stop()
+                // 2c: `stop()` tears the SCStream down on a background task; own
+                // that as an awaitable handle so the shutdown barrier waits for
+                // the screen-capture stream to actually stop.
+                trackExternalOutputClose { await screen.awaitTeardown() }
             case .link(let video, _): video.stop()
             case .systemAudio(let audio): audio.stop()
             case .generated(let video): video.stop()
@@ -2329,6 +2356,11 @@ final class AppEngine: ObservableObject {
         activeSources.removeAll()
         renderLoop?.stop()
         feeder.stop()
+        // 2c: `feeder.stop()` releases the virtual-camera DAL stream on its serial
+        // work queue and returns immediately; own the drain as an awaitable handle
+        // so the barrier waits for the vcam to actually detach (no lingering vcam).
+        let feeder = self.feeder
+        trackExternalOutputClose { await feeder.drainTeardown() }
         linkServer.stop()
         if controlServerRunning { controlServer.stop() }
         // Codex #4: fence the control tier. Detach the obs backend and clear the
@@ -2338,6 +2370,13 @@ final class AppEngine: ObservableObject {
         // didShutdown above, so a request that captured the ref before this still
         // can't attach a new output).
         controlBackend.engine = nil
+        // 2c: BOUNDED external-output barrier — AWAIT the RTMP socket close, the
+        // broadcaster/SRT destination shutdowns, the screen-capture stops, and the
+        // virtual-camera detach registered above, before returning so the real
+        // quit path (`applicationShouldTerminate` → `.terminateLater`) doesn't let
+        // AppKit exit with a socket still publishing or the vcam still attached.
+        // Bounded (default 5 s) — logs and returns if a close overruns.
+        await awaitExternalOutputsClosed()
         Self.current = nil
         log.info("shutdown: complete")
     }
@@ -5330,9 +5369,12 @@ final class AppEngine: ObservableObject {
         streamEncoder = encoder
         rtmpOutput = rtmp
         self.broadcaster = broadcaster
-        isStreaming = true
         streamStartDate = Date()
-        streamStateDescription = hasPrimary ? "connecting" : "broadcasting"
+        // 2f: enter the streaming lifecycle. With a single-RTMP primary we are
+        // only REQUESTED (`.preparing`) until the socket confirms `.publishing`;
+        // a destinations-only broadcast is CONFIRMED live as soon as the encoder
+        // runs. `isStreaming`/`isOnAir` derive from this.
+        streamOutputState = StreamOutputState.reduce(.idle, on: .requestStart(hasPrimary: hasPrimary))
         // Reset all live counters on START so GetStreamStatus never reports the
         // previous stream's totals before the first stats tick (Codex #7).
         streamDroppedAppends = 0
@@ -5419,12 +5461,16 @@ final class AppEngine: ObservableObject {
     func stopStream() {
         guard isStreaming else { return }
         controlServer.publish(.streamStateChanged(active: false, state: .stopped))
-        finishStreamTeardown(state: "closed")
+        finishStreamTeardown(terminal: .idle)
     }
 
     private func streamStateChanged(_ state: RTMPStreamOutput.ConnectionState) {
-        streamStateDescription = Self.describe(state)
+        // 2f: map the single-RTMP socket's ConnectionState onto the streaming
+        // lifecycle (the single source of truth). `streamStateDescription`
+        // derives from `streamOutputState`, so no string is assigned here.
         switch state {
+        case .idle, .connecting:
+            streamOutputState = StreamOutputState.reduce(streamOutputState, on: .socketConnecting)
         case .publishing:
             // A return to .publishing after the first publish is a fresh stream
             // (e.g. following a .reconnecting) — force a keyframe so the new
@@ -5432,19 +5478,21 @@ final class AppEngine: ObservableObject {
             // keyframe interval for the next IDR (W5).
             if streamHasPublished { streamEncoder?.forceKeyframe() }
             streamHasPublished = true
-        case .failed, .closed:
-            finishStreamTeardown(state: streamStateDescription)
-        default:
-            break
+            streamOutputState = StreamOutputState.reduce(streamOutputState, on: .socketPublishing)
+        case .reconnecting(let attempt):
+            streamOutputState = StreamOutputState.reduce(streamOutputState, on: .socketReconnecting(attempt: attempt))
+        case .closed:
+            finishStreamTeardown(terminal: .idle)
+        case .failed(let reason):
+            finishStreamTeardown(terminal: .failed(reason: reason))
         }
         writeLinkDebugState()
     }
 
     private func streamConnectFailed(_ error: Error) {
         lastError = "Stream connect failed: \(error.localizedDescription)"
-        streamStateDescription = "failed: \(error.localizedDescription)"
         controlServer.publish(.streamStateChanged(active: false, state: .stopped))
-        finishStreamTeardown(state: streamStateDescription)
+        finishStreamTeardown(terminal: .failed(reason: error.localizedDescription))
     }
 
     /// Single teardown path for stop AND failure/closed (W7). Bumps the stream
@@ -5452,7 +5500,7 @@ final class AppEngine: ObservableObject {
     /// awaits `RTMPStreamOutput.close()` — which cancels the consumer/watcher
     /// tasks and finishes the ingest continuation — so no path leaves a live
     /// RTMP session or a running connect Task behind.
-    private func finishStreamTeardown(state: String) {
+    private func finishStreamTeardown(terminal: StreamOutputState) {
         streamStatsTimer?.invalidate(); streamStatsTimer = nil
         broadcastStatsTimer?.invalidate(); broadcastStatsTimer = nil
         streamStateTask?.cancel(); streamStateTask = nil
@@ -5470,7 +5518,6 @@ final class AppEngine: ObservableObject {
         streamEncoder = nil
         rtmpOutput = nil
         self.broadcaster = nil
-        isStreaming = false
         streamStartDate = nil
         streamHasPublished = false
         // Reset counters on teardown too (Codex #7): a stopped stream has no live
@@ -5480,12 +5527,20 @@ final class AppEngine: ObservableObject {
         streamTotalFrames = 0
         streamDroppedAppends = 0
         broadcastDestinationsConfigured = 0
-        streamStateDescription = state
+        // 2f: the terminal state (`.idle` for a clean stop/close, `.failed` for a
+        // failure) is the single source of truth; `isStreaming` (now false) and
+        // `streamStateDescription` derive from it. Set SYNCHRONOUSLY so callers
+        // that poll `isStreaming` right after `stopStream()` see it stopped —
+        // preserving the pre-2f timing — while the socket close is AWAITED
+        // separately via the external-output barrier below.
+        streamOutputState = terminal
         // Cancel + await the connect Task (so a connect that publishes right as
         // we tear down completes first), THEN close() — close tears down
         // whatever connect established, guaranteeing no orphan connection (W2/W7).
+        // 2c: registered as an OWNED handle (not fire-and-forget) so `shutdown()`
+        // can await this RTMP socket close before the process exits.
         if rtmp != nil || connectTask != nil {
-            Task {
+            trackExternalOutputClose {
                 connectTask?.cancel()
                 await connectTask?.value
                 await rtmp?.close()
@@ -5500,13 +5555,90 @@ final class AppEngine: ObservableObject {
         let connectTasks = Array(destinationConnectTasks.values)
         destinationConnectTasks.removeAll()
         if let broadcaster {
-            Task {
+            // 2c: OWNED handle so `shutdown()` awaits the broadcaster/SRT
+            // destination closes before the process exits.
+            trackExternalOutputClose {
                 for t in connectTasks { t.cancel() }
                 for t in connectTasks { await t.value }
                 await broadcaster.shutdown()
             }
         } else {
             for t in connectTasks { t.cancel() }
+        }
+    }
+
+    // MARK: - External-output barrier (2c)
+
+    /// Register a detached external-output CLOSE as an OWNED, awaitable handle so
+    /// `awaitExternalOutputsClosed(timeout:)` can wait for it before the process
+    /// exits. In normal operation the close still runs promptly and the handle
+    /// self-removes; only `shutdown()` blocks on the collection. Runs off the main
+    /// actor (the closes call into the RTMP/broadcaster actors), then hops back to
+    /// deregister.
+    private func trackExternalOutputClose(_ body: @escaping @Sendable () async -> Void) {
+        externalOutputTeardownSeq &+= 1
+        let token = externalOutputTeardownSeq
+        let task = Task { [weak self] in
+            await body()
+            await MainActor.run { self?.externalOutputTeardowns[token] = nil }
+        }
+        externalOutputTeardowns[token] = task
+    }
+
+    /// BOUNDED external-output barrier (2c). Awaits every in-flight external-output
+    /// close — the RTMP socket `close()`, the broadcaster/SRT destination
+    /// `shutdown()`s, the screen-capture `stopCapture()`s, and the virtual-camera
+    /// DAL-stream teardown — up to `timeout`, so the app does not quit while a
+    /// socket is still publishing (a corrupt stream tail) or the virtual camera is
+    /// still attached (a lingering vcam). NEVER hangs: past the deadline it logs
+    /// the stragglers and returns (their tasks are already cancelled / finish as
+    /// the process exits).
+    func awaitExternalOutputsClosed(timeout: Duration = .seconds(5)) async {
+        let handles = Array(externalOutputTeardowns.values)
+        guard !handles.isEmpty else { return }
+        let timedOut = await Self.awaitAll(handles, timeout: timeout)
+        if timedOut {
+            log.error("shutdown: external-output close exceeded bound; \(self.externalOutputTeardowns.count) handle(s) still open")
+        } else {
+            log.info("shutdown: external outputs closed")
+        }
+    }
+
+    /// PURE bounded barrier primitive (2c): await every handle to completion, or
+    /// return as soon as `timeout` elapses — whichever comes first. Extracted so
+    /// the "waits, but never hangs" contract is unit-testable without a live
+    /// socket. Returns `true` if the deadline was hit with handles still running,
+    /// `false` if every handle finished in time.
+    ///
+    /// The waiter and the deadline are UNSTRUCTURED tasks raced through a
+    /// continuation rather than a task group: a task group awaits its children at
+    /// scope exit, and `Task<Void, Never>.value` is not cancellation-responsive,
+    /// so a wedged handle would keep the group (and thus shutdown) blocked for the
+    /// handle's full duration — defeating the bound. Racing through a continuation
+    /// lets us return on the deadline and ABANDON the still-running waiter (its
+    /// only caller is `shutdown()`, so the process is exiting anyway).
+    static func awaitAll(_ handles: [Task<Void, Never>], timeout: Duration) async -> Bool {
+        guard !handles.isEmpty else { return false }
+        return await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            let resumed = OSAllocatedUnfairLock(initialState: false)
+            @Sendable func finish(_ timedOut: Bool) {
+                let shouldResume = resumed.withLock { done -> Bool in
+                    guard !done else { return false }
+                    done = true
+                    return true
+                }
+                if shouldResume { continuation.resume(returning: timedOut) }
+            }
+            // Waiter: resolves when every external-output close has finished.
+            Task {
+                for handle in handles { await handle.value }
+                finish(false)
+            }
+            // Deadline: resolves after the bound regardless of the waiter.
+            Task {
+                try? await Task.sleep(for: timeout)
+                finish(true)
+            }
         }
     }
 
@@ -5658,16 +5790,10 @@ final class AppEngine: ObservableObject {
         catch { lastError = "Couldn't save destinations: \(error.localizedDescription)" }
     }
 
-    private static func describe(_ state: RTMPStreamOutput.ConnectionState) -> String {
-        switch state {
-        case .idle: return "idle"
-        case .connecting: return "connecting"
-        case .publishing: return "publishing"
-        case .reconnecting(let attempt): return "reconnecting (attempt \(attempt))"
-        case .closed: return "closed"
-        case .failed(let reason): return "failed: \(reason)"
-        }
-    }
+    // (2f) The RTMP `ConnectionState` → string mapping was folded into
+    // `StreamOutputState` — `streamStateChanged` now advances the lifecycle and
+    // `streamStateDescription` derives from it, so this per-state describe helper
+    // is gone (single source of truth).
 
     // MARK: - Transitions (deliverable 4)
 

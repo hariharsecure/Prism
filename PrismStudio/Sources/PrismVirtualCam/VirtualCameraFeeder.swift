@@ -119,6 +119,17 @@ public final class VirtualCameraFeeder: @unchecked Sendable {
         }
     }
 
+    /// Await the completion of any teardown queued by `stop()` (2c external-output
+    /// barrier). `stop()` posts its DAL-stream release to a SERIAL work queue and
+    /// returns immediately; this fences that queue so app shutdown can guarantee
+    /// the virtual camera is fully detached before the process exits (no lingering
+    /// vcam). Does not rewrite the lifecycle — it only observes queue drain.
+    public func drainTeardown() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            workQueue.async { continuation.resume() }
+        }
+    }
+
     /// Enqueue one program frame. Render-thread-safe; drops (and counts) when
     /// the sink isn't attached or its queue is full — never blocks.
     public func send(_ frame: VideoFrame) {

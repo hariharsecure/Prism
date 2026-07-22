@@ -118,6 +118,11 @@ public final class ScreenSource: NSObject, VideoSource, AudioSource, @unchecked 
     /// The generation the CURRENTLY-running stream belongs to (read on the sample
     /// queues, written when a start commits to `.running`).
     private let runningGeneration = OSAllocatedUnfairLock<UInt64>(initialState: 0)
+    /// The background task spawned by the most recent `stop()` to tear the
+    /// SCStream down. Stored so a caller (app shutdown) can AWAIT the async
+    /// `stopCapture()` via `awaitTeardown()` — a bounded external-output barrier
+    /// (2c) — instead of racing process exit against a still-open capture stream.
+    private let stopTaskLock = OSAllocatedUnfairLock<Task<Void, Never>?>(initialState: nil)
     private let target: ScreenTarget
     private var stream: SCStream?
     private let videoQueue = DispatchQueue(label: "studio.prism.screen.video")
@@ -193,13 +198,22 @@ public final class ScreenSource: NSObject, VideoSource, AudioSource, @unchecked 
 
         let stream = self.stream
         self.stream = nil
-        Task { [weak self] in
+        let task = Task { [weak self] in
             if let stream {
                 do { try await stream.stopCapture() }
                 catch { self?.log.debug("stopCapture: \(error.localizedDescription) (already stopped?)") }
             }
             self?.setState(.idle)
         }
+        stopTaskLock.withLock { $0 = task }
+    }
+
+    /// Await the async SCStream teardown kicked off by the most recent `stop()`
+    /// (2c external-output barrier). Returns immediately when no stop is in
+    /// flight. Safe to call after `stop()` on any actor/thread.
+    public func awaitTeardown() async {
+        let task = stopTaskLock.withLock { $0 }
+        await task?.value
     }
 
     // MARK: - Async start path
