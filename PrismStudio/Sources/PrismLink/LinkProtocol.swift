@@ -59,6 +59,30 @@ public enum LinkProtocol {
     public static let controlHeaderSize = 6
     /// Upper bound we accept for one control payload (JSON), defensive.
     public static let maxControlPayload = 1 << 20
+
+    // MARK: Media memory-DoS caps (wire-controlled, fail-closed)
+    //
+    // `partCount` and `payloadLength` are attacker-controlled UInt16s. Left
+    // unbounded, the first part of a frame forces `Array(repeating: nil,
+    // count: partCount)` (up to 65535 entries) and a frame can accumulate
+    // partCount × up to 65535 payload bytes (~1 GiB), across many concurrent
+    // partial frames. These caps reject or bound such frames BEFORE the
+    // allocation happens.
+
+    /// Max parts we accept for one media frame. A real encoded video frame at
+    /// the ~1200-byte media MTU is well under a few thousand parts even for a
+    /// large keyframe; 16384 (2^14) gives generous headroom while bounding the
+    /// `[Data?]` part table a first-seen part allocates (16384 × ~16 B ≈ 256
+    /// KiB) and rejecting a wire-declared partCount up to 65535.
+    public static let maxPartCount = 16384
+    /// Max reassembled bytes we accept for ONE frame before dropping it —
+    /// generous for a 16 Mbps keyframe, far below the ~1 GiB a hostile peer
+    /// could otherwise pack into `maxPartCount` full-size parts.
+    public static let maxFrameBytes = 16 * 1024 * 1024
+    /// Max bytes buffered across ALL in-flight (incomplete) frames. Bounds
+    /// total receive-side memory regardless of how many partial frames a peer
+    /// opens; oldest partial frames are evicted to stay under it.
+    public static let maxTotalPendingBytes = 64 * 1024 * 1024
 }
 
 // MARK: - Control messages
@@ -330,7 +354,10 @@ public struct MediaDatagramHeader: Equatable, Sendable {
             ptsHouseNanos: Int64(bitPattern: data.readLE(UInt64.self, at: 17)),
             flags: Flags(rawValue: data.byte(at: 2))
         )
-        guard header.partCount > 0, header.partIndex < header.partCount else {
+        guard header.partCount > 0, header.partIndex < header.partCount,
+              Int(header.partCount) <= LinkProtocol.maxPartCount else {
+            // partCount == 0, index out of range, or a partCount so large it
+            // would force an unbounded part-table allocation downstream.
             throw ParseError.badPartFields
         }
         return header

@@ -25,6 +25,13 @@ public struct ReassemblyStats: Sendable {
     /// Parts rejected for inconsistent metadata (payload length ≠ header's
     /// declared length, or a part index outside the frame's declared shape).
     public var partsInvalid: UInt64 = 0
+    /// Frames rejected BEFORE their part table was allocated because the
+    /// wire-declared partCount exceeded `maxPartCount` — a memory-DoS attempt.
+    public var framesRejectedOversize: UInt64 = 0
+    /// Peak bytes ever buffered across all in-flight frames. Proves the
+    /// total-pending-bytes cap actually bounds receive-side memory: it can
+    /// never exceed `maxTotalPendingBytes + one part's payload`.
+    public var peakPendingBytes: UInt64 = 0
     public init() {}
 }
 
@@ -90,11 +97,29 @@ public final class FrameReassembler {
     /// Reorder-buffer bound; overflowing forces the oldest gap to be skipped.
     private let maxReady = 16
 
+    /// Max parts accepted for one frame — a partCount above this is rejected
+    /// before the `[Data?]` part table is allocated (memory-DoS guard).
+    public let maxPartCount: Int
+    /// Max reassembled bytes accepted for one frame before it is dropped.
+    public let maxFrameBytes: Int
+    /// Max bytes buffered across all in-flight frames; oldest partial frames
+    /// are evicted to stay under it.
+    public let maxTotalPendingBytes: Int
+    /// Sum of `bytes` across all `pending` entries, kept in lockstep with the
+    /// dict by `storePending`/`dropPending` so the byte cap is O(1) to enforce.
+    private var pendingBytes: Int = 0
+
     public init(timeout: TimeInterval = 0.25, maxPending: Int = 8,
-                reorderTimeout: TimeInterval = 0.1) {
+                reorderTimeout: TimeInterval = 0.1,
+                maxPartCount: Int = LinkProtocol.maxPartCount,
+                maxFrameBytes: Int = LinkProtocol.maxFrameBytes,
+                maxTotalPendingBytes: Int = LinkProtocol.maxTotalPendingBytes) {
         self.timeout = timeout
         self.maxPending = maxPending
         self.reorderTimeout = reorderTimeout
+        self.maxPartCount = maxPartCount
+        self.maxFrameBytes = maxFrameBytes
+        self.maxTotalPendingBytes = maxTotalPendingBytes
     }
 
     /// Ingest one datagram. Returns the next frame in frameID order when one
@@ -127,17 +152,30 @@ public final class FrameReassembler {
             return
         }
 
-        var entry = pending[frameID] ?? Pending(parts: Array(repeating: nil, count: Int(header.partCount)),
-                                                ptsHouseNanos: header.ptsHouseNanos,
-                                                flags: header.flags,
-                                                firstSeen: now)
+        // First part of this frame: validate the wire-declared shape BEFORE
+        // allocating its part table. A hostile peer's partCount (up to 65535,
+        // or higher on a hand-built header that skipped parse()'s guard) would
+        // otherwise force an unbounded `Array(repeating: nil, count:)`. Fail
+        // closed: drop + count, never allocate.
+        let existing = pending[frameID]
+        if existing == nil {
+            guard header.partCount > 0, Int(header.partCount) <= maxPartCount else {
+                stats.framesRejectedOversize += 1
+                return
+            }
+        }
+
+        var entry = existing ?? Pending(parts: Array(repeating: nil, count: Int(header.partCount)),
+                                        ptsHouseNanos: header.ptsHouseNanos,
+                                        flags: header.flags,
+                                        firstSeen: now)
         // A part disagreeing about the frame's shape or timing means
         // corruption or a frameID collision after wrap — abandon the frame,
         // wait for the next (and ask for a recovery point).
         guard entry.parts.count == Int(header.partCount),
               entry.ptsHouseNanos == header.ptsHouseNanos,
               entry.flags == header.flags else {
-            pending.removeValue(forKey: frameID)
+            dropPending(frameID)
             stats.framesDropped += 1
             onKeyframeNeeded?()
             return
@@ -149,7 +187,16 @@ public final class FrameReassembler {
         }
         guard entry.parts[index] == nil else {
             stats.duplicateParts += 1
-            pending[frameID] = entry
+            storePending(frameID, entry)
+            return
+        }
+        // Per-frame byte cap: partCount parts × up to 65535 payload bytes each
+        // could reach ~1 GiB. Drop the frame rather than let one frame grow
+        // unboundedly.
+        guard entry.bytes + payload.count <= maxFrameBytes else {
+            dropPending(frameID)
+            stats.framesDropped += 1
+            onKeyframeNeeded?()
             return
         }
         entry.parts[index] = payload
@@ -157,7 +204,7 @@ public final class FrameReassembler {
         entry.bytes += payload.count
 
         if entry.received == entry.parts.count {
-            pending.removeValue(forKey: frameID)
+            dropPending(frameID)
             stats.framesCompleted += 1
             var whole = Data(capacity: entry.bytes)
             for part in entry.parts { whole.append(part!) }
@@ -170,9 +217,43 @@ public final class FrameReassembler {
             promoteReady()
             boundReady()
         } else {
-            pending[frameID] = entry
+            storePending(frameID, entry)
             evictIfOverfull(keeping: frameID)
+            enforcePendingByteCap(keeping: frameID)
         }
+    }
+
+    /// Store an in-flight frame, keeping `pendingBytes` (and its peak) in sync
+    /// with the dict so the total-pending-bytes cap stays O(1) to enforce.
+    private func storePending(_ frameID: UInt32, _ entry: Pending) {
+        pendingBytes += entry.bytes - (pending[frameID]?.bytes ?? 0)
+        pending[frameID] = entry
+        if UInt64(pendingBytes) > stats.peakPendingBytes {
+            stats.peakPendingBytes = UInt64(pendingBytes)
+        }
+    }
+
+    /// Remove an in-flight frame, keeping `pendingBytes` in sync.
+    @discardableResult
+    private func dropPending(_ frameID: UInt32) -> Pending? {
+        guard let removed = pending.removeValue(forKey: frameID) else { return nil }
+        pendingBytes -= removed.bytes
+        return removed
+    }
+
+    /// Total-pending-bytes cap across ALL in-flight frames: evict oldest
+    /// partial frames (never the one we just touched) until back under the
+    /// bound, so receive-side memory can't grow with attacker input.
+    private func enforcePendingByteCap(keeping newest: UInt32) {
+        var evicted = false
+        while pendingBytes > maxTotalPendingBytes {
+            guard let victim = pending.filter({ $0.key != newest })
+                .min(by: { $0.value.firstSeen < $1.value.firstSeen })?.key else { break }
+            dropPending(victim)
+            stats.framesDropped += 1
+            evicted = true
+        }
+        if evicted { onKeyframeNeeded?() }
     }
 
     /// Wrap-aware (RFC 1982 style): is `frameID` before `nextExpected`?
@@ -223,7 +304,7 @@ public final class FrameReassembler {
     @discardableResult
     public func expire(at now: TimeInterval) -> Int {
         let stale = pending.filter { now - $0.value.firstSeen > timeout }.map(\.key)
-        for key in stale { pending.removeValue(forKey: key) }
+        for key in stale { dropPending(key) }
         stats.framesDropped += UInt64(stale.count)
         if !stale.isEmpty { onKeyframeNeeded?() }
         return stale.count
@@ -231,6 +312,8 @@ public final class FrameReassembler {
 
     /// Number of frames currently awaiting parts.
     public var pendingFrameCount: Int { pending.count }
+    /// Bytes currently buffered across all in-flight frames (cap tests/stats).
+    public var pendingByteCount: Int { pendingBytes }
 
     private func evictIfOverfull(keeping newest: UInt32) {
         var evicted = false
@@ -238,7 +321,7 @@ public final class FrameReassembler {
             // Oldest by arrival time; never evict the frame we just touched.
             guard let victim = pending.filter({ $0.key != newest })
                 .min(by: { $0.value.firstSeen < $1.value.firstSeen })?.key else { break }
-            pending.removeValue(forKey: victim)
+            dropPending(victim)
             stats.framesDropped += 1
             evicted = true
         }
