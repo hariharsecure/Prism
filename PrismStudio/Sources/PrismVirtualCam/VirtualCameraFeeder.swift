@@ -93,8 +93,15 @@ public final class VirtualCameraFeeder: @unchecked Sendable {
     public func start() {
         workQueue.async { [weak self] in
             guard let self else { return }
-            self.state = .searching
-            self.installDeviceListListener()
+            // Idempotency + leak accounting live in the pure lifecycle model:
+            // `start()` keeps `.feeding` when already attached (so a repeat
+            // "vcam on" doesn't drop to `.searching`), and asks us to install a
+            // DAL listener only when one isn't already registered.
+            let needsListener = self.lifecycle.start()
+            if !self.lifecycle.attached {
+                self.state = .searching
+            }
+            if needsListener { self.installDeviceListListener() }
             self.armRescanTimer()
             self.attemptAttach()
         }
@@ -104,6 +111,7 @@ public final class VirtualCameraFeeder: @unchecked Sendable {
     public func stop() {
         workQueue.async { [weak self] in
             guard let self else { return }
+            self.lifecycle.stop()
             self.disarmRescanTimer()
             self.removeDeviceListListener()
             self.teardownStream()
@@ -166,7 +174,12 @@ public final class VirtualCameraFeeder: @unchecked Sendable {
     private var sinkStreamID: CMIOObjectID = 0
     private var streamStarted = false
     private var rescanTimer: DispatchSourceTimer?
-    private var listenerInstalled = false
+    /// Pure state-transition + DAL-listener accounting (idempotency / no leak).
+    private var lifecycle = VCamLifecycleModel()
+    /// The exact listener block registered with the DAL, retained so we can
+    /// unregister the *identical* reference on stop() (the removal API matches
+    /// by block identity). `nil` ⇔ no listener registered — the leak fix.
+    private var deviceListListenerBlock: CMIOObjectPropertyListenerBlock?
 
     /// C callback the DAL invokes when the sink queue is altered (for output
     /// streams: on removals, i.e. the extension consumed a buffer). We only
@@ -186,26 +199,38 @@ public final class VirtualCameraFeeder: @unchecked Sendable {
     )
 
     private func installDeviceListListener() {
-        guard !listenerInstalled else { return }
+        // Belt-and-braces: never register a second block over a live one.
+        guard deviceListListenerBlock == nil else { return }
         // Re-attempt attach whenever the device list changes (extension
-        // installed, approved, upgraded, or unloaded).
-        let status = CMIOObjectAddPropertyListenerBlock(
-            CMIOObjectID(kCMIOObjectSystemObject), &deviceListAddress, workQueue
-        ) { [weak self] _, _ in
+        // installed, approved, upgraded, or unloaded). Hold the block so the
+        // matching stop() can remove this EXACT reference.
+        let block: CMIOObjectPropertyListenerBlock = { [weak self] _, _ in
             self?.attemptAttach()
         }
-        listenerInstalled = (status == noErr)
-        if status != noErr {
+        let status = CMIOObjectAddPropertyListenerBlock(
+            CMIOObjectID(kCMIOObjectSystemObject), &deviceListAddress, workQueue, block
+        )
+        if status == noErr {
+            deviceListListenerBlock = block
+        } else {
+            // Install failed — undo the model's accounting so a later start
+            // retries and stop() won't try to remove a phantom listener.
+            lifecycle.listenerInstallFailed()
             logger.warning("device-list listener failed (\(status)); relying on rescan timer")
         }
     }
 
     private func removeDeviceListListener() {
-        // NOTE: CMIOObjectRemovePropertyListenerBlock requires the identical
-        // block reference; we register once per feeder lifetime and simply
-        // leave it in place until process exit — the block holds only a weak
-        // self, so it can never resurrect or leak the feeder.
-        listenerInstalled = false
+        // Remove the identical block reference we registered (the DAL matches by
+        // block identity), then drop it so off/on cycles never leak listeners.
+        guard let block = deviceListListenerBlock else { return }
+        let status = CMIOObjectRemovePropertyListenerBlock(
+            CMIOObjectID(kCMIOObjectSystemObject), &deviceListAddress, workQueue, block
+        )
+        if status != noErr {
+            logger.warning("device-list listener removal failed (\(status))")
+        }
+        deviceListListenerBlock = nil
     }
 
     private func armRescanTimer() {
@@ -233,6 +258,7 @@ public final class VirtualCameraFeeder: @unchecked Sendable {
             if findPrismDevice() == nil {
                 logger.warning("Prism device vanished; tearing down and re-searching")
                 teardownStream()
+                lifecycle.detach()
                 state = .extensionNotInstalled
             }
             return
@@ -273,6 +299,7 @@ public final class VirtualCameraFeeder: @unchecked Sendable {
         sinkStreamID = sink
         streamStarted = true
         lock.withLockUnchecked { _sinkQueue = queue }
+        lifecycle.attach()
         logger.info("attached: device \(device) sink stream \(sink) queue capacity \(CMSimpleQueueGetCapacity(queue))")
         state = .feeding
     }
