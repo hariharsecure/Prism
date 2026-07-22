@@ -763,8 +763,11 @@ final class AppEngine: ObservableObject {
     /// makes every requested clip path unique (belt-and-suspenders with the
     /// engine's `RecorderFilePath.nonClobbering` last-line guard in `ReplayBuffer`).
     private var clipSaveCounter: UInt64 = 0
-    private let feeder = VirtualCameraFeeder()
-    private let installer = SystemExtensionInstaller()
+    /// Virtual-camera output subsystem (CoreMediaIO system-extension install + DAL
+    /// feeder), extracted from AppEngine (Phase 4a). Constructed in `init` (needs
+    /// `fanOut`); AppEngine forwards to it and keeps the UI-bound `vcam*`
+    /// @Published properties in sync via its `on…` callbacks.
+    private let virtualCamera: VirtualCameraController
     private let controlServer = ControlServer()
     private let controlBackend = EngineControlBackend()
 
@@ -1969,6 +1972,7 @@ final class AppEngine: ObservableObject {
         let code = Self.loadOrCreatePairingCode()
         pairingCode = code
         linkServer = LinkServer(configuration: .init(pairingCode: code))
+        virtualCamera = VirtualCameraController(fanOut: fanOut)
         let env = ProcessInfo.processInfo.environment
         linkDebugMonitor = (env["PRISM_LINK_STATE_FILE"]?.isEmpty == false)
             ? LinkDebugMonitor() : nil
@@ -2026,15 +2030,16 @@ final class AppEngine: ObservableObject {
         // callback (deliverable 3). Polled into `masterLoudness` by the meter timer.
         audioMixer.setLoudnessMeter(loudnessMeter)
 
-        feeder.onStateChange = { [weak self] state in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.vcamFeederStatus = Self.describe(state)
-                // C30: on-air only once the feeder confirms .feeding; any
-                // other state (searching/failed/stopped) is not on-air.
-                self.vcamOutputEnabled = self.vcamOutputRequested && state == .feeding
-            }
-        }
+        // Mirror the extracted virtual-camera controller's status back into the
+        // UI-bound @Published properties (kept on AppEngine so the SwiftUI
+        // bindings — and the isOnAir/HDR/canvas gates that read them — are
+        // untouched). The C30 "on-air only once the feeder confirms .feeding"
+        // rule now lives inside VirtualCameraController.
+        virtualCamera.onInstallStatus = { [weak self] in self?.vcamInstallStatus = $0 }
+        virtualCamera.onActivationInFlight = { [weak self] in self?.vcamActivationInFlight = $0 }
+        virtualCamera.onFeederStatus = { [weak self] in self?.vcamFeederStatus = $0 }
+        virtualCamera.onOutputRequested = { [weak self] in self?.vcamOutputRequested = $0 }
+        virtualCamera.onOutputEnabled = { [weak self] in self?.vcamOutputEnabled = $0 }
 
         // C29: the fan-out polls MovieRecorder.state after appends (throttled)
         // and reports a mid-recording writer failure exactly once.
@@ -2465,12 +2470,12 @@ final class AppEngine: ObservableObject {
         effectPipelines.removeAll()
         activeSources.removeAll()
         renderLoop?.stop()
-        feeder.stop()
-        // 2c: `feeder.stop()` releases the virtual-camera DAL stream on its serial
-        // work queue and returns immediately; own the drain as an awaitable handle
-        // so the barrier waits for the vcam to actually detach (no lingering vcam).
-        let feeder = self.feeder
-        trackExternalOutputClose { await feeder.drainTeardown() }
+        // 2c: `stopFeederForShutdown()` stops the feeder now (releases the
+        // virtual-camera DAL stream on its serial work queue and returns
+        // immediately) and hands back the drain as an awaitable handle so the
+        // barrier waits for the vcam to actually detach (no lingering vcam).
+        let vcamDrain = virtualCamera.stopFeederForShutdown()
+        trackExternalOutputClose { await vcamDrain() }
         linkServer.stop()
         if controlServerRunning { controlServer.stop() }
         // Codex #4: fence the control tier. Detach the obs backend and clear the
@@ -4746,64 +4751,14 @@ final class AppEngine: ObservableObject {
 
     // MARK: Virtual camera
 
-    func activateVirtualCameraExtension() {
-        guard !vcamActivationInFlight else { return }
-        vcamActivationInFlight = true
-        vcamInstallStatus = "Requesting activation…"
-        installer.onPhaseChange = { [weak self] phase in
-            DispatchQueue.main.async { self?.vcamInstallStatus = Self.describe(phase) }
-        }
-        Task { @MainActor in
-            do {
-                let phase = try await installer.activate()
-                vcamInstallStatus = Self.describe(phase)
-            } catch {
-                vcamInstallStatus = """
-                Activation failed: \(error.localizedDescription) — note: unsigned/ad-hoc \
-                builds can't install system extensions. Sign with a team, run from \
-                /Applications (or enable `systemextensionsctl developer on`), then retry.
-                """
-            }
-            vcamActivationInFlight = false
-        }
-    }
+    /// Thin forwarder — the virtual-camera subsystem lives in
+    /// `VirtualCameraController` (owned by AppEngine). Public signature unchanged.
+    func activateVirtualCameraExtension() { virtualCamera.activate() }
 
-    func setVirtualCameraOutput(_ enabled: Bool) {
-        vcamOutputRequested = enabled
-        if enabled {
-            // C30: do NOT flip vcamOutputEnabled/isOnAir here — the feeder
-            // starts asynchronously (search → attach). onStateChange sets
-            // vcamOutputEnabled once the feeder confirms `.feeding`.
-            feeder.start()
-            fanOut.setFeeder(feeder)
-        } else {
-            vcamOutputEnabled = false
-            fanOut.setFeeder(nil)
-            feeder.stop()
-        }
-    }
-
-    private static func describe(_ phase: SystemExtensionInstaller.Phase) -> String {
-        switch phase {
-        case .submitted: return "Activation requested — waiting for macOS…"
-        case .requiresApproval:
-            return "Approval needed: System Settings → General → Login Items & Extensions"
-        case .activated: return "Extension activated"
-        case .activatedAfterReboot: return "Activated — takes effect after restart"
-        case .deactivated: return "Extension deactivated"
-        }
-    }
-
-    private static func describe(_ state: VirtualCameraFeeder.State) -> String {
-        switch state {
-        case .idle: return "Off"
-        case .searching: return "Searching for Prism Camera device…"
-        case .extensionNotInstalled: return "Extension not installed — activate it first"
-        case .feeding: return "Feeding program to Prism Camera"
-        case .stopped: return "Off"
-        case .failed(let error): return "Failed: \(error)"
-        }
-    }
+    /// Thin forwarder — see `VirtualCameraController.setOutput(_:)`. Public
+    /// signature unchanged; `vcamOutputRequested` still flips synchronously so the
+    /// isOnAir / canvas / HDR gates observe it immediately.
+    func setVirtualCameraOutput(_ enabled: Bool) { virtualCamera.setOutput(enabled) }
 
     // MARK: Global-hotkeys support (read-only view for the toggle-stream policy)
 
