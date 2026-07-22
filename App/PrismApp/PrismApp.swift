@@ -46,6 +46,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         if env["PRISM_DEBUG_STUDIO"] == "1" {
             engine.studioMode = true
         }
+        //   PRISM_DEBUG_UI_STATE=<name> → drive the app into a named UI state (see
+        // PrismDebugUIState.allStates) at launch, for the UI-snapshot harness. Uses
+        // the real engine mutators + in-window AX presses; no-op without the var.
+        if let uiState = env["PRISM_DEBUG_UI_STATE"], !uiState.isEmpty {
+            PrismDebugUIState.apply(uiState, engine: engine)
+        }
+        //   PRISM_DEBUG_AX_DUMP=<file> → after a settle delay, walk THIS window's
+        // AX tree → JSON + audit (no-name / <20pt / offscreen interactive), then
+        // quit through the real path. Pair with PRISM_DEBUG_UI_STATE to audit a
+        // specific state. Same Timer-not-asyncAfter rule as the hooks above.
+        if let axFile = env["PRISM_DEBUG_AX_DUMP"], !axFile.isEmpty {
+            let delay = env["PRISM_DEBUG_AX_DELAY"].flatMap(Double.init) ?? 2.5
+            PrismDebugAX.scheduleDump(to: axFile, state: env["PRISM_DEBUG_UI_STATE"] ?? "default", delay: delay)
+        }
         if let seconds = env["PRISM_DEBUG_AUTO_RECORD_SECONDS"].flatMap(Double.init) {
             Timer.scheduledTimer(withTimeInterval: seconds, repeats: false) { [weak self] _ in
                 MainActor.assumeIsolated { self?.engine.toggleRecording() }
