@@ -131,4 +131,91 @@ final class StudioModePreviewTests: XCTestCase {
         engine.take()
         XCTAssertEqual(isHidden(engine.scene, id), before, "take() with studio OFF must not change the program")
     }
+
+    // MARK: - STAGE 2: TAKE runs the currently-selected transition
+
+    /// Phase 3a Stage 2: with `transitionEnabled` ON, TAKE runs the operator's
+    /// selected transition (a dissolve) instead of a hard cut. Reproduce-first —
+    /// against the Stage-1 hard-cut `take()` the "transition completes" assertion
+    /// is RED (a hard cut never starts an animated transition, so
+    /// `transitionsCompleted` never advances); after Stage 2 it is GREEN.
+    ///
+    /// Proves all three Stage-2 claims: (a) NOT instant — the transition is
+    /// in-flight right after TAKE, so it has not completed yet; (b) it runs to
+    /// completion over `transitionDuration` (`RenderLoop.Stats.transitionsCompleted`
+    /// increments); (c) the off-air preview is UNCHANGED across the transition.
+    func testTakeWithDissolveRunsTheTransitionNotAnInstantCut() async throws {
+        let (engine, id) = try engineWithOneLayer()
+        guard let loop = engine.renderLoop else {
+            await engine.shutdown(); throw XCTSkip("no render loop (Metal unavailable)")
+        }
+        engine.setStingerMedia(nil)          // ensure a COMPOSITOR transition, not a stinger
+        engine.setTransitionEnabled(true)
+        engine.setTransitionKind(.dissolve)
+        engine.setTransitionDuration(0.5)
+        engine.studioMode = true
+        engine.setLayerHidden(true, for: id) // off-air edit → a real preview≠program switch
+        XCTAssertEqual(isHidden(engine.scene, id), false, "pre-TAKE: the program is still unedited")
+
+        let previewIDsBefore = engine.previewScene.layers.map(\.sourceID)
+        let completedBefore = loop.stats.transitionsCompleted
+
+        engine.take()
+
+        // (a) NOT an instant cut: the dissolve is in-flight, so it has not finished.
+        XCTAssertEqual(loop.stats.transitionsCompleted, completedBefore,
+                       "TAKE with a dissolve must NOT complete instantly — the transition should be in-flight")
+        // The preview edit is committed as the new program base scene; the render
+        // loop animates the program pixels toward it over `transitionDuration`.
+        XCTAssertEqual(isHidden(engine.scene, id), true,
+                       "TAKE commits the preview edit as the program's new base scene")
+        // (c) Preview is UNCHANGED across the on-air transition.
+        XCTAssertEqual(engine.previewScene.layers.map(\.sourceID), previewIDsBefore,
+                       "the off-air preview scene must be UNCHANGED across the on-air transition")
+        XCTAssertEqual(isHidden(engine.previewScene, id), true,
+                       "the preview keeps showing the taken (incoming) scene during the transition")
+
+        // (b) After `transitionDuration` elapses the transition COMPLETES.
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline, loop.stats.transitionsCompleted == completedBefore {
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertGreaterThan(loop.stats.transitionsCompleted, completedBefore,
+                             "the dissolve TAKE must run to completion (transitionsCompleted increments)")
+        // Preview STILL unchanged once the transition has landed.
+        XCTAssertEqual(engine.previewScene.layers.map(\.sourceID), previewIDsBefore,
+                       "the preview must remain unchanged after the transition completes")
+        await engine.shutdown()
+    }
+
+    /// Stage-2 preserves Stage-1: with `transitionEnabled` OFF, TAKE is an instant
+    /// hard cut — the program base scene is the preview edit IMMEDIATELY and no
+    /// animated transition is ever started (a hard cut never increments
+    /// `transitionsCompleted`). This is the negative control for the dissolve test.
+    func testTakeWithTransitionsOffIsAnInstantHardCut() async throws {
+        let (engine, id) = try engineWithOneLayer()
+        guard let loop = engine.renderLoop else {
+            await engine.shutdown(); throw XCTSkip("no render loop (Metal unavailable)")
+        }
+        engine.setTransitionEnabled(false)   // transitions OFF → Stage-1 hard cut
+        engine.setTransitionDuration(0.5)
+        engine.studioMode = true
+        engine.setLayerHidden(true, for: id)
+
+        let completedBefore = loop.stats.transitionsCompleted
+        engine.take()
+
+        // Instant: the edit is on the program base scene synchronously…
+        XCTAssertEqual(isHidden(engine.scene, id), true,
+                       "TAKE-off must hard-cut the preview edit onto the program immediately")
+        XCTAssertEqual(engine.previewScene.layers.map(\.sourceID), engine.scene.layers.map(\.sourceID),
+                       "after a hard-cut TAKE, preview and program stay in sync (Stage-1 behavior)")
+
+        // …and no transition ran. Give the running loop time to (not) complete one.
+        let deadline = Date().addingTimeInterval(1)
+        while Date() < deadline { try? await Task.sleep(nanoseconds: 20_000_000) }
+        XCTAssertEqual(loop.stats.transitionsCompleted, completedBefore,
+                       "a hard-cut TAKE must NOT run a transition (transitionsCompleted unchanged)")
+        await engine.shutdown()
+    }
 }

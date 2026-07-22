@@ -6180,19 +6180,38 @@ final class AppEngine: ObservableObject {
         suppressSceneRenderApply = false
     }
 
-    /// Studio hard-cut TAKE (Phase 3a Stage 1): commit the off-air `previewScene`
-    /// to the live program as an atomic HARD CUT, reusing `performSceneCommit`
-    /// with a nil transition (`RenderLoop.switchScene` does the immediate swap).
-    /// After this the program shows `previewScene`; `scene` and `previewScene`
-    /// are left equal so the next off-air edit starts from what is now live.
-    /// No-op unless studio mode is on. (Stage 2 adds transitions to TAKE.)
+    /// Studio TAKE (Phase 3a): commit the off-air `previewScene` to the live
+    /// program. When `transitionEnabled` is ON this runs the operator's
+    /// CURRENTLY-SELECTED transition (Stage 2); when OFF it is an atomic HARD CUT
+    /// (Stage-1 behavior, preserved). No-op unless studio mode is on.
+    ///
+    /// The transition path reuses the EXACT live scene-switch engine — no new
+    /// transition code. `commitSceneAnimated(incoming)` selects a stinger schedule
+    /// (`liveStingerSchedule`) when one is armed/selected, otherwise falls through
+    /// to `performSceneCommit`'s non-stinger branch
+    /// (`transitionSchedule(outgoing: scene, incoming: previewScene)`) — identical
+    /// to a live scene switch, so TAKE animates over `transitionDuration` on the
+    /// program instead of cutting instantly.
+    ///
+    /// `previewScene` is deliberately NOT reassigned on the transition path: it
+    /// already equals `incoming` (what the program lands on once the transition
+    /// finishes), so the off-air preview keeps showing `incoming` UNCHANGED across
+    /// the on-air transition — including the stinger async-cue path, where `scene`
+    /// is committed later on the render thread (reassigning here would momentarily
+    /// snap the preview back to the outgoing scene).
     func take() {
         guard studioMode else { return }
         let incoming = previewScene
-        let outgoing = scene
-        performSceneCommit(incoming, outgoing: outgoing, stingerItem: nil, hardCut: true)
-        // `performSceneCommit` set `scene = incoming`; keep the preview equal to it.
-        previewScene = scene
+        guard transitionEnabled else {
+            // Transitions OFF: atomic hard cut (`RenderLoop.switchScene` swaps
+            // immediately). `performSceneCommit` sets `scene = incoming`; keep the
+            // preview equal to it so the next off-air edit starts from what is live.
+            performSceneCommit(incoming, outgoing: scene, stingerItem: nil, hardCut: true)
+            previewScene = scene
+            return
+        }
+        // Transitions ON: run the selected transition via the live scene-switch path.
+        commitSceneAnimated(incoming)
     }
 
     /// Pure cue evaluator used by the live schedule and App regression tests.
