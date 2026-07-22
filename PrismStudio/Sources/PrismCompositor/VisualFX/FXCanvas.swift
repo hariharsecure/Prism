@@ -85,6 +85,15 @@ public final class FXCanvas {
         ctx.clear(rect)
         try draw(ctx)
         ctx.flush()
+        // Phase 2e: this canvas draws sRGB content (`colorSpace` above) — the shared
+        // ground-truth surface for every FXCanvas-backed GENERATED overlay
+        // (MotionGraphics / Caption / Ticker / AnimatedLogo / CreditsRoll). It must
+        // carry its OWN colorimetry, not reach the HDR compositor UNTAGGED: an untagged
+        // buffer is decoded with the Rec.709 EOTF instead of the sRGB EOTF (correct
+        // primaries, wrong transfer → ~3.8% mid-tone error, a generated gray 128 → ≈765
+        // instead of ≈726). Stamp sRGB/709 exactly as `SourceRenderCanvas` and
+        // `BackgroundEffect.replace` already do. The SDR compositor ignores the tags.
+        YCbCrTags.stampSRGB(buffer)
         return buffer
     }
 
@@ -102,6 +111,10 @@ public final class FXCanvas {
             throw VisualFXError.contextCreationFailed
         }
         fill(base.assumingMemoryBound(to: UInt8.self), CVPixelBufferGetBytesPerRow(buffer))
+        // Phase 2e: same sRGB content as `render` (the glitch / RGB-split effect writes
+        // sRGB bytes directly) — tag it sRGB/709 so it is not decoded as Rec.709 EOTF in
+        // the HDR compositor (see `render`).
+        YCbCrTags.stampSRGB(buffer)
         return buffer
     }
 

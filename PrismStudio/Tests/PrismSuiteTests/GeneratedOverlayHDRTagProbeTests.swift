@@ -10,29 +10,31 @@ import PrismCore
 /// CreditsRoll / MotionGraphics / CaptionRenderer — every `FXCanvas`-backed
 /// overlay source) composites into an HDR (HLG / Rec.2020) program.
 ///
-/// Motivation: those overlay sources render sRGB content into an **untagged**
-/// BGRA `FXCanvas` buffer (`FXCanvas.render` mints a pooled buffer and attaches
-/// no colorimetry; `TimedVideoSource.emit` / the app overlay sources emit it as
-/// a plain `VideoFrame` with no `stampSRGB`). An untagged buffer in the HDR
-/// compositor is decoded as **Rec.709** (`YCbCrTags.transferCode == 0`,
-/// `primariesRotationCode == 1`): correct 709/sRGB PRIMARIES (709→2020 rotation),
-/// but the **Rec.709 EOTF instead of the sRGB EOTF**.
+/// Phase 2e FIX (was a documented MEDIUM edge): those overlay sources render sRGB
+/// content into an `FXCanvas` BGRA buffer that used to be emitted **untagged**.
+/// An untagged buffer in the HDR compositor is decoded as **Rec.709**
+/// (`YCbCrTags.transferCode == 0`): correct 709/sRGB PRIMARIES (709→2020 rotation),
+/// but the **Rec.709 EOTF instead of the sRGB EOTF** — a ~3.8% mid-tone transfer
+/// error (a generated gray 128 → ≈765/1023 instead of the correct ≈726).
 ///
-/// This probe renders the real `FXCanvas` raster backend (the ground-truth
-/// surface shared by every generated overlay) through the real `MetalCompositor`
-/// in `.hdr` mode, reads back the 10-bit program, and compares against three
-/// independent from-spec oracles:
-///   • CORRECT   = sRGB EOTF → (709→2020 linear) → HLG OETF   (what a stamped
-///                 sRGB overlay would give),
-///   • MEASURED-EXPECTED (current, untagged) = 709 EOTF → … → HLG,
-///   • WORST-CASE (badly wrong) = if the overlay were stamped the program's HLG
-///     transfer, the sRGB value would be HLG-inverse-decoded (grossly dark).
+/// `FXCanvas.render` / `renderRaw` now call `YCbCrTags.stampSRGB(buffer)` (matching
+/// `SourceRenderCanvas` and `BackgroundEffect.replace`), so the overlay carries its
+/// OWN sRGB/709 colorimetry and the compositor decodes it with the **sRGB EOTF**.
 ///
-/// Finding (see KNOWN_LIMITATIONS.md "Generated overlays untagged in HDR"): the
-/// measured value tracks the 709-EOTF oracle, NOT the HLG worst case. On the
-/// neutral axis the residual sRGB-vs-709 transfer error is small (~39/1023 ≈
-/// 3.8% of range at mid-gray) and ZERO at black / white / a saturated primary.
-/// Primaries are correct. This is a documented MEDIUM edge, not a HIGH.
+/// This probe renders the real `FXCanvas` raster backend (the ground-truth surface
+/// shared by every generated overlay) through the real `MetalCompositor` in `.hdr`
+/// mode, reads back the 10-bit program, and compares against three independent
+/// from-spec oracles:
+///   • CORRECT (post-fix, stamped sRGB) = sRGB EOTF → (709→2020 linear) → HLG OETF,
+///   • PRE-FIX WRONG (untagged → 709 EOTF) = 709 EOTF → … → HLG (≈765 at mid-gray,
+///     ~39/1023 above the correct value — the bug this fix removes),
+///   • WORST-CASE = if the overlay were stamped the program's HLG transfer, the sRGB
+///     value would be HLG-inverse-decoded (grossly dark ≈513).
+///
+/// Finding: after the fix the measured mid-gray tracks the sRGB-EOTF oracle (≈726),
+/// NOT the pre-fix 709 value (≈765) and NOT the HLG worst case. Primaries were always
+/// correct; the fix corrects the transfer. Black / white / a saturated primary are
+/// ZERO-error on BOTH transfers, so they stay unchanged (a pure primary is a control).
 final class GeneratedOverlayHDRTagProbeTests: XCTestCase {
 
     private let W = 256, H = 144
@@ -74,21 +76,36 @@ final class GeneratedOverlayHDRTagProbeTests: XCTestCase {
         return (Int(word & 0x3FF), Int((word >> 10) & 0x3FF), Int((word >> 20) & 0x3FF))
     }
 
-    /// Prove the untagged FXCanvas overlay buffer really carries NO colorimetry —
-    /// so the compositor's untagged→Rec.709 default is what actually runs.
-    func testGeneratedOverlayBufferIsUntagged() throws {
+    private func attachmentEquals(_ buf: CVPixelBuffer, _ key: CFString, _ expected: CFString) -> Bool {
+        guard let raw = CVBufferCopyAttachment(buf, key, nil) else { return false }
+        return CFEqual(raw as AnyObject, expected)
+    }
+
+    /// Phase 2e: prove the generated FXCanvas overlay buffer now carries the sRGB/709
+    /// colorimetry `stampSRGB` writes — so the compositor decodes it with the sRGB EOTF
+    /// (correct), not the untagged→Rec.709 default (the pre-fix bug).
+    func testGeneratedOverlayBufferIsStampedSRGB() throws {
         let canvas = try FXCanvas(width: W, height: H)
         let buf = try canvas.solid(RGBA(r: 0.50196, g: 0.50196, b: 0.50196))
-        XCTAssertNil(CVBufferCopyAttachment(buf, kCVImageBufferColorPrimariesKey, nil),
-                     "FXCanvas overlay buffer unexpectedly carries ColorPrimaries")
-        XCTAssertNil(CVBufferCopyAttachment(buf, kCVImageBufferTransferFunctionKey, nil),
-                     "FXCanvas overlay buffer unexpectedly carries TransferFunction")
-        XCTAssertNil(CVBufferCopyAttachment(buf, kCVImageBufferCGColorSpaceKey, nil),
-                     "FXCanvas overlay buffer unexpectedly carries a CGColorSpace name")
+        XCTAssertTrue(attachmentEquals(buf, kCVImageBufferColorPrimariesKey,
+                                       kCVImageBufferColorPrimaries_ITU_R_709_2),
+                      "FXCanvas overlay buffer must be stamped Rec.709 primaries")
+        XCTAssertTrue(attachmentEquals(buf, kCVImageBufferTransferFunctionKey,
+                                       kCVImageBufferTransferFunction_sRGB),
+                      "FXCanvas overlay buffer must be stamped the sRGB transfer (not left untagged → Rec.709 EOTF)")
+        XCTAssertTrue(attachmentEquals(buf, kCVImageBufferYCbCrMatrixKey,
+                                       kCVImageBufferYCbCrMatrix_ITU_R_709_2),
+                      "FXCanvas overlay buffer must be stamped the Rec.709 matrix")
+        // The raw-fill effect path (glitch / RGB-split) is stamped too.
+        let raw = try canvas.render { ctx in ctx.setFillColor(RGBA(r: 0.5, g: 0.5, b: 0.5).cg); ctx.fill(canvas.rect) }
+        XCTAssertTrue(attachmentEquals(raw, kCVImageBufferTransferFunctionKey,
+                                       kCVImageBufferTransferFunction_sRGB),
+                      "render() output must be stamped sRGB")
     }
 
     /// Render a generated sRGB overlay (mid-gray + saturated red) through the real
-    /// HDR compositor and classify the color error against from-spec oracles.
+    /// HDR compositor and classify the color against from-spec oracles: the mid-gray
+    /// now decodes via the sRGB EOTF (≈726), NOT the pre-fix Rec.709 EOTF (≈765).
     func testGeneratedOverlayCompositedIntoHDRProgram() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw XCTSkip("no Metal device")
@@ -107,28 +124,32 @@ final class GeneratedOverlayHDRTagProbeTests: XCTestCase {
         let g = read10(grayProgram, x: cx, y: cy)
 
         let v = 128.0 / 255.0
-        let correctGray  = Int((hlgOETF(srgbEOTF(v)) * 1023).rounded())          // stamped-sRGB oracle
-        let untaggedGray = Int((hlgOETF(eotf709(v)) * 1023).rounded())           // current untagged→709 path
-        let hlgMisdecode = Int((hlgOETF(hlgInverseOETF(v)) * 1023).rounded())    // worst case if stamped HLG
+        let correctGray  = Int((hlgOETF(srgbEOTF(v)) * 1023).rounded())          // stamped-sRGB oracle ≈726
+        let preFixGray   = Int((hlgOETF(eotf709(v)) * 1023).rounded())           // pre-fix untagged→709 ≈765 (the BUG)
+        let hlgMisdecode = Int((hlgOETF(hlgInverseOETF(v)) * 1023).rounded())    // worst case if stamped HLG ≈513
         let measuredGray = g.g                                                   // neutral: channels equal
 
         let errVsCorrect = abs(measuredGray - correctGray)
+        let errVsPreFix  = abs(measuredGray - preFixGray)
         let errVsWorst   = abs(measuredGray - hlgMisdecode)
-        print("[overlay-HDR probe] gray128 measured=\(measuredGray) | correct-sRGB≈\(correctGray) untagged-709≈\(untaggedGray) HLG-misdecode≈\(hlgMisdecode) | err vs correct=\(errVsCorrect)/1023 (\(String(format: "%.1f", Double(errVsCorrect) / 1023 * 100))%)")
+        print("[overlay-HDR probe] gray128 measured=\(measuredGray) | correct-sRGB≈\(correctGray) pre-fix-709≈\(preFixGray) HLG-misdecode≈\(hlgMisdecode) | err vs correct=\(errVsCorrect)/1023 vs pre-fix=\(errVsPreFix)/1023")
 
-        // 1. The compositor decodes the untagged overlay as Rec.709 (NOT sRGB, NOT HLG).
-        XCTAssertEqual(measuredGray, untaggedGray, accuracy: 12,
-                       "untagged overlay should decode via the Rec.709 EOTF path")
-        // 2. It is NOT the badly-wrong HLG-misdecode (that would be grossly dark ≈513).
+        // Discriminator sanity: the sRGB and 709 oracles differ enough to tell apart.
+        XCTAssertGreaterThan(abs(correctGray - preFixGray), 25,
+                             "sRGB vs 709 mid-gray oracles too close to discriminate (\(correctGray) vs \(preFixGray))")
+
+        // 1. The stamped overlay now decodes via the sRGB EOTF (the FIX).
+        XCTAssertEqual(measuredGray, correctGray, accuracy: 12,
+                       "stamped overlay should decode via the sRGB EOTF (≈726)")
+        // 2. It is NOT the pre-fix untagged→Rec.709 value (≈765) — the bug is gone.
+        XCTAssertGreaterThan(errVsPreFix, 20,
+                             "measured gray still matches the pre-fix Rec.709-EOTF value \(preFixGray) — stampSRGB did not take effect")
+        // 3. It is NOT the badly-wrong HLG-misdecode (that would be grossly dark ≈513).
         XCTAssertGreaterThan(errVsWorst, 150,
                              "measured gray is near the HLG-misdecode value — that WOULD be a HIGH")
-        // 3. The residual sRGB-vs-709 error is a small, bounded transfer diff → MEDIUM.
-        XCTAssertLessThan(errVsCorrect, 60,
-                          "sRGB-vs-709 gray error unexpectedly large — re-classify")
-        XCTAssertGreaterThan(errVsCorrect, 20,
-                             "gray error vanished — overlay may now be stamped sRGB; update the ledger")
 
-        // ---- Saturated sRGB RED (255,0,0): sRGB & 709 EOTF agree at 0 and 1 → ZERO transfer error ----
+        // ---- Saturated sRGB RED (255,0,0): sRGB & 709 EOTF agree at 0 and 1 → ZERO transfer error,
+        //      so red is a CONTROL — unchanged by the fix. ----
         let redBuf = try canvas.solid(RGBA(r: 1, g: 0, b: 0))
         let redID = SourceID("probe.overlay.red")
         let redProgram = try compositor.composite(
@@ -137,7 +158,7 @@ final class GeneratedOverlayHDRTagProbeTests: XCTestCase {
             pts: CMTimeAdd(t0, CMTime(value: 1, timescale: 60)))
         let r = read10(redProgram, x: cx, y: cy)
 
-        // Oracle: EOTF(1)=1 for BOTH sRGB and 709, so correct == untagged for a pure primary.
+        // Oracle: EOTF(1)=1 for BOTH sRGB and 709, so correct == pre-fix for a pure primary.
         let (lr, lg, lb) = rotate709to2020(1, 0, 0)
         let oracleR = Int((hlgOETF(lr) * 1023).rounded())
         let oracleG = Int((hlgOETF(lg) * 1023).rounded())

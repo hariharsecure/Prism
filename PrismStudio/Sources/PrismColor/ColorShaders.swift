@@ -30,8 +30,11 @@ import Foundation
 /// re-premultiplies the output by α (sol #11 #3), so an alpha-bearing source is
 /// graded on its TRUE color — not the α-darkened premultiplied color. Opaque
 /// (α==1) and the YUV variants (α always 1) divide by one → byte-identical.
-/// (The `relight_bgra` kernel still grades the premultiplied rgb in place —
-/// exact for α∈{0,1}; a partial-α relight edge is out of #3's scope.)
+/// (Phase 2e: the `relight_bgra` kernel NOW un-premultiplies the sampled rgb
+/// the same way — shades the STRAIGHT color and re-premultiplies by α — because
+/// the Blinn specular is an ADDITIVE linear-light term, so shading the α-darkened
+/// premultiplied rgb is NOT equivalent to shading·α for a partial-α source.
+/// Opaque (α==1) and the YUV variant (α always 1) divide by one → byte-identical.)
 enum ColorShaders {
     static let source = """
     #include <metal_stdlib>
@@ -437,9 +440,16 @@ enum ColorShaders {
         float2 size = float2(dst.get_width(), dst.get_height());
         float2 uv = (float2(gid) + 0.5) / size;
         float4 src4 = src.sample(s, uv);
-        // Preserve the input matte (see prism_grade_bgra). YUV sources have no
-        // alpha, so the YUV relight below stays opaque (α=1).
-        dst.write(float4(relight_rgb(src4.rgb, uv, 1.0 / size, depthTex, u, lights), src4.a), gid);
+        // Phase 2e: the sampled BGRA rgb is PREMULTIPLIED by α. Un-premultiply to
+        // the STRAIGHT color (guard α==0) BEFORE shading, then RE-premultiply by α —
+        // exactly the prism_grade_bgra pattern. The Blinn specular adds a constant in
+        // linear light (litLin = lin·diffuse + specular), so shading the α-darkened
+        // premultiplied rgb ≠ shading straight then ·α for a partial-α source. OPAQUE
+        // (α==1) and the YUV relight below (α always 1) divide by one → BYTE-IDENTICAL.
+        // The input matte (α) carries through unchanged (see prism_grade_bgra).
+        float a = src4.a;
+        float3 straight = (a > 0.0) ? src4.rgb / a : src4.rgb;
+        dst.write(float4(relight_rgb(straight, uv, 1.0 / size, depthTex, u, lights) * a, a), gid);
     }
 
     kernel void prism_relight_yuv(texture2d<float, access::sample> lumaTex [[texture(0)]],

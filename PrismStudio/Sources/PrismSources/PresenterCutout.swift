@@ -478,7 +478,7 @@ public final class PresenterCutout {
                 let a = alpha[alphaRow + x] // already clamped 0…1
                 let ip = inRowPtr + x * 4
                 let op = outRowPtr + x * 4
-                let ib = Float(ip[0]), ig = Float(ip[1]), ir = Float(ip[2])
+                let ib = Float(ip[0]), ig = Float(ip[1]), ir = Float(ip[2]), ia = Float(ip[3])
                 if let fill {
                     // Opaque composite over solid colour: out = in·a + bg·(1-a).
                     let inv = 1 - a
@@ -487,11 +487,20 @@ public final class PresenterCutout {
                     op[2] = UInt8((ir * a + fill.r * inv).rounded().clampedByte)
                     op[3] = 255
                 } else {
-                    // Premultiplied transparent: out.rgb = in.rgb·a, out.a = a.
+                    // Premultiplied transparent: out.rgb = in.rgb·a, out.a = srcA·a.
+                    // Phase 2e: INTERSECT the matte with the source's OWN coverage α
+                    // (input byte 3) instead of emitting the matte alone (out.a = a).
+                    // The GPU `.remove` path already intersects (m·srcA); this CPU
+                    // reference/fallback (Metal-unavailable + GPU-fault recovery) still
+                    // wrote out.a = a, so an alpha-bearing source (input α<1) came back
+                    // OPAQUE under an all-person matte (a=1 → α=255 instead of srcA). The
+                    // premultiplied rgb (in.rgb = straight·srcA, ·a here) already carries
+                    // srcA, so it stays consistent with the α. OPAQUE input (ia==255) →
+                    // ia·a == a·255 → BYTE-IDENTICAL (the GPU-vs-CPU oracle still holds).
                     op[0] = UInt8((ib * a).rounded().clampedByte)
                     op[1] = UInt8((ig * a).rounded().clampedByte)
                     op[2] = UInt8((ir * a).rounded().clampedByte)
-                    op[3] = UInt8((a * 255).rounded().clampedByte)
+                    op[3] = UInt8((ia * a).rounded().clampedByte)
                 }
             }
         }

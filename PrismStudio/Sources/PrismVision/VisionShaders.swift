@@ -203,10 +203,21 @@ enum VisionShaders {
             return float4(rgb * m, outA);
         } else if (mode == 1) {
             // Blur: sharp foreground over blurred background.
-            return float4(mix(blurred, rgb, m), 1.0);
+            // Phase 2e: PRESERVE the source's own coverage α instead of forcing 1.0.
+            // An alpha-bearing source (input α<1) became fully OPAQUE under blur (a PNG
+            // overlay's transparent holes filled in). Both `rgb` and `blurred` are already
+            // premultiplied by srcA (blurred is the blur of the premultiplied source), so
+            // their mix is premultiplied by srcA and the output α = srcA is consistent.
+            // OPAQUE BGRA and YUV (srcA==1) are BYTE-IDENTICAL (α=1.0 as before).
+            return float4(mix(blurred, rgb, m), srcA);
         }
         // Replace: solid color background.
-        return float4(mix(u.replaceColor.rgb, rgb, m), 1.0);
+        // Phase 2e: PRESERVE the source's coverage α (was forced 1.0, making an
+        // alpha-bearing source opaque under replace). `rgb` is premultiplied by srcA;
+        // premultiply the (straight, coded) replacement color by srcA too so the whole
+        // mix is premultiplied by srcA and the output α = srcA is consistent. OPAQUE
+        // BGRA and YUV (srcA==1) are BYTE-IDENTICAL (replaceColor·1, α=1.0 as before).
+        return float4(mix(u.replaceColor.rgb * srcA, rgb, m), srcA);
     }
 
     kernel void prism_bg_bgra(texture2d<float, access::sample> src [[texture(0)]],
