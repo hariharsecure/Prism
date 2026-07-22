@@ -1305,6 +1305,15 @@ final class AppEngine: ObservableObject {
     /// restore/restart the original source (the pre-fix behaviour) — leaving the registered backing
     /// stranded `.idle` (dark) with only `lastError` set. The fix restores + restarts a raw feed.
     static var _test_skipCutoutFailureRestore = false
+    /// TEST HOOK (2a — transactional reconfigure): when true, the `prepare` step of a montage /
+    /// movie-loop reconfigure throws — simulating a replacement whose first asset is missing/corrupt
+    /// (its eager first-frame load fails at `start()`). Exercises the roll-back path.
+    static var _test_forceReconfigFailure = false
+    /// NEGATIVE CONTROL (2a): when true, a montage / movie-loop reconfigure STOPS the predecessor
+    /// BEFORE building its replacement (the pre-fix ordering). With `_test_forceReconfigFailure`,
+    /// the replacement then fails and the predecessor is left stranded (stopped, no recovery) —
+    /// reproducing the bug the transactional (build-validate-then-swap) fix eliminates.
+    static var _test_reconfigStopPredecessorFirst = false
     /// sol #10 #2/#3 test hook: fired INSIDE every gated screen delivery body, UNDER the gate
     /// lock (between the concurrency `enter` and `exit`). A forced-overlap probe pins one
     /// generation's body here (holding its gate lock) while it drives the other generation, to
@@ -2979,32 +2988,52 @@ final class AppEngine: ObservableObject {
             return
         }
         let descriptor = activeSources[index].descriptor
-        do {
-            let source = try MovieSource(id: id, fileURL: entry.fileURL,
-                                         canvasSize: Self.sourceCanvas,
-                                         contentMode: .aspectFit, loop: loop)
-            let pipeline = effectPipelines[id]
-            source.onFrame = { [mailbox, monitor = linkDebugMonitor, pipeline, isoTap, verticalTap, directorTap, sid = id] frame in
-                Self.deliverSourceFrame(frame, pipeline: pipeline, monitor: monitor,
-                                        isoTap: isoTap, verticalTap: verticalTap,
-                                        directorTap: directorTap, sid: sid, mailbox: mailbox)
-            }
-            // Reuse the existing mixer channel (same id) if the clip has audio.
-            if source.hasAudioTrack, let channel = audioMixer.channel(id: id) {
-                source.onAudio = { [multitrackTap] packet in
-                    channel.ingest(packet)
-                    multitrackTap.append(packet)
+        // 2a: transactional. Build + start (validate) the replacement decoder BEFORE
+        // stopping the predecessor; on failure the predecessor keeps running and only
+        // `lastError` is set — the raw movie-loop branch never strands the source.
+        #if DEBUG
+        let stopFirst = Self._test_reconfigStopPredecessorFirst
+        #else
+        let stopFirst = false
+        #endif
+        if stopFirst { entry.source.stop() }   // NEGATIVE CONTROL: pre-fix ordering.
+        reconfigureTransactionally(
+            prepare: { () throws -> MovieSource in
+                #if DEBUG
+                if Self._test_forceReconfigFailure {
+                    throw SourceError.mediaLoadFailed(path: "\(id.raw) (forced reconfigure failure)", underlying: nil)
                 }
+                #endif
+                let source = try MovieSource(id: id, fileURL: entry.fileURL,
+                                             canvasSize: Self.sourceCanvas,
+                                             contentMode: .aspectFit, loop: loop)
+                let pipeline = self.effectPipelines[id]
+                source.onFrame = { [mailbox, monitor = self.linkDebugMonitor, pipeline, isoTap = self.isoTap, verticalTap = self.verticalTap, directorTap = self.directorTap, sid = id] frame in
+                    Self.deliverSourceFrame(frame, pipeline: pipeline, monitor: monitor,
+                                            isoTap: isoTap, verticalTap: verticalTap,
+                                            directorTap: directorTap, sid: sid, mailbox: mailbox)
+                }
+                // Reuse the existing mixer channel (same id) if the clip has audio.
+                if source.hasAudioTrack, let channel = self.audioMixer.channel(id: id) {
+                    source.onAudio = { [multitrackTap = self.multitrackTap] packet in
+                        channel.ingest(packet)
+                        multitrackTap.append(packet)
+                    }
+                }
+                try source.start()   // validates the replacement (a bad file throws HERE)
+                return source
+            },
+            commit: { source in
+                if !stopFirst { entry.source.stop() }   // old decoder's closures go quiet — only now
+                self.movieSources[id] = MovieEntry(source: source, fileURL: entry.fileURL,
+                                                   loop: loop, scoped: entry.scoped)
+                self.activeSources[index] = ActiveSource(id: id, descriptor: descriptor,
+                                                         backing: .movie(source), mailbox: mailbox)
+            },
+            rollback: { error in
+                self.lastError = "Couldn't update loop for \(descriptor.name): \(error.localizedDescription)"
             }
-            entry.source.stop()        // old decoder's closures go quiet
-            try source.start()
-            movieSources[id] = MovieEntry(source: source, fileURL: entry.fileURL,
-                                          loop: loop, scoped: entry.scoped)
-            activeSources[index] = ActiveSource(id: id, descriptor: descriptor,
-                                                backing: .movie(source), mailbox: mailbox)
-        } catch {
-            lastError = "Couldn't update loop for \(descriptor.name): \(error.localizedDescription)"
-        }
+        )
     }
 
     // MARK: - Montage source (Build B: auto-cycling image/video reel)
@@ -3186,10 +3215,41 @@ final class AppEngine: ObservableObject {
         for pipeline in effectPipelines.values { pipeline.setBeatClock(clock) }
     }
 
+    /// Transactional source reconfiguration (2a — the prepare/commit/rollback
+    /// primitive). Builds AND validates the replacement in `prepare` (which STARTS
+    /// it, so a missing/corrupt first asset throws there) WITHOUT touching the
+    /// predecessor. Only a confirmed-good replacement is `commit`ted (the caller
+    /// stops the predecessor and swaps it in). If `prepare` throws, the predecessor
+    /// is left running untouched and `rollback` records the error — the source is
+    /// NEVER stranded (the pre-fix ordering stopped the predecessor first, so a
+    /// failing replacement left it stopped with no recovery).
+    ///
+    /// The closures run synchronously and in order (`prepare` → `commit`, or
+    /// `prepare` → `rollback`); nothing escapes, so a caller may safely capture
+    /// `self` / local `let`s.
+    private func reconfigureTransactionally<Replacement>(
+        prepare: () throws -> Replacement,
+        commit: (Replacement) -> Void,
+        rollback: (Error) -> Void
+    ) {
+        let replacement: Replacement
+        do {
+            replacement = try prepare()
+        } catch {
+            rollback(error)
+            return
+        }
+        commit(replacement)
+    }
+
     /// Live-reconfigure a montage. Its params are fixed at init, so this REBUILDS
     /// the `MontageSource` in place — reusing the SourceID, mailbox, effect
     /// pipeline, and scene layer (only the backing decoder is swapped) — so the
     /// layer never leaves the scene. Mirrors `setMovieLoop`.
+    ///
+    /// 2a: transactional. The replacement is built + started (validated) BEFORE the
+    /// predecessor is stopped; on failure the predecessor keeps running and only
+    /// `lastError` is set — it is never stranded.
     func reconfigureMontage(for id: SourceID, interval: Double? = nil,
                             transition: MontageSource.Transition? = nil,
                             kenBurns: Bool? = nil, shuffle: Bool? = nil) {
@@ -3202,36 +3262,54 @@ final class AppEngine: ObservableObject {
         if let kenBurns { entry.kenBurns = kenBurns }
         if let shuffle { entry.shuffle = shuffle }
         let descriptor = activeSources[index].descriptor
-        do {
-            let source = try MontageSource(id: id, items: entry.items,
-                                           canvasSize: Self.sourceCanvas,
-                                           interval: entry.interval, transition: entry.transition,
-                                           kenBurns: entry.kenBurns, shuffle: entry.shuffle,
-                                           loop: entry.loop)
-            let pipeline = effectPipelines[id]
-            source.onFrame = { [mailbox, monitor = linkDebugMonitor, pipeline, isoTap, verticalTap, directorTap, sid = id] frame in
-                Self.deliverSourceFrame(frame, pipeline: pipeline, monitor: monitor,
-                                        isoTap: isoTap, verticalTap: verticalTap,
-                                        directorTap: directorTap, sid: sid, mailbox: mailbox)
-            }
-            // Reuse the existing mixer channel (same id) if the reel has audio — the
-            // item set is unchanged by a reconfigure, so hasAudioContent is stable
-            // (mirrors setMovieLoop's audio re-wire on an in-place rebuild).
-            if source.hasAudioContent, let channel = audioMixer.channel(id: id) {
-                source.onAudio = { [multitrackTap] packet in
-                    channel.ingest(packet)
-                    multitrackTap.append(packet)
+        #if DEBUG
+        let stopFirst = Self._test_reconfigStopPredecessorFirst
+        #else
+        let stopFirst = false
+        #endif
+        if stopFirst { old.stop() }   // NEGATIVE CONTROL: pre-fix ordering — retire before build.
+        reconfigureTransactionally(
+            prepare: { () throws -> MontageSource in
+                #if DEBUG
+                if Self._test_forceReconfigFailure {
+                    throw SourceError.mediaLoadFailed(path: "\(id.raw) (forced reconfigure failure)", underlying: nil)
                 }
+                #endif
+                let source = try MontageSource(id: id, items: entry.items,
+                                               canvasSize: Self.sourceCanvas,
+                                               interval: entry.interval, transition: entry.transition,
+                                               kenBurns: entry.kenBurns, shuffle: entry.shuffle,
+                                               loop: entry.loop)
+                let pipeline = self.effectPipelines[id]
+                source.onFrame = { [mailbox, monitor = self.linkDebugMonitor, pipeline, isoTap = self.isoTap, verticalTap = self.verticalTap, directorTap = self.directorTap, sid = id] frame in
+                    Self.deliverSourceFrame(frame, pipeline: pipeline, monitor: monitor,
+                                            isoTap: isoTap, verticalTap: verticalTap,
+                                            directorTap: directorTap, sid: sid, mailbox: mailbox)
+                }
+                // Reuse the existing mixer channel (same id) if the reel has audio — the
+                // item set is unchanged by a reconfigure, so hasAudioContent is stable
+                // (mirrors setMovieLoop's audio re-wire on an in-place rebuild).
+                if source.hasAudioContent, let channel = self.audioMixer.channel(id: id) {
+                    source.onAudio = { [multitrackTap = self.multitrackTap] packet in
+                        channel.ingest(packet)
+                        multitrackTap.append(packet)
+                    }
+                }
+                try source.start()   // validates the replacement (bad first item throws HERE)
+                return source
+            },
+            commit: { source in
+                if !stopFirst { old.stop() }   // retire the predecessor ONLY once the replacement is good
+                self.montageSources[id] = entry
+                self.activeSources[index] = ActiveSource(id: id, descriptor: descriptor,
+                                                         backing: .generated(source), mailbox: mailbox)
+                self.persistMontageDefaults(from: id)
+            },
+            rollback: { error in
+                // Predecessor untouched (still running); surface the error only.
+                self.lastError = "Couldn't update montage: \(error.localizedDescription)"
             }
-            old.stop() // old director queue goes quiet
-            try source.start()
-            montageSources[id] = entry
-            activeSources[index] = ActiveSource(id: id, descriptor: descriptor,
-                                                backing: .generated(source), mailbox: mailbox)
-            persistMontageDefaults(from: id)
-        } catch {
-            lastError = "Couldn't update montage: \(error.localizedDescription)"
-        }
+        )
     }
 
     /// Live-update the text of an added `TextSource` (inline sidebar editing).
@@ -7086,6 +7164,18 @@ extension AppEngine {
 
     /// Ids of live movie sources (proves an alpha ProRes 4444 movie registered).
     var integrationDebugMovieSourceIDs: [SourceID] { Array(movieSources.keys) }
+
+    /// Ids of live montage sources (2a — drives the transactional-reconfigure test).
+    var integrationDebugMontageSourceIDs: [SourceID] { Array(montageSources.keys) }
+
+    /// The live `.generated` backing registered for `id` (nil if the active source
+    /// isn't generated). Identity + `state` prove whether a transactional
+    /// reconfigure swapped the source or left the predecessor running (2a).
+    func integrationDebugGeneratedBacking(for id: SourceID) -> VideoSource? {
+        guard let s = activeSources.first(where: { $0.id == id }),
+              case .generated(let src) = s.backing else { return nil }
+        return src
+    }
 
     /// Count of live active (resting) scene sources (F15 reject-before-register).
     var integrationDebugActiveSourceCount: Int { activeSources.count }

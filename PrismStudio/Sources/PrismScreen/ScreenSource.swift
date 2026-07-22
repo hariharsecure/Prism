@@ -106,6 +106,18 @@ public final class ScreenSource: NSObject, VideoSource, AudioSource, @unchecked 
     public var state: SourceState { stateLock.withLock { $0 } }
 
     private let stateLock = OSAllocatedUnfairLock<SourceState>(initialState: .idle)
+    /// Monotonic lifecycle generation. `start()` arms a fresh generation and hands
+    /// it to the async `resolveAndStart`; `stop()` retires it. Because the start
+    /// path is async, a `stop()`+`start()` can race an in-flight `resolveAndStart`:
+    /// the retired task would otherwise pass the bare `state == .starting` check
+    /// (the RESTART set `.starting` again) and commit its stale stream over the
+    /// live one. Gating every async step on the captured generation drops the
+    /// retired task instead. It also drops SCK samples that a torn-down stream
+    /// keeps delivering across the boundary.
+    private let generation = GenerationGate()
+    /// The generation the CURRENTLY-running stream belongs to (read on the sample
+    /// queues, written when a start commits to `.running`).
+    private let runningGeneration = OSAllocatedUnfairLock<UInt64>(initialState: 0)
     private let target: ScreenTarget
     private var stream: SCStream?
     private let videoQueue = DispatchQueue(label: "studio.prism.screen.video")
@@ -157,8 +169,12 @@ public final class ScreenSource: NSObject, VideoSource, AudioSource, @unchecked 
         }
         guard ok else { throw ScreenSourceError.notIdle(state) }
 
+        // Arm a fresh generation for THIS start and hand it to the async task so a
+        // stop/restart that races the resolve retires this attempt (the successor
+        // owns a newer generation).
+        let gen = generation.bump()
         Task { [weak self] in
-            await self?.resolveAndStart()
+            await self?.resolveAndStart(generation: gen)
         }
     }
 
@@ -170,6 +186,10 @@ public final class ScreenSource: NSObject, VideoSource, AudioSource, @unchecked 
             return true
         }
         guard shouldStop else { return }
+
+        // Retire the running generation: an in-flight `resolveAndStart` and any
+        // sample a torn-down stream still delivers now fail the generation check.
+        generation.bump()
 
         let stream = self.stream
         self.stream = nil
@@ -184,15 +204,18 @@ public final class ScreenSource: NSObject, VideoSource, AudioSource, @unchecked 
 
     // MARK: - Async start path
 
-    private func resolveAndStart() async {
+    private func resolveAndStart(generation gen: UInt64) async {
         do {
             // Off-screen windows included so minimized/occluded windows stay capturable.
             let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false)
             let filter = try makeFilter(content: content)
             let streamConfig = makeStreamConfiguration(filter: filter)
 
-            // stop() may have raced us while we were resolving.
-            guard state == .starting else { return }
+            // A stop() — or a stop()+restart() — may have retired this attempt while
+            // we were resolving. Gate on the generation, not the bare state: a
+            // RESTART sets `.starting` again, so `state == .starting` would wrongly
+            // let this retired task proceed and commit its stale stream.
+            guard generation.isCurrent(gen) else { return }
 
             let stream = SCStream(filter: filter, configuration: streamConfig, delegate: self)
             if configuration.videoEnabled {
@@ -204,15 +227,21 @@ public final class ScreenSource: NSObject, VideoSource, AudioSource, @unchecked 
             self.stream = stream
             try await stream.startCapture()
 
-            guard state == .starting else {
-                // stop() raced startCapture; unwind.
+            guard generation.isCurrent(gen) else {
+                // stop()/restart raced startCapture; unwind this retired stream.
+                self.stream = nil
                 try? await stream.stopCapture()
                 return
             }
+            // Publish the generation frames must match BEFORE going live.
+            runningGeneration.withLock { $0 = gen }
             setState(.running)
             onStarted?()
             log.info("running: \(self.descriptor.id) \(streamConfig.width)x\(streamConfig.height) @\(self.configuration.targetFPS)fps audio=\(self.configuration.capturesAudio)")
         } catch {
+            // A retired attempt that failed must not clobber the live run's state or
+            // fire a stale onError into the successor.
+            guard generation.isCurrent(gen) else { return }
             self.stream = nil
             setState(.failed)
             log.error("start failed for \(self.descriptor.id): \(error.localizedDescription)")
@@ -308,6 +337,11 @@ public final class ScreenSource: NSObject, VideoSource, AudioSource, @unchecked 
     private func setState(_ new: SourceState) {
         stateLock.withLock { $0 = new }
     }
+
+    #if DEBUG
+    /// The live lifecycle generation (proves a stop→start advances it).
+    public var _test_generation: UInt64 { generation.current }
+    #endif
 }
 
 // MARK: - SCStreamOutput / SCStreamDelegate
@@ -315,6 +349,12 @@ public final class ScreenSource: NSObject, VideoSource, AudioSource, @unchecked 
 extension ScreenSource: SCStreamOutput, SCStreamDelegate {
 
     public func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
+        // Drop a sample that crossed a stop/restart boundary: it must come from the
+        // live stream AND the running generation, or it is a straggler from a
+        // retired run posting into the successor.
+        guard stream === self.stream else { return }
+        let armed = runningGeneration.withLock { $0 }
+        guard generation.isCurrent(armed) else { return }
         guard state == .running, CMSampleBufferIsValid(sampleBuffer) else { return }
         switch type {
         case .screen:
@@ -329,6 +369,11 @@ extension ScreenSource: SCStreamOutput, SCStreamDelegate {
     /// Mid-capture stop (window closed, app quit, permission revoked, display
     /// disconnected) → `.failed` + `onError`.
     public func stream(_ stream: SCStream, didStopWithError error: Error) {
+        // Only the live stream may fail the source: a retired stream's async stop
+        // error must not knock down the successor run.
+        guard stream === self.stream else { return }
+        let armed = runningGeneration.withLock { $0 }
+        guard generation.isCurrent(armed) else { return }
         self.stream = nil
         setState(.failed)
         log.error("stream stopped: \(self.descriptor.id): \(error.localizedDescription)")

@@ -2,6 +2,7 @@ import AVFoundation
 import CoreMedia
 import CoreVideo
 import Foundation
+import os
 import PrismCore
 
 /// One supported device format (dimensions + fps ranges), stable-indexed
@@ -98,6 +99,16 @@ public final class CameraSource: NSObject, VideoSource {
     private let signposter = EngineLog.signposter("capture.camera")
 
     private var configured = false
+    /// Monotonic lifecycle generation. `start()` arms a fresh generation for the
+    /// running session; `stop()` retires it. A capture callback that crosses the
+    /// stop (or a stop→restart) boundary — a frame still queued on `captureQueue`
+    /// when the session was torn down — no longer matches the armed generation and
+    /// is dropped, so it never posts into a retired (or successor) run.
+    private let generation = GenerationGate()
+    /// The generation the CURRENTLY-running session belongs to (read on
+    /// `captureQueue`, written on the control thread). Equal to the live generation
+    /// only while a session is running; a `stop()` bumps the live one past it.
+    private let sessionGeneration = OSAllocatedUnfairLock<UInt64>(initialState: 0)
     private var runtimeErrorObserver: NSObjectProtocol?
     private var selectedFormatIndex: Int?
     private var selectedFrameRate: Double?
@@ -257,6 +268,9 @@ public final class CameraSource: NSObject, VideoSource {
             state = .failed
             throw error
         }
+        // Arm a fresh generation for THIS session before frames can flow, so the
+        // delegate accepts only frames from the run it belongs to.
+        sessionGeneration.withLock { $0 = generation.bump() }
         session.startRunning()
         state = .running
         log.info("camera running: \(self.device.localizedName, privacy: .public)")
@@ -272,6 +286,10 @@ public final class CameraSource: NSObject, VideoSource {
     public func stop() {
         guard Self.stopPerformsTeardown(from: state) else { return }
         state = .stopping
+        // Retire the running generation: any frame still queued on captureQueue
+        // now fails the delegate's generation check and is dropped (a stale frame
+        // must never cross this boundary into a later run).
+        generation.bump()
         session.stopRunning() // no-op if the session already halted
         state = .idle
         log.info("camera stopped: \(self.device.localizedName, privacy: .public)")
@@ -281,6 +299,10 @@ public final class CameraSource: NSObject, VideoSource {
     /// Headless-verification seam (DEBUG builds only): force the lifecycle
     /// state without touching the capture session. Never call in production.
     public func _test_forceState(_ newState: SourceState) { state = newState }
+    /// The live lifecycle generation (proves a stop→start advances it).
+    public var _test_generation: UInt64 { generation.current }
+    /// The generation armed for the currently-running session.
+    public var _test_sessionGeneration: UInt64 { sessionGeneration.withLock { $0 } }
     #endif
 
     private func configureSessionIfNeeded() throws {
@@ -350,6 +372,14 @@ extension CameraSource: AVCaptureVideoDataOutputSampleBufferDelegate {
         didOutput sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection
     ) {
+        // Generation gate: drop a frame that crossed a stop/restart boundary. The
+        // frame's session generation was armed at `start()`; if `stop()` has since
+        // retired it (or a later run re-armed a newer one) the captured value no
+        // longer matches the live generation, so this stale frame is dropped
+        // instead of posting into a retired/successor run.
+        let armed = sessionGeneration.withLock { $0 }
+        guard generation.isCurrent(armed) else { return }
+
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
         // Zero-copy invariant (§3.5): only IOSurface-backed buffers enter the graph.
