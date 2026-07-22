@@ -28,6 +28,8 @@ struct LayerControlsView: View {
                     }
                 }
                 .accessibilityIdentifier("layers.layout.picker")
+                .accessibilityLabel("Scene layout")
+                .accessibilityHint("Switch between Fullscreen, PiP Corner, or Side by Side.")
                 .labelsHidden()
                 .pickerStyle(.menu)
                 .fixedSize()
@@ -69,6 +71,9 @@ struct LayerControlsView: View {
                     Image(systemName: layer.isHidden ? "eye.slash" : "eye")
                 }
                 .accessibilityIdentifier("layers.row.visibility.toggle")
+                .accessibilityLabel("Layer visibility")
+                .accessibilityValue(layer.isHidden ? "Hidden" : "Visible")
+                .accessibilityHint(layer.isHidden ? "Show this layer." : "Hide this layer.")
                 .buttonStyle(.plain)
                 .help(layer.isHidden ? "Show layer" : "Hide layer")
 
@@ -87,6 +92,8 @@ struct LayerControlsView: View {
                     Image(systemName: "chevron.up")
                 }
                 .accessibilityIdentifier("layers.row.moveUp")
+                .accessibilityLabel("Bring forward")
+                .accessibilityHint("Move this layer one step toward the front.")
                 .buttonStyle(.plain)
                 .help("Bring forward")
 
@@ -96,6 +103,8 @@ struct LayerControlsView: View {
                     Image(systemName: "chevron.down")
                 }
                 .accessibilityIdentifier("layers.row.moveDown")
+                .accessibilityLabel("Send backward")
+                .accessibilityHint("Move this layer one step toward the back.")
                 .buttonStyle(.plain)
                 .help("Send backward")
             }
@@ -129,6 +138,8 @@ struct LayerControlsView: View {
                           ? "play.circle.fill" : "wand.and.rays")
                 }
                 .accessibilityIdentifier("layers.row.entrance.menu")
+                .accessibilityLabel("Animate layer in")
+                .accessibilityHint("Play an entrance animation: slide, fade, scale, or pop.")
                 .menuStyle(.borderlessButton)
                 .fixedSize()
                 .controlSize(.mini)
@@ -174,6 +185,8 @@ struct TransitionControlsView: View {
                 }
             }
             .accessibilityIdentifier("transition.effect.picker")
+            .accessibilityLabel("Transition effect")
+            .accessibilityHint("Choose the effect used when switching scenes.")
             .pickerStyle(.menu)
             .labelsHidden()
             .fixedSize()
@@ -182,10 +195,13 @@ struct TransitionControlsView: View {
 
             HStack(spacing: 6) {
                 Image(systemName: "timer").foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
                 Slider(value: Binding(get: { engine.transitionDuration },
                                       set: { engine.setTransitionDuration($0) }),
                        in: 0...2)
                     .accessibilityIdentifier("transition.duration.slider")
+                    .accessibilityLabel("Transition duration")
+                    .accessibilityValue(String(format: "%.1f seconds", engine.transitionDuration))
                     .frame(width: 120)
                     .disabled(!engine.transitionEnabled)
                 Text(String(format: "%.1fs", engine.transitionDuration))
@@ -219,6 +235,8 @@ struct TransitionControlsView: View {
                 Image(systemName: "sparkles.tv")
             }
             .accessibilityIdentifier("transition.stinger.menu")
+            .accessibilityLabel("Stinger media")
+            .accessibilityHint("Choose live media for cue-frame stinger scene switches, or None to use the effect picker.")
             .menuStyle(.borderlessButton)
             .fixedSize()
             .help("Choose live media for cue-frame stinger scene switches; choose None to use the Effect picker")

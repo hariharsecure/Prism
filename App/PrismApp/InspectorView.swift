@@ -53,6 +53,7 @@ struct InspectorView: View {
             Image(systemName: emptyIcon)
                 .font(.system(size: 34))
                 .foregroundStyle(.tertiary)
+                .accessibilityHidden(true)
             Text(emptyTitle)
                 .font(.callout.weight(.semibold))
                 .multilineTextAlignment(.center)
@@ -70,21 +71,26 @@ struct InspectorView: View {
 
     private var emptyIcon: String {
         if selection.selectedSourceID != nil { return "slider.horizontal.3" }
-        return hasLayers ? "hand.tap" : "plus.rectangle.on.rectangle"
+        return hasLayers ? "hand.tap" : "slider.horizontal.3"
     }
 
     private var emptyTitle: String {
         if selection.selectedSourceID != nil { return "No adjustable effects" }
-        return hasLayers ? "Select a layer" : "Add a source to begin"
+        return hasLayers ? "Select a layer" : "Nothing to inspect yet"
     }
 
     private var emptyBody: String {
         if selection.selectedSourceID != nil {
             return "This source has no adjustable effects."
         }
+        // When there are layers, guide the click that populates the Inspector.
+        // When the scene is still empty, DON'T repeat the "add a source" call to
+        // action — the left-rail Add Source button and the program-monitor hint
+        // already own first-run discoverability. Here we just say what this panel
+        // is for, so the right rail stops competing for the same attention.
         return hasLayers
             ? "Click a layer in the list above to grade its color, key out a green or dark background, or remove the background."
-            : "Add a source from the left rail — click ＋ Add Source, or a camera under Cameras — to build your scene."
+            : "Per-layer color grade and background effects appear here once a source is on the canvas."
     }
 }
 

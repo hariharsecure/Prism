@@ -23,8 +23,10 @@ struct TransportBar: View {
         // Only the two primary actions (Record, Stream) carry text labels; every
         // secondary control is a clean icon with a .help() tooltip so nothing
         // truncates to a one-letter stub at the 1100 pt minimum window width.
-        // Controls are grouped into three clusters (capture · output · tools)
-        // with a divider between clusters instead of between every item.
+        // Controls are grouped into four clusters (capture · output · scene &
+        // automation · connections & preflight) with a divider between clusters
+        // instead of between every item, so the row reads as labelled groups
+        // rather than one undifferentiated glyph wall.
         // The control clusters scroll horizontally so the live-status extras that
         // only appear while RECORDING **and** STREAMING at once (the mono record
         // timer + stream state + bitrate + dropped-append glyphs) can never squeeze
@@ -50,14 +52,18 @@ struct TransportBar: View {
 
                     Divider().frame(height: 22)
 
-                    // Cluster 3 — tools
+                    // Cluster 3 — scene & automation
                     studioModeToggle
-                    reactiveTriggerControl
+                    SceneCollectionsMenu()
                     autoDirectorButton
+                    reactiveTriggerControl
+
+                    Divider().frame(height: 22)
+
+                    // Cluster 4 — connections & preflight
                     midiButton
                     controlServerToggle
                     broadcastCheckButton
-                    SceneCollectionsMenu()
                 }
             }
 
@@ -111,6 +117,9 @@ struct TransportBar: View {
                     .foregroundStyle(engine.isStreaming ? .red : .primary)
             }
             .accessibilityIdentifier("transport.stream.button")
+            .accessibilityLabel("Stream")
+            .accessibilityValue(engine.isStreaming ? "Live" : "Stopped")
+            .accessibilityHint("Set up a destination and go live to YouTube, Twitch, or any RTMP/SRT platform.")
             .help("Stream the program live to YouTube, Twitch, or any RTMP/SRT platform. Click to set up your destination.")
             .popover(isPresented: $streamPopoverShown, arrowEdge: .bottom) { streamPopover }
 
@@ -224,6 +233,9 @@ struct TransportBar: View {
                     .foregroundStyle(engine.isRecording ? .red : .primary)
             }
             .accessibilityIdentifier("transport.record.toggle")
+            .accessibilityLabel("Record")
+            .accessibilityValue(engine.isRecording ? "Recording" : "Stopped")
+            .accessibilityHint("Record the program to your Movies folder.")
             .help("Record the program to ~/Movies/Prism")
 
             if let started = engine.recordStartDate {
@@ -264,6 +276,11 @@ struct TransportBar: View {
                     .foregroundStyle(engine.isoArmedSourceIDs.isEmpty ? Color.primary : .accentColor)
             }
             .accessibilityIdentifier("transport.iso.button")
+            .accessibilityLabel("ISO recording")
+            .accessibilityValue(engine.isoArmedSourceIDs.isEmpty
+                                ? "No sources armed"
+                                : "\(engine.isoArmedSourceIDs.count) source\(engine.isoArmedSourceIDs.count == 1 ? "" : "s") armed")
+            .accessibilityHint("Arm sources to save a separate clean file per camera, in sync with the program.")
             .help(engine.isoArmedSourceIDs.isEmpty
                   ? "ISO recording — save a separate clean file per camera/source, in sync with the program. Arm sources before you press Record."
                   : "ISO recording — \(engine.isoArmedSourceIDs.count) source\(engine.isoArmedSourceIDs.count == 1 ? "" : "s") armed. A clean per-source file will record alongside the program.")
@@ -276,6 +293,8 @@ struct TransportBar: View {
                     .labelStyle(.iconOnly)
             }
             .accessibilityIdentifier("transport.exportFinalCut.button")
+            .accessibilityLabel("Export to Final Cut Pro")
+            .accessibilityHint("Export the last multi-angle session as a Final Cut Pro multicam project.")
             .disabled(!engine.lastMulticamExportable)
             .help(engine.lastMulticamExportable
                   ? "Export the last multi-angle session as a Final Cut Pro multicam project"
@@ -367,6 +386,9 @@ struct TransportBar: View {
             }
             .toggleStyle(.button)
             .accessibilityIdentifier("transport.replay.toggle")
+            .accessibilityLabel("Instant replay")
+            .accessibilityValue(engine.replayArmed ? "Armed" : "Off")
+            .accessibilityHint("Continuously buffer recent program so you can save a replay at any moment.")
             .help("Instant replay — continuously buffer the last few seconds of program so you can save a replay clip at any moment.")
 
             if engine.replayArmed {
@@ -397,6 +419,8 @@ struct TransportBar: View {
                         .labelStyle(.iconOnly)
                 }
                 .accessibilityIdentifier("transport.replay.save")
+                .accessibilityLabel("Save replay")
+                .accessibilityHint("Save the buffered window with program audio and reveal it in Finder.")
                 .help("Save the buffered window (with program audio) to ~/Movies/Prism/Replays and reveal it")
 
                 // "Clip that moment" (feature 3): saves just the last N seconds of
@@ -444,6 +468,9 @@ struct TransportBar: View {
             }
             .toggleStyle(.button)
             .accessibilityIdentifier("transport.captions.toggle")
+            .accessibilityLabel("Live captions")
+            .accessibilityValue(engine.captionsEnabled ? "On" : "Off")
+            .accessibilityHint("Transcribe program audio on-device and overlay subtitles.")
             .help("Live captions — transcribe the program audio on-device and composite a subtitle overlay over the program.")
 
             // Clear one-line note when the on-device captioner can't run (no
@@ -500,6 +527,9 @@ struct TransportBar: View {
                 .foregroundStyle(engine.reactiveTrigger == .none ? .primary : Color.accentColor)
         }
         .accessibilityIdentifier("transport.reactiveTrigger.menu")
+        .accessibilityLabel("Reactive trigger")
+        .accessibilityValue(engine.reactiveTrigger == .none ? "Off" : engine.reactiveTrigger.label)
+        .accessibilityHint("On a loud transient, fire a strobe or meme, or arm a stinger for the next scene switch.")
         .menuStyle(.button)
         .help("Reactive trigger — on a loud transient, fire a strobe/meme or arm a stinger for the next scene switch. Off by default.")
     }
@@ -517,6 +547,9 @@ struct TransportBar: View {
             }
             .toggleStyle(.button)
             .accessibilityIdentifier("transport.vcam.toggle")
+            .accessibilityLabel("Virtual camera")
+            .accessibilityValue(engine.vcamOutputEnabled ? "On air" : (engine.vcamOutputRequested ? "Starting" : "Off"))
+            .accessibilityHint("Send the Prism program into Zoom, Meet, or any app as a webcam.")
             .help("Virtual Camera — send the Prism program into Zoom, Meet, or any app as a webcam.")
 
             Button {
@@ -525,6 +558,8 @@ struct TransportBar: View {
                 Image(systemName: "info.circle")
             }
             .accessibilityIdentifier("transport.vcam.info")
+            .accessibilityLabel("Virtual camera status")
+            .accessibilityHint("Show extension status and activate the system extension.")
             .buttonStyle(.plain)
             .help("Virtual camera status & activate the system extension")
             .popover(isPresented: $vcamPopoverShown, arrowEdge: .bottom) {
@@ -555,6 +590,9 @@ struct TransportBar: View {
         }
         .toggleStyle(.button)
         .accessibilityIdentifier("transport.controlServer.toggle")
+        .accessibilityLabel("Remote control server")
+        .accessibilityValue(engine.controlServerRunning ? "Running" : "Stopped")
+        .accessibilityHint("Let a Stream Deck or OBS-remote app control Prism over the obs-websocket protocol on port 4455.")
         .help("Remote control server (port 4455) — lets a Stream Deck or OBS-remote app control Prism. Compatible with the obs-websocket protocol.")
     }
 
@@ -569,6 +607,9 @@ struct TransportBar: View {
                 .foregroundStyle(broadcastCheckTint)
         }
         .accessibilityIdentifier("transport.broadcastCheck.button")
+        .accessibilityLabel("Broadcast check")
+        .accessibilityValue(broadcastCheckStatusText)
+        .accessibilityHint("Run preflight checks — audio, disk space, network, sources — before you go live.")
         .help("Broadcast Check — run preflight checks (audio, disk space, network, sources) to catch problems before you go live.")
         .popover(isPresented: $broadcastCheckShown, arrowEdge: .bottom) {
             BroadcastCheckView().environmentObject(engine)
@@ -593,6 +634,17 @@ struct TransportBar: View {
         }
     }
 
+    /// VoiceOver value for the broadcast-check glyph, whose color otherwise
+    /// carries the pass/warn/fail state a non-sighted user can't see.
+    private var broadcastCheckStatusText: String {
+        switch engine.lastBroadcastReport?.overall {
+        case .fail: return "Failing"
+        case .warn: return "Warnings"
+        case .pass: return "Passing"
+        case nil: return "Not run"
+        }
+    }
+
     // MARK: HDR output (Integration 4)
 
     private var hdrLocked: Bool {
@@ -607,6 +659,11 @@ struct TransportBar: View {
         }
         .toggleStyle(.button)
         .accessibilityIdentifier("transport.hdr.toggle")
+        .accessibilityLabel("HDR output")
+        .accessibilityValue(engine.hdrEnabled ? "On" : "Off")
+        .accessibilityHint(hdrLocked
+                           ? "Locked while on-air. Stop recording, streaming, replay, and the virtual camera to change HDR."
+                           : "Run the program in high dynamic range. Can only be changed while off-air.")
         .disabled(hdrLocked)
         // When locked, say WHY rather than leaving a mystery grey control (item 4).
         .help(hdrLocked
@@ -625,6 +682,9 @@ struct TransportBar: View {
                 .foregroundStyle(engine.autoDirectorEnabled ? .green : .primary)
         }
         .accessibilityIdentifier("transport.autoDirector.button")
+        .accessibilityLabel("Auto-Director")
+        .accessibilityValue(engine.autoDirectorEnabled ? "On" : "Off")
+        .accessibilityHint("Automatically cut the program to whichever source is most active and auto-frame it.")
         .help("Auto-Director — automatically cut the program to whichever source is most active and auto-frame it.")
         .popover(isPresented: $directorPopoverShown, arrowEdge: .bottom) {
             AutoDirectorPanel().environmentObject(engine)
@@ -642,6 +702,9 @@ struct TransportBar: View {
                 .foregroundStyle(engine.controlSurfaceEnabled ? .green : .primary)
         }
         .accessibilityIdentifier("transport.midi.button")
+        .accessibilityLabel("MIDI control surface")
+        .accessibilityValue(engine.controlSurfaceEnabled ? "Connected" : "Off")
+        .accessibilityHint("Map physical knobs, faders, and buttons on a MIDI controller to Prism actions.")
         .help("MIDI control surface — map physical knobs, faders, and buttons on a MIDI controller to Prism actions.")
         .popover(isPresented: $midiPopoverShown, arrowEdge: .bottom) {
             MIDIControlPanel().environmentObject(engine)
@@ -657,6 +720,8 @@ struct TransportBar: View {
             Image(systemName: "questionmark.circle")
         }
         .accessibilityIdentifier("transport.help.button")
+        .accessibilityLabel("Getting Started help")
+        .accessibilityHint("Open the guide: how to add sources, apply effects, and go live.")
         .buttonStyle(.plain)
         .help("Getting Started — how to add sources, apply effects, and go live")
     }
@@ -672,10 +737,13 @@ struct TransportBar: View {
                 .padding(.vertical, 3)
                 .background(.red, in: Capsule())
                 .foregroundStyle(.white)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("On air")
         } else {
             Text("OFF AIR")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+                .accessibilityLabel("Off air")
         }
     }
 }

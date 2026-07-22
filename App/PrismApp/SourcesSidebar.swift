@@ -57,6 +57,8 @@ struct SourcesSidebar: View {
                         .frame(maxWidth: .infinity)
                 }
                 .accessibilityIdentifier("sources.sidebar.addSource.menu")
+                .accessibilityLabel("Add Source")
+                .accessibilityHint("Add a text or title, image, video, browser, overlay, or other source to the scene.")
                 .menuStyle(.button)
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
@@ -96,6 +98,8 @@ struct SourcesSidebar: View {
                     Label("Add Display/Window…", systemImage: "macwindow.badge.plus")
                 }
                 .accessibilityIdentifier("sources.screen.addDisplayWindow")
+                .accessibilityLabel("Add display or window")
+                .accessibilityHint("Share a display or app window. Prompts for Screen Recording permission.")
                 .buttonStyle(.plain)
                 .foregroundStyle(Color.accentColor)
                 .help("Share a display or app window (prompts for Screen Recording permission)")
@@ -277,6 +281,8 @@ struct SourcesSidebar: View {
                 .labelStyle(.titleAndIcon)
         }
         .accessibilityIdentifier(id)
+        .accessibilityLabel(name.map { "Add \($0)" } ?? "Add to scene")
+        .accessibilityHint("Add this source to the scene.")
         .buttonStyle(.bordered)
         .controlSize(.small)
         .tint(.accentColor)
@@ -291,6 +297,8 @@ struct SourcesSidebar: View {
             Image(systemName: "minus.circle.fill")
         }
         .accessibilityIdentifier(accessibilityID)
+        .accessibilityLabel("Remove source")
+        .accessibilityHint("Remove this source from the scene.")
         .buttonStyle(.plain)
         .foregroundStyle(.red)
         .help("Remove source")

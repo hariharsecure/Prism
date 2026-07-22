@@ -105,12 +105,14 @@ struct ContentView: View {
             Image(systemName: "video.badge.plus")
                 .font(.system(size: 40))
                 .foregroundStyle(.white.opacity(0.85))
+                .accessibilityHidden(true)
             Text("Add a camera or source from the left")
                 .font(.headline)
                 .foregroundStyle(.white.opacity(0.9))
             Text("to see your program here.")
                 .font(.subheadline)
                 .foregroundStyle(.white.opacity(0.6))
+                .accessibilityHidden(true)
 
             // One-click start: if exactly one camera is connected, offer it
             // right here so a first-timer never has to hunt the left rail.
@@ -121,6 +123,8 @@ struct ContentView: View {
                     Label("Use \(cam.name)", systemImage: "video.fill")
                 }
                 .accessibilityIdentifier("content.monitor.useCamera")
+                .accessibilityLabel("Use \(cam.name)")
+                .accessibilityHint("Add this camera as your first source and start the program.")
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
                 .padding(.top, 6)

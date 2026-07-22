@@ -76,6 +76,9 @@ struct MixerDrawer: View {
             }
             .toggleStyle(.button)
             .accessibilityIdentifier("mixer.monitor.toggle")
+            .accessibilityLabel("Monitor")
+            .accessibilityValue(engine.isAudioMonitoringEnabled ? "On" : "Off")
+            .accessibilityHint("Route the master mix to your output device.")
             .controlSize(.small)
             .help("Route the master mix to your output device")
 
@@ -126,8 +129,9 @@ struct MixerDrawer: View {
     private func channelStrip(_ source: ActiveSource) -> some View {
         let id = source.id
         let ui = channels[id] ?? ChannelUI()
+        let name = source.descriptor.name
         VStack(spacing: 6) {
-            Text(source.descriptor.name)
+            Text(name)
                 .font(.caption2).lineLimit(1).frame(width: 78)
 
             HStack(spacing: 6) {
@@ -142,6 +146,8 @@ struct MixerDrawer: View {
                         engine.setChannelGain(Float(newValue), for: id)
                     }), range: 0...1.5)
                     .accessibilityIdentifier("mixer.channel.fader")
+                    .accessibilityLabel("\(name) volume")
+                    .accessibilityValue("\(Int((channels[id]?.gain ?? 1.0) / 1.5 * 100)) percent")
             }
             .frame(height: 114)
 
@@ -151,6 +157,8 @@ struct MixerDrawer: View {
                     engine.setChannelMuted(channels[id]?.muted ?? false, for: id)
                 }
                 .accessibilityIdentifier("mixer.channel.mute")
+                .accessibilityLabel("Mute \(name)")
+                .accessibilityValue(ui.muted ? "Muted" : "Unmuted")
                 .buttonStyle(.bordered)
                 .controlSize(.mini)
                 .tint(ui.muted ? .red : nil)
@@ -161,6 +169,8 @@ struct MixerDrawer: View {
                     engine.setChannelSolo(channels[id]?.solo ?? false, for: id)
                 }
                 .accessibilityIdentifier("mixer.channel.solo")
+                .accessibilityLabel("Solo \(name)")
+                .accessibilityValue(ui.solo ? "Soloed" : "Not soloed")
                 .buttonStyle(.bordered)
                 .controlSize(.mini)
                 .tint(ui.solo ? .yellow : nil)
@@ -178,6 +188,9 @@ struct MixerDrawer: View {
                     Text(insertCount > 0 ? "FX \(insertCount)" : "FX")
                 }
                 .accessibilityIdentifier("mixer.channel.fx")
+                .accessibilityLabel("\(name) audio effects")
+                .accessibilityValue(insertCount > 0 ? "\(insertCount) insert\(insertCount == 1 ? "" : "s")" : "None")
+                .accessibilityHint("Add audio effects — EQ, compressor, reverb, noise gate — to this channel.")
                 .buttonStyle(.bordered)
                 .controlSize(.mini)
                 .tint(insertCount > 0 ? .accentColor : nil)
@@ -192,6 +205,9 @@ struct MixerDrawer: View {
                     Image(systemName: "waveform.badge.mic")
                 }
                 .accessibilityIdentifier("mixer.channel.voiceIsolation")
+                .accessibilityLabel("\(name) voice isolation")
+                .accessibilityValue(voiceIso ? "On" : "Off")
+                .accessibilityHint("Isolate the voice band and remove background noise.")
                 .buttonStyle(.bordered)
                 .controlSize(.mini)
                 .tint(voiceIso ? .green : nil)
@@ -340,6 +356,7 @@ struct MixerDrawer: View {
                 }
             }
             .accessibilityIdentifier("mixer.ducking.target.picker")
+            .accessibilityLabel("Ducking target channel")
             .labelsHidden().frame(width: 120)
 
             Text("when").font(.caption).foregroundStyle(.secondary)
@@ -351,6 +368,7 @@ struct MixerDrawer: View {
                 }
             }
             .accessibilityIdentifier("mixer.ducking.key.picker")
+            .accessibilityLabel("Ducking key channel")
             .labelsHidden().frame(width: 120)
             Text("is loud").font(.caption).foregroundStyle(.secondary)
 
@@ -358,6 +376,8 @@ struct MixerDrawer: View {
                 Text("Thr").font(.caption2).foregroundStyle(.secondary)
                 Slider(value: $duckThreshold, in: -60...0)
                     .accessibilityIdentifier("mixer.ducking.threshold.slider")
+                    .accessibilityLabel("Ducking threshold")
+                    .accessibilityValue("\(Int(duckThreshold)) decibels")
                     .frame(width: 70)
                 Text("\(Int(duckThreshold)) dB").font(.caption2.monospacedDigit()).frame(width: 42)
             }
@@ -365,6 +385,8 @@ struct MixerDrawer: View {
                 Text("Ratio").font(.caption2).foregroundStyle(.secondary)
                 Slider(value: $duckRatio, in: 1...20)
                     .accessibilityIdentifier("mixer.ducking.ratio.slider")
+                    .accessibilityLabel("Ducking ratio")
+                    .accessibilityValue(String(format: "%.0f to 1", duckRatio))
                     .frame(width: 60)
                 Text(String(format: "%.0f:1", duckRatio)).font(.caption2.monospacedDigit()).frame(width: 34)
             }

@@ -39,6 +39,8 @@ struct SceneCollectionsMenu: View {
                 .labelStyle(.iconOnly)
         }
         .accessibilityIdentifier("transport.scenes.menu")
+        .accessibilityLabel("Scenes")
+        .accessibilityHint("Save the current layout under a name and switch between saved layouts.")
         .menuStyle(.borderlessButton)
         .fixedSize()
         .help("Scenes — save the current layout under a name and switch between saved layouts.")
