@@ -75,7 +75,7 @@ public final class ProximityAdvertiser: NSObject {
 
     private func beginAdvertisingIfReady() {
         guard let peripheral, peripheral.state == .poweredOn,
-              isAdvertising, let token = rotator?.current else { return }
+              isAdvertising, rotator?.current != nil else { return }
 
         // Publish a readable characteristic carrying name+token. This is the
         // ONLY path by which the token reaches a central: iOS strips arbitrary
@@ -104,7 +104,9 @@ public final class ProximityAdvertiser: NSObject {
             CBAdvertisementDataLocalNameKey: deviceName,
         ])
         startRotationTimer()
-        log.info("proximity: advertising as \(self.deviceName, privacy: .public) token \(token.hex, privacy: .public)")
+        // Device name is .private (identifies a person, e.g. "Rishi's iPhone");
+        // the presence token is intentionally NOT logged (secret + anti-correlation).
+        log.info("proximity: advertising as \(self.deviceName, privacy: .private)")
     }
 
     private func startRotationTimer() {
@@ -117,11 +119,12 @@ public final class ProximityAdvertiser: NSObject {
     }
 
     private func rotateToken() {
-        guard let token = try? rotator?.rotate() else { return }
+        guard (try? rotator?.rotate()) != nil else { return }
         // No cached value to mutate: reads are served live in
         // `peripheralManager(_:didReceiveRead:)` from the current token, so the
-        // rotated value is delivered on the next connected read (#8).
-        log.debug("proximity: rotated presence token → \(token.hex, privacy: .public)")
+        // rotated value is delivered on the next connected read (#8). The token
+        // value itself is never logged (secret + anti-correlation).
+        log.debug("proximity: rotated presence token")
     }
 
     /// The encoded presence payload for the current name+token, or `nil` if no

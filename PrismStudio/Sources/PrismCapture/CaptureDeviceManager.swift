@@ -149,10 +149,10 @@ public final class CaptureDeviceManager {
         let event: DeviceEvent
         if connected {
             event = .added(Self.descriptor(for: device))
-            Self.log.info("device connected: \(device.localizedName, privacy: .public) [\(device.uniqueID, privacy: .public)]")
+            Self.log.info("device connected: \(device.localizedName, privacy: .private) [\(LogRedact.hashID(device.uniqueID), privacy: .public)]")
         } else {
             event = .removed(id: device.uniqueID)
-            Self.log.info("device disconnected: \(device.localizedName, privacy: .public) [\(device.uniqueID, privacy: .public)]")
+            Self.log.info("device disconnected: \(device.localizedName, privacy: .private) [\(LogRedact.hashID(device.uniqueID), privacy: .public)]")
         }
         onDeviceEvent?(event)
     }

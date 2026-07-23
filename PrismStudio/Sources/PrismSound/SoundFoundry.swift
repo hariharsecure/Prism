@@ -96,7 +96,7 @@ public enum SoundFoundry {
         let manifest = try JSONEncoder().encodePretty(entries)
         try manifest.write(to: rootURL.appendingPathComponent("library.json"))
         progress?(produced, target)
-        log.info("generated \(produced) sounds to \(rootURL.path, privacy: .public)")
+        log.info("generated \(produced) sounds to \(LogRedact.basename(rootURL.path), privacy: .public)")
 
         return GenerationReport(
             rootURL: rootURL,

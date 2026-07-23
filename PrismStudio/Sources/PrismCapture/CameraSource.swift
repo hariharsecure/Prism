@@ -273,7 +273,7 @@ public final class CameraSource: NSObject, VideoSource {
         sessionGeneration.withLock { $0 = generation.bump() }
         session.startRunning()
         state = .running
-        log.info("camera running: \(self.device.localizedName, privacy: .public)")
+        log.info("camera running: \(self.device.localizedName, privacy: .private)")
     }
 
     /// Whether `stop()` performs session teardown when called in `state`.
@@ -292,7 +292,7 @@ public final class CameraSource: NSObject, VideoSource {
         generation.bump()
         session.stopRunning() // no-op if the session already halted
         state = .idle
-        log.info("camera stopped: \(self.device.localizedName, privacy: .public)")
+        log.info("camera stopped: \(self.device.localizedName, privacy: .private)")
     }
 
     #if DEBUG
@@ -356,7 +356,7 @@ public final class CameraSource: NSObject, VideoSource {
         ) { [weak self] note in
             guard let self else { return }
             let err = note.userInfo?[AVCaptureSessionErrorKey] as? NSError
-            self.log.error("session runtime error on \(self.device.localizedName, privacy: .public): \(err?.localizedDescription ?? "unknown", privacy: .public)")
+            self.log.error("session runtime error on \(self.device.localizedName, privacy: .private): \(err?.localizedDescription ?? "unknown", privacy: .public)")
             self.state = .failed
         }
 
@@ -386,7 +386,7 @@ extension CameraSource: AVCaptureVideoDataOutputSampleBufferDelegate {
         guard CVPixelBufferGetIOSurface(pixelBuffer) != nil else {
             if !warnedNonIOSurface {
                 warnedNonIOSurface = true
-                log.error("dropping non-IOSurface frame from \(self.device.localizedName, privacy: .public) — zero-copy violation")
+                log.error("dropping non-IOSurface frame from \(self.device.localizedName, privacy: .private) — zero-copy violation")
             }
             return
         }
@@ -400,7 +400,7 @@ extension CameraSource: AVCaptureVideoDataOutputSampleBufferDelegate {
             pts = CMSyncConvertTime(pts, from: syncClock, to: HouseClock.clock)
             if !warnedClockConversion {
                 warnedClockConversion = true
-                log.notice("session clock ≠ house clock for \(self.device.localizedName, privacy: .public); converting PTS via CMSyncConvertTime")
+                log.notice("session clock ≠ house clock for \(self.device.localizedName, privacy: .private); converting PTS via CMSyncConvertTime")
             }
         }
 

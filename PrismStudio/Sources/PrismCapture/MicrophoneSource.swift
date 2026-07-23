@@ -71,7 +71,7 @@ public final class MicrophoneSource: NSObject, AudioSource {
         }
         session.startRunning()
         state = .running
-        log.info("microphone running: \(self.device.localizedName, privacy: .public)")
+        log.info("microphone running: \(self.device.localizedName, privacy: .private)")
     }
 
     /// Whether `stop()` performs session teardown when called in `state`.
@@ -86,7 +86,7 @@ public final class MicrophoneSource: NSObject, AudioSource {
         state = .stopping
         session.stopRunning() // no-op if the session already halted
         state = .idle
-        log.info("microphone stopped: \(self.device.localizedName, privacy: .public)")
+        log.info("microphone stopped: \(self.device.localizedName, privacy: .private)")
     }
 
     #if DEBUG
@@ -127,7 +127,7 @@ public final class MicrophoneSource: NSObject, AudioSource {
         ) { [weak self] note in
             guard let self else { return }
             let err = note.userInfo?[AVCaptureSessionErrorKey] as? NSError
-            self.log.error("session runtime error on \(self.device.localizedName, privacy: .public): \(err?.localizedDescription ?? "unknown", privacy: .public)")
+            self.log.error("session runtime error on \(self.device.localizedName, privacy: .private): \(err?.localizedDescription ?? "unknown", privacy: .public)")
             self.state = .failed
         }
 
@@ -152,12 +152,12 @@ extension MicrophoneSource: AVCaptureAudioDataOutputSampleBufferDelegate {
                 buffer = retimed
                 if !warnedClockConversion {
                     warnedClockConversion = true
-                    log.notice("session clock ≠ house clock for \(self.device.localizedName, privacy: .public); retiming packets via CMSyncConvertTime")
+                    log.notice("session clock ≠ house clock for \(self.device.localizedName, privacy: .private); retiming packets via CMSyncConvertTime")
                 }
             } else {
                 if !warnedRetimeFailure {
                     warnedRetimeFailure = true
-                    log.error("failed to retime audio from \(self.device.localizedName, privacy: .public); dropping packets to protect the house-time invariant")
+                    log.error("failed to retime audio from \(self.device.localizedName, privacy: .private); dropping packets to protect the house-time invariant")
                 }
                 return
             }
