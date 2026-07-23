@@ -150,7 +150,10 @@ targets:
   PrismCamera:
     type: application
     platform: iOS
-    sources: [PrismCamera]
+    sources:
+      - PrismCamera
+      # Phase 5b: reuse the Mac app's Keychain helper for the pairing-code PSK.
+      - path: PrismApp/KeychainStore.swift
     info:
       path: Config/PrismCamera-Info.plist
       properties:

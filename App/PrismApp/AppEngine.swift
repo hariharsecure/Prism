@@ -727,21 +727,15 @@ final class AppEngine: ObservableObject {
     private let autoAddPeers =
         ProcessInfo.processInfo.environment["PRISM_AUTOADD_PEERS"] == "1"
 
-    /// UserDefaults key for the persisted pairing code (survives relaunches
-    /// so already-paired devices keep working).
-    private static let pairingCodeDefaultsKey = "studio.prism.link.pairingCode"
-
-    /// Loads the persisted pairing code, generating + persisting one on
-    /// first launch (or if the stored value is malformed).
+    /// Loads the persisted pairing code, generating + persisting one on first
+    /// launch (or if the stored value is malformed). Phase 5b: the code now
+    /// lives in the Keychain (via `PairingCodeStore`), not `UserDefaults`; a
+    /// legacy `UserDefaults` value is migrated in and cleared on load.
     private static func loadOrCreatePairingCode() -> String {
-        let defaults = UserDefaults.standard
-        if let stored = defaults.string(forKey: pairingCodeDefaultsKey),
-           LinkPairing.normalize(stored).count == LinkPairing.codeLength {
-            return LinkPairing.normalize(stored)
-        }
-        let code = LinkPairing.generateCode()
-        defaults.set(code, forKey: pairingCodeDefaultsKey)
-        return code
+        PairingCodeStore.loadOrCreate(
+            generate: { LinkPairing.generateCode() },
+            normalize: { LinkPairing.normalize($0) },
+            isValid: { LinkPairing.normalize($0).count == LinkPairing.codeLength })
     }
 
     // Outputs
@@ -2625,9 +2619,29 @@ final class AppEngine: ObservableObject {
     /// change (listener port, peers, per-peer media counters). Lets a CLI
     /// test observe "the server accepted my hello / my frames arrived"
     /// without UI scraping. No-op in normal use.
+    ///
+    /// Phase 5b security: DEBUG-only (compiled OUT of release builds so it can
+    /// never export in production), the pairing code (the PSK) is OMITTED from
+    /// the dump, and the file is written with mode 0600 (owner-only).
     private func writeLinkDebugState() {
+        #if DEBUG
         guard let path = ProcessInfo.processInfo.environment["PRISM_LINK_STATE_FILE"],
               !path.isEmpty else { return }
+        let state = makeLinkDebugState()
+        if let data = try? JSONSerialization.data(withJSONObject: state, options: [.sortedKeys]) {
+            let url = URL(fileURLWithPath: path)
+            try? data.write(to: url, options: .atomic)
+            // 0600: the state file is owner-only even though the PSK is omitted.
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600],
+                                                    ofItemAtPath: url.path)
+        }
+        #endif
+    }
+
+    #if DEBUG
+    /// Builds the debug link-state dictionary. Extracted so a test can assert
+    /// the pairing code (PSK) is NEVER included — the export must not leak it.
+    func makeLinkDebugState() -> [String: Any] {
         let peerDicts: [[String: Any]] = peers.map { entry in
             // mediaStats is internally synchronized (queue.sync onto the link
             // queue) — safe here. state/name come from the snapshot (C24);
@@ -2647,7 +2661,7 @@ final class AppEngine: ObservableObject {
             "port": linkPort ?? 0,
             "listenerState": linkListenerState,
             "advertising": linkAdvertising,
-            "pairingCode": pairingCode,
+            // Phase 5b: the pairing code (PSK) is intentionally NOT exported.
             "peerCount": peers.count,
             "peers": peerDicts,
             "updatedAt": Date().timeIntervalSince1970,
@@ -2749,10 +2763,9 @@ final class AppEngine: ObservableObject {
             state["programFingerprintPTS"] = snap.fingerprintPTS
             state["programFingerprintCount"] = NSNumber(value: snap.fingerprintCount)
         }
-        if let data = try? JSONSerialization.data(withJSONObject: state, options: [.sortedKeys]) {
-            try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
-        }
+        return state
     }
+    #endif
 
     // MARK: Add / remove sources
 
@@ -5890,7 +5903,13 @@ final class AppEngine: ObservableObject {
     }
 
     private func persistDestinations() {
-        do { try StreamDestinationsStore.save(destinations) }
+        do {
+            try StreamDestinationsStore.save(destinations)
+            // Fail-closed (Phase 5a): a Keychain write failure keeps the key in
+            // memory only and blanks it in JSON — surface the warning so the
+            // operator knows it won't survive relaunch.
+            if let warning = StreamDestinationsStore.lastError { lastError = warning }
+        }
         catch { lastError = "Couldn't save destinations: \(error.localizedDescription)" }
     }
 

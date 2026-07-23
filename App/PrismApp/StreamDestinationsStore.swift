@@ -47,6 +47,24 @@ struct PersistedDestination: Codable, Identifiable, Equatable {
 /// same pattern as `SceneCollectionStore`. The on-disk file is the source of
 /// truth restored at every launch.
 enum StreamDestinationsStore {
+    /// Test seam: the Keychain writer (default = the real Keychain). A headless
+    /// test — where the live Keychain isn't writable under ad-hoc signing —
+    /// substitutes a stub that returns `false` to simulate a write failure and
+    /// assert the fail-closed contract (no plaintext key ever lands in JSON).
+    /// Signature mirrors `KeychainStore.set(_:for:)` → returns write success.
+    static var keychainSet: (_ value: String, _ account: String) -> Bool = {
+        KeychainStore.set($0, for: $1)
+    }
+
+    /// Test seam: the Keychain reader (default = the real Keychain), so the
+    /// load-time legacy-plaintext migration can be exercised headlessly.
+    static var keychainGet: (_ account: String) -> String? = { KeychainStore.get($0) }
+
+    /// Set by `save` when one or more stream keys could NOT be persisted to the
+    /// Keychain. Fail-closed: those keys stay ONLY in memory for this session
+    /// (never written to JSON) and won't survive relaunch. `nil` = clean save.
+    static private(set) var lastError: String?
+
     /// `~/Library/Application Support/studio.prism.app/StreamDestinations.json`.
     static var fileURL: URL {
         let base = (try? FileManager.default.url(for: .applicationSupportDirectory,
@@ -77,8 +95,10 @@ enum StreamDestinationsStore {
     /// Codex #8: the stream key/streamid is NOT read from the JSON — it lives in
     /// the Keychain (keyed by the destination id). Any legacy plaintext `key` in an
     /// old file is migrated into the Keychain once, then dropped on the next save.
-    static func load() -> [Destination] {
-        let url = fileURL
+    static func load() -> [Destination] { load(from: fileURL) }
+
+    /// Testable overload: load from an explicit URL (default path = `fileURL`).
+    static func load(from url: URL) -> [Destination] {
         guard let data = try? Data(contentsOf: url) else { return [] }
         guard let rows = try? JSONDecoder().decode([LenientRow].self, from: data) else {
             sidecarCorruptFile(at: url) // not an array at all → preserve + start empty
@@ -88,11 +108,11 @@ enum StreamDestinationsStore {
             guard let persisted = row.value,                 // #9: skip one bad row
                   var dest = persisted.destination else { return nil } // + unknown proto
             let account = persisted.id.uuidString
-            if let secret = KeychainStore.get(account) {
+            if let secret = keychainGet(account) {
                 dest.key = secret
             } else if !persisted.key.isEmpty {
                 // Legacy plaintext key on disk → migrate into the Keychain once.
-                KeychainStore.set(persisted.key, for: account)
+                _ = keychainSet(persisted.key, account)
                 dest.key = persisted.key
             } else {
                 dest.key = ""
@@ -106,19 +126,42 @@ enum StreamDestinationsStore {
     /// Codex #8: each secret is stored in the Keychain (keyed by the destination
     /// id); the JSON row keeps only the reference — its `key` field is written
     /// EMPTY so no secret ever touches the plaintext file.
+    ///
+    /// FAIL-CLOSED (Phase 5a): a stream key is a credential. On a Keychain WRITE
+    /// FAILURE we do NOT fall back to writing plaintext into the JSON (a
+    /// screen-shared setup would leak it) — the JSON `key` is ALWAYS written
+    /// empty, exactly as the success path. The unsaved key survives only in the
+    /// in-memory `Destination.key` for this session; a warning is logged and
+    /// surfaced via `lastError` so the operator knows it won't survive relaunch.
     static func save(_ destinations: [Destination]) throws {
-        let url = fileURL
+        try save(destinations, to: fileURL)
+    }
+
+    /// Testable overload: write to an explicit URL (default path = `fileURL`).
+    static func save(_ destinations: [Destination], to url: URL) throws {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
                                                 withIntermediateDirectories: true)
+        var failedNames: [String] = []
         let rows = destinations.map { dest -> PersistedDestination in
-            let stored = KeychainStore.set(dest.key, for: dest.id.uuidString)
+            let hasKey = !dest.key.isEmpty
+            let stored = keychainSet(dest.key, dest.id.uuidString)
+            // A non-empty key that the Keychain refused → it lives in memory only.
+            if hasKey && !stored { failedNames.append(dest.name) }
             var row = PersistedDestination(dest)
-            // Blank the JSON key ONLY if the Keychain actually accepted the write;
-            // if the Keychain is unavailable (ad-hoc signing) keep the plaintext
-            // fallback so the key survives a relaunch (re-verify #8: unconditional
-            // blanking + a silent write failure lost the key).
-            row.key = stored ? "" : dest.key
+            // Always blank the JSON key — fail CLOSED. Never persist a stream key
+            // as plaintext, even when the Keychain write failed (re-verify: the
+            // old plaintext fallback leaked the credential to the on-disk file).
+            row.key = ""
             return row
+        }
+        if failedNames.isEmpty {
+            lastError = nil
+        } else {
+            let names = failedNames.joined(separator: ", ")
+            let message = "Stream key for \(names) couldn't be saved to the Keychain; "
+                + "it works this session but must be re-entered after relaunch."
+            lastError = message
+            NSLog("StreamDestinationsStore: %@", message)
         }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]

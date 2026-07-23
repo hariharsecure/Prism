@@ -35,11 +35,29 @@ final class CameraAppModel: ObservableObject {
     /// pushed to the streamer and used by the next connect.
     @Published var pairingCode: String {
         didSet {
-            UserDefaults.standard.set(pairingCode, forKey: Self.pairingCodeDefaultsKey)
+            // Phase 5b: the pairing code (PSK) is a shared secret — persist it in
+            // the Keychain (REUSING KeychainStore), not UserDefaults. An empty
+            // value clears the stored item.
+            _ = KeychainStore.set(pairingCode, for: Self.pairingCodeKeychainAccount)
             streamer.setPairingCode(normalizedPairingCode)
         }
     }
+    private static let pairingCodeKeychainAccount = "studio.prism.camera.pairingCode"
+    /// Legacy UserDefaults key — migrated into the Keychain on load, then removed.
     private static let pairingCodeDefaultsKey = "studio.prism.camera.pairingCode"
+
+    /// Load the persisted pairing code from the Keychain, migrating a legacy
+    /// UserDefaults value in (and clearing it) the first time.
+    private static func loadPersistedPairingCode() -> String {
+        if let stored = KeychainStore.get(pairingCodeKeychainAccount) { return stored }
+        let defaults = UserDefaults.standard
+        if let legacy = defaults.string(forKey: pairingCodeDefaultsKey), !legacy.isEmpty {
+            _ = KeychainStore.set(legacy, for: pairingCodeKeychainAccount)
+            defaults.removeObject(forKey: pairingCodeDefaultsKey)
+            return legacy
+        }
+        return ""
+    }
     private var normalizedPairingCode: String? {
         let normalized = LinkPairing.normalize(pairingCode)
         return normalized.isEmpty ? nil : normalized
@@ -72,7 +90,7 @@ final class CameraAppModel: ObservableObject {
     private var previewInput: AVCaptureDeviceInput?
 
     init() {
-        let storedCode = UserDefaults.standard.string(forKey: Self.pairingCodeDefaultsKey) ?? ""
+        let storedCode = Self.loadPersistedPairingCode()
         pairingCode = storedCode
         let normalized = LinkPairing.normalize(storedCode)
         streamer = DeviceCameraStreamer(
