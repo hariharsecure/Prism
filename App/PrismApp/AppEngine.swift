@@ -614,11 +614,19 @@ final class AnimatedFXDriver: @unchecked Sendable {
 /// zero rather than recomputing them.
 struct FinishedMulticamSession {
     struct AngleMeta { let name: String; let width: Int; let height: Int; let fps: Double; let hasAudio: Bool }
+    /// Immutable canvas geometry captured at record START (sol #18). The FCPXML
+    /// project + program angle must declare the geometry the session was RECORDED
+    /// at — not whatever the live `canvasConfig` happens to be at finalize/export
+    /// time (the user may have resized the canvas after stopping the recording).
+    struct CanvasSnapshot { let width: Int; let height: Int; let fps: Double }
     let projectName: String
     /// Folder the recordings live in (the `.fcpxml` is written here).
     let directory: URL
     /// Shared timeline zero (house time) — the ISO bank's fixed start.
     let sessionStart: CMTime
+    /// Canvas geometry as it was at record START — the ONLY geometry finalize +
+    /// FCPXML export may use for the program angle / timeline (sol #18).
+    let canvas: CanvasSnapshot
     let programSource: SourceID
     let program: MovieRecorder.Report
     let isoResults: [SourceID: Result<MovieRecorder.Report, Error>]
@@ -894,6 +902,10 @@ final class AppEngine: ObservableObject {
                 takeTransitionInFlight = false
                 takeGuardTimer?.invalidate()
                 takeGuardTimer = nil
+                // #13: leaving studio invalidates the guard timer, so its completion
+                // fence will never fire — drain any deferred canvas/HDR change here so
+                // a change queued during a TAKE isn't stranded forever.
+                drainDeferredCanvasHDRChange()
             }
         }
     }
@@ -934,6 +946,48 @@ final class AppEngine: ObservableObject {
     /// mid-transition is coalesced (ignored) instead of hard-jumping the program.
     private var takeTransitionInFlight = false
     private var takeGuardTimer: Timer?
+
+    // MARK: #13 — defer canvas/HDR rebuild while a transition/cue is in flight
+    //
+    // A canvas-resize or HDR toggle REBUILDS the render loop, which unconditionally
+    // `invalidatePendingStingerCue` + `cancelActiveStingerTransition`s — silently
+    // destroying an in-flight scene/TAKE transition or a pending stinger TAKE cue
+    // mid-flight (a visible program glitch). A full transition MIGRATION across the
+    // rebuild is out of scope; the minimal-safe behavior is to DEFER the change:
+    // queue it and re-apply it from the transition/cue completion fence, so the
+    // operator's rebuild still happens — just after the transition finishes cleanly.
+    //
+    // A transition/cue is "in flight" when a TAKE transition is running
+    // (`takeTransitionInFlight`), a stinger transition is live (`activeStingerSourceID`),
+    // or a stinger TAKE cue is pending (`pendingStingerCueToken`). A later request of
+    // the same kind supersedes an earlier queued one; if both a canvas and an HDR
+    // change are queued, canvas is applied first, then HDR.
+    private var deferredCanvasConfig: CanvasConfig?
+    private var deferredHDRChange: Bool?
+
+    /// True while a scene/TAKE transition or a stinger TAKE cue is mid-flight — the
+    /// window in which a canvas/HDR rebuild would destroy it (#13).
+    private var transitionOrStingerInFlight: Bool {
+        takeTransitionInFlight || activeStingerSourceID != nil || pendingStingerCueToken != nil
+    }
+
+    /// Re-apply a canvas/HDR change that was deferred because a transition/cue was in
+    /// flight (#13). Called from every transition/cue completion fence; a near-no-op
+    /// unless the engine is now fully idle AND a change is actually queued. Because
+    /// `transitionOrStingerInFlight` is false by the time this applies, the re-entered
+    /// `setCanvasConfig`/`setHDREnabled` proceeds normally (never re-defers).
+    private func drainDeferredCanvasHDRChange() {
+        guard !transitionOrStingerInFlight else { return }
+        guard deferredCanvasConfig != nil || deferredHDRChange != nil else { return }
+        if let config = deferredCanvasConfig {
+            deferredCanvasConfig = nil
+            setCanvasConfig(config)
+        }
+        if let on = deferredHDRChange {
+            deferredHDRChange = nil
+            setHDREnabled(on)
+        }
+    }
 
     /// The scene the current layer/scene edit targets: `previewScene` (off-air)
     /// while `studioMode` is on, else the live `scene`. This is the edit-routing
@@ -1518,6 +1572,29 @@ final class AppEngine: ObservableObject {
     /// Whether this source currently carries a background-`remove` key in the ONE
     /// shared FX store (used by the FX-residual xfail — off-air leak #2).
     func _test_sourceBackgroundIsRemove(_ id: SourceID) -> Bool { sourceEffects[id]?.background == .remove }
+    /// #17 residual probe: the immutable raster size a canvas-native source was
+    /// CONSTRUCTED at. `setCanvasConfig` rebuilds the render loop + preview program
+    /// but NOT existing canvas-native sources, so after a program resize this stays
+    /// at the OLD size (the source then upscales). Text sources for now — the
+    /// residual class is identical for image/gif/browser/movie/montage.
+    func _test_canvasNativeRasterSize(for id: SourceID) -> (width: Int, height: Int)? {
+        guard let active = activeSources.first(where: { $0.id == id }) else { return nil }
+        if case .generated(let video) = active.backing, let text = video as? TextSource {
+            let s = text.renderCanvasSize
+            return (s.width, s.height)
+        }
+        return nil
+    }
+    /// sol #18: inject a finished multicam session so a test can drive the export
+    /// path without a real ISO recording.
+    func _test_setLastFinishedSession(_ s: FinishedMulticamSession) { lastFinishedSession = s }
+    /// sol #18: the exact `MulticamSession` `exportFinalCutProject` would write for the
+    /// finished session — WITHOUT touching disk or Finder — so a test can assert the
+    /// declared geometry comes from the RECORDED canvas snapshot, not the live config.
+    func _test_exportMulticamSession() -> MulticamSession? {
+        guard let s = lastFinishedSession else { return nil }
+        return makeMulticamSessionForExport(s)
+    }
     #endif
     #if DEBUG
     /// sol #10 #2/#3: per-`SourceID` concurrency probes shared by the original + replacement
@@ -4464,6 +4541,10 @@ final class AppEngine: ObservableObject {
     private var isoSessionDir: URL?
     private var isoSessionProjectName: String?
     private var isoSessionMeta: [SourceID: FinishedMulticamSession.AngleMeta] = [:]
+    /// Canvas geometry snapshotted at record START (sol #18). Finalize + FCPXML
+    /// export read ONLY this, never live `canvasConfig`, so a post-recording
+    /// resize can't rewrite the exported session's declared resolution/fps.
+    private var isoSessionCanvas: FinishedMulticamSession.CanvasSnapshot?
 
     private func startISOIfArmed(recordingDirectory: URL, projectName: String, takeID: String) {
         // Only video sources still present can be ISO-recorded.
@@ -4545,6 +4626,11 @@ final class AppEngine: ObservableObject {
             isoSessionDir = recordingDirectory
             isoSessionProjectName = projectName
             isoSessionMeta = meta
+            // sol #18: freeze the canvas geometry AT START. The finalize/export path
+            // uses this snapshot exclusively, so resizing the canvas after Stop can't
+            // rewrite the exported FCPXML's declared resolution/fps.
+            isoSessionCanvas = FinishedMulticamSession.CanvasSnapshot(
+                width: canvasConfig.width, height: canvasConfig.height, fps: Double(canvasConfig.fps))
             isoStatuses = Dictionary(uniqueKeysWithValues: armed.map { ($0.id, "recording…") })
             startISOStatusTimer()
         } catch {
@@ -4580,6 +4666,10 @@ final class AppEngine: ObservableObject {
             lastMulticamExportable = false
             return
         }
+        // sol #18: the geometry the session was RECORDED at (captured at START).
+        // Fall back to live canvasConfig only if the snapshot is somehow missing.
+        let canvas = isoSessionCanvas ?? FinishedMulticamSession.CanvasSnapshot(
+            width: canvasConfig.width, height: canvasConfig.height, fps: Double(canvasConfig.fps))
         let programSource = SourceID("program")
         var meta = isoSessionMeta
         // sol wave-16 #1: a DEFERRED angle's meta was recorded with provisional
@@ -4594,13 +4684,14 @@ final class AppEngine: ObservableObject {
             }
         }
         meta[programSource] = FinishedMulticamSession.AngleMeta(
-            name: "Program", width: canvasConfig.width, height: canvasConfig.height,
-            fps: Double(canvasConfig.fps), hasAudio: program.audioBuffersWritten > 0)
+            name: "Program", width: canvas.width, height: canvas.height,
+            fps: canvas.fps, hasAudio: program.audioBuffersWritten > 0)
 
         lastFinishedSession = FinishedMulticamSession(
             projectName: isoSessionProjectName ?? "Prism Multicam",
             directory: directory,
             sessionStart: start,
+            canvas: canvas,
             programSource: programSource,
             program: program,
             isoResults: results,
@@ -4818,25 +4909,36 @@ final class AppEngine: ObservableObject {
     /// Build a Final Cut multicam project from the last multi-angle session and
     /// reveal the written `.fcpxml`. No-op (and disabled in the UI) when no such
     /// session exists.
-    func exportFinalCutProject() {
-        guard let session = lastFinishedSession else { return }
-        let multicam = FCPXMLExporter.makeSession(
+    /// Build the FCPXML `MulticamSession` for a finished recording, declaring the
+    /// geometry the session was RECORDED at — its `canvas` snapshot (sol #18) — for
+    /// the project timeline AND the program angle's fallback dims, NEVER the live
+    /// `canvasConfig` (a post-Stop resize must not rewrite a finished session's
+    /// FCPXML). Extracted so a test can assert the export geometry with NO file write
+    /// / Finder reveal.
+    private func makeMulticamSessionForExport(_ session: FinishedMulticamSession) -> MulticamSession {
+        let canvas = session.canvas
+        return FCPXMLExporter.makeSession(
             projectName: session.projectName,
             sessionStart: session.sessionStart,
-            frameRate: FrameRate(fps: Double(canvasConfig.fps)),
-            width: canvasConfig.width,
-            height: canvasConfig.height,
+            frameRate: FrameRate(fps: canvas.fps),
+            width: canvas.width,
+            height: canvas.height,
             program: (report: session.program, source: session.programSource),
             isoResults: session.isoResults,
-            metadata: { [canvasConfig] id in
+            metadata: { id in
                 let m = session.meta[id]
                 return FCPXMLExporter.AngleMetadata(
                     name: m?.name ?? id.raw,
-                    width: m?.width ?? canvasConfig.width,
-                    height: m?.height ?? canvasConfig.height,
-                    fps: m?.fps ?? Double(canvasConfig.fps),
+                    width: m?.width ?? canvas.width,
+                    height: m?.height ?? canvas.height,
+                    fps: m?.fps ?? canvas.fps,
                     hasAudio: m?.hasAudio ?? false)
             })
+    }
+
+    func exportFinalCutProject() {
+        guard let session = lastFinishedSession else { return }
+        let multicam = makeMulticamSessionForExport(session)
         // sol #17 (data-loss class): the exporter overwrites any existing file at
         // the target path, and the name is a fixed `<projectName>.fcpxml`. Two
         // exports of the same session (or two sessions sharing a project name +
@@ -6203,6 +6305,11 @@ final class AppEngine: ObservableObject {
             }
             self.performSceneCommit(newScene, outgoing: outgoing,
                                     stingerItem: ready ? candidate : nil)
+            // #13: if the cue resolved to a plain cut (no active transition started),
+            // the engine is now idle — apply any queued canvas/HDR change. If it
+            // started an active stinger transition instead, this no-ops here and the
+            // active-transition completion fence drains it.
+            self.drainDeferredCanvasHDRChange()
         }
     }
 
@@ -6237,6 +6344,7 @@ final class AppEngine: ObservableObject {
                             // back to its idle/frame-0 state so it isn't decoding a
                             // transition that already finished.
                             self.stopStingerMedia(stingerSourceID)
+                            self.drainDeferredCanvasHDRChange()   // #13: apply a queued canvas/HDR change
                         }
                     })
             } else {
@@ -6293,7 +6401,10 @@ final class AppEngine: ObservableObject {
         takeGuardTimer?.invalidate()
         takeGuardTimer = Timer.scheduledTimer(withTimeInterval: max(0.05, transitionDuration),
                                               repeats: false) { [weak self] _ in
-            MainActor.assumeIsolated { self?.takeTransitionInFlight = false }
+            MainActor.assumeIsolated {
+                self?.takeTransitionInFlight = false
+                self?.drainDeferredCanvasHDRChange()   // #13: apply a queued canvas/HDR change
+            }
         }
         commitSceneAnimated(incoming)
         promoteStudioStagedEdits()
@@ -6984,6 +7095,15 @@ extension AppEngine {
             lastError = "Stop recording, streaming, replay, and the virtual camera before changing HDR."
             return
         }
+        // #13: an HDR rebuild would destroy an in-flight scene/TAKE transition or a
+        // pending stinger TAKE cue (same unconditional invalidate/cancel as the canvas
+        // rebuild). DEFER instead — queue it and re-apply from the transition/cue
+        // completion fence rather than glitching the transition away mid-flight.
+        if transitionOrStingerInFlight {
+            deferredHDRChange = on
+            lastError = "HDR change deferred until the current transition finishes."
+            return
+        }
         let mode: MetalCompositor.ColorMode = on ? .hdr : .sdr
         // Rebuild the vertical (9:16) program in the SAME color mode so the vertical
         // program + its recording reach HDR parity with the primary (Stage O). The
@@ -7147,21 +7267,36 @@ extension AppEngine {
             Self.persistCanvasConfig(config)
             return
         }
-        let previous = canvasConfig
-        canvasConfig = config   // buildRenderLoop reads the CURRENT canvasConfig
-        let mode: MetalCompositor.ColorMode = hdrEnabled ? .hdr : .sdr
-        guard let newLoop = buildRenderLoop(colorMode: mode) else {
-            canvasConfig = previous
-            lastError = "Couldn't rebuild the compositor at \(config.resolution.label)."
+        // #13: a canvas rebuild would destroy an in-flight scene/TAKE transition or a
+        // pending stinger TAKE cue (the rebuild `invalidatePendingStingerCue` +
+        // `cancelActiveStingerTransition`s unconditionally). DEFER instead — queue the
+        // change and re-apply it from the transition/cue completion fence, so the
+        // transition finishes cleanly rather than being glitched away mid-flight.
+        if transitionOrStingerInFlight {
+            deferredCanvasConfig = config
+            lastError = "Canvas change deferred until the current transition finishes."
             return
         }
+        let previous = canvasConfig
+        canvasConfig = config   // buildRenderLoop + PreviewProgram read the CURRENT canvasConfig
+        let mode: MetalCompositor.ColorMode = hdrEnabled ? .hdr : .sdr
         // Rebuild the studio PREVIEW program at the NEW canvas size in the CURRENT
         // color mode, mirroring the HDR-rebuild path's parity: the preview compositor
         // is a fixed-dimension raster built at construction, so a resolution change
         // that rebuilds only the primary leaves the preview compositing at the OLD
-        // size (Phase 3a Stage 1 follow-up). Same fence discipline as setHDREnabled
-        // (`quiesce` the old, `resume` on the failure path). Built at the NEW program
-        // canvas size in `mode`; every failure path below restores `oldPreview`.
+        // size (Phase 3a Stage 1 follow-up).
+        //
+        // ORDER (regression fix, mirrors setHDREnabled): build + assign `previewProgram`
+        // BEFORE `buildRenderLoop`. The render loop's tick-snapshot closure captures
+        // `previewProgram` BY VALUE at build time (see `buildRenderLoop`'s
+        // `onTickSnapshot` capture list). If the loop were built first, it would forever
+        // target the OLD preview instance — which we then `quiesce()` below — so the NEW
+        // preview would receive no ticks and FREEZE on its last pre-resize frame. Swap the
+        // new preview in first so the new loop captures the new preview.
+        //
+        // Same fence discipline as setHDREnabled (`quiesce` the old, `resume` on the
+        // failure path). Built at the NEW program canvas size in `mode`; every failure
+        // path below restores `oldPreview`.
         let oldPreview = previewProgram
         let newPreview: PreviewProgram? = metalDevice.flatMap { dev -> PreviewProgram? in
             guard let p = try? PreviewProgram(device: dev,
@@ -7178,6 +7313,12 @@ extension AppEngine {
             return
         }
         previewProgram = newPreview ?? oldPreview
+        guard let newLoop = buildRenderLoop(colorMode: mode) else {
+            canvasConfig = previous
+            previewProgram = oldPreview   // undo the preview swap — the loop capture never happened
+            lastError = "Couldn't rebuild the compositor at \(config.resolution.label)."
+            return
+        }
         let old = renderLoop
         // Quiesce the old render thread FIRST (shared animated-FX GPU / mailboxes
         // are single-consumer): a failed quiesce is a near-no-op that leaves the

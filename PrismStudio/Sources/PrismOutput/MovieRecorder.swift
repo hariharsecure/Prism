@@ -143,6 +143,19 @@ public final class MovieRecorder: @unchecked Sendable {
         public let videoFramesRejectedForPTS: UInt64
         public let audioBuffersWritten: UInt64
         public let audioBuffersDropped: UInt64
+        public init(url: URL, duration: CMTime, bytesWritten: Int64,
+                    videoFramesWritten: UInt64, videoFramesDropped: UInt64,
+                    videoFramesRejectedForPTS: UInt64,
+                    audioBuffersWritten: UInt64, audioBuffersDropped: UInt64) {
+            self.url = url
+            self.duration = duration
+            self.bytesWritten = bytesWritten
+            self.videoFramesWritten = videoFramesWritten
+            self.videoFramesDropped = videoFramesDropped
+            self.videoFramesRejectedForPTS = videoFramesRejectedForPTS
+            self.audioBuffersWritten = audioBuffersWritten
+            self.audioBuffersDropped = audioBuffersDropped
+        }
     }
 
     public let url: URL

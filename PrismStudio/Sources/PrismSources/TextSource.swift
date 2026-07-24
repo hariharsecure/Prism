@@ -81,6 +81,13 @@ public final class TextSource: TimedVideoSource {
     private let log = EngineLog.logger("sources.text")
     private let canvas: SourceRenderCanvas
 
+    /// Immutable raster dimensions captured at construction (the program
+    /// `canvasSize` at the time the source was added). Read-only; exposed so the
+    /// app can observe that `setCanvasConfig` does NOT re-raster canvas-native
+    /// sources on a program resize (the #17 residual — the source keeps rendering
+    /// at this size and the compositor upscales it).
+    public var renderCanvasSize: CanvasSize { CanvasSize(width: canvas.width, height: canvas.height) }
+
     // All mutable content lives under one lock (mutators race the timer tick).
     private struct Content {
         var text: String

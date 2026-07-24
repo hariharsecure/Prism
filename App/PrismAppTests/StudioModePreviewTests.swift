@@ -276,6 +276,18 @@ final class StudioModePreviewTests: XCTestCase {
     /// TAKE. A correct fix needs a per-bus FX stage (stage preview FX + premult,
     /// promote on TAKE) — deferred this pass to avoid shipping a half-broken FX
     /// change. This xfail LOCKS the residual in and flips GREEN when it is fixed.
+    ///
+    /// FAST by construction (≈7 ms, no render): the leak is asserted at the
+    /// SHARED-PIPELINE STATE level — `sourceEffects[id].background`, the single
+    /// program-facing FX metadata that `setBackground`/`setChromaKey`/`setLumaKey`
+    /// mutate for BOTH buses — NOT by rendering a full program/preview pass and
+    /// diffing pixels. A studio FX key flips that shared state IMMEDIATELY (pre-TAKE),
+    /// which is the residual; the desired post-fix invariant (state unchanged until
+    /// TAKE) is the wrapped `XCTExpectFailure` assertion. Checking the state directly
+    /// (rather than running the ~28-minute full-render diff the pixel proof would
+    /// need) keeps the suite fast while still LOCKING IN residual #2 — this test flips
+    /// GREEN the moment a per-bus FX stage (stage preview key + premult, promote on
+    /// TAKE) lands.
     func testFXKeyingInStudioIsAKnownProgramLeakResidual() throws {
         let (engine, id) = try engineWithOneLayer()
         engine.studioMode = true
@@ -284,7 +296,8 @@ final class StudioModePreviewTests: XCTestCase {
         XCTExpectFailure("off-air leak #2: FX keying is a shared-pipeline residual — stage preview FX + promote on TAKE") {
             engine.setBackground(.remove, for: id)
             // DESIRED post-fix invariant: a studio FX key must not change the shared,
-            // program-facing FX state until TAKE. Today it changes immediately.
+            // program-facing FX state until TAKE. Today it changes immediately — proven
+            // cheaply by reading the shared FX-pipeline metadata, no render loop.
             XCTAssertFalse(engine._test_sourceBackgroundIsRemove(id),
                            "off-air: a studio FX key must not change the program-facing FX state pre-TAKE")
         }
