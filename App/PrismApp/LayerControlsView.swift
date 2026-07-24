@@ -9,8 +9,14 @@ struct LayerControlsView: View {
     @EnvironmentObject private var selection: SelectionModel
 
     /// Top-most layer first (how switchers list layers).
+    ///
+    /// Off-air leak #14: reads `editableLayers` — the off-air `previewScene` in
+    /// studio mode (what an edit actually targets), else the live `scene`. So the
+    /// eye toggle and the row's hidden/visible state reflect the scene being
+    /// EDITED, not the on-air program snapshot (else the toggle negates program
+    /// state while writing preview and flips the wrong way). Off studio → identical.
     private var orderedLayers: [Layer] {
-        engine.scene.layers.sorted { $0.zIndex > $1.zIndex }
+        engine.editableLayers.sorted { $0.zIndex > $1.zIndex }
     }
 
     var body: some View {

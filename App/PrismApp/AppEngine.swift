@@ -879,9 +879,61 @@ final class AppEngine: ObservableObject {
                 // program so the operator edits from what is on-air right now.
                 previewScene = scene
                 previewProgram?.scene = previewScene
+                // Seed the STAGED off-air edit sets from the live state so a
+                // studio session starts equal to the program.
+                previewLayerMotions = layerMotions
+                pendingStudioRemovals.removeAll()
+                pendingStudioEntrances.removeAll()
+            } else {
+                // Leaving studio WITHOUT a take(): discard every staged off-air
+                // edit. The live program was never touched by them, so dropping
+                // the staging simply abandons the un-taken preview.
+                pendingStudioRemovals.removeAll()
+                pendingStudioEntrances.removeAll()
+                previewLayerMotions.removeAll()
+                takeTransitionInFlight = false
+                takeGuardTimer?.invalidate()
+                takeGuardTimer = nil
             }
         }
     }
+
+    /// The scene the layer/scene UI should READ while an edit is in progress:
+    /// the off-air `previewScene` in studio mode (what the edit actually targets),
+    /// else the live `scene`. Pairs with the `editScene` WRITE seam so a toggle
+    /// reflects what it is editing — e.g. the layer-list eye button negates the
+    /// state of the scene it writes, not the on-air program snapshot (off-air leak
+    /// #14). Off studio → identical to reading `scene` (no behavior change).
+    var editableScene: ProgramScene { studioMode ? previewScene : scene }
+
+    /// The layers the layer UI should render/read (top-most order is applied by
+    /// the view). Studio → `previewScene.layers`; off → `scene.layers`.
+    var editableLayers: [Layer] { editableScene.layers }
+
+    // MARK: Studio mode — staged off-air edits (promoted on TAKE)
+
+    /// Sources whose removal was STAGED off-air (dropped from `previewScene`) while
+    /// studio mode is on. The layer stays on the live program and the underlying
+    /// source keeps running (so the program output is unchanged) until `take()`
+    /// commits the removal — `promoteStudioStagedEdits` then tears the source down.
+    private var pendingStudioRemovals: Set<SourceID> = []
+
+    /// Per-layer motion STAGED off-air. While studio mode is on, motion edits land
+    /// here instead of `layerMotions` (which drives the live render-loop provider),
+    /// so the program is untouched; `promoteStudioStagedEdits` copies these onto
+    /// `layerMotions` on TAKE. (Deferral: the preview MONITOR renders a static
+    /// `previewScene` and does not animate staged motion in this pass — the motion
+    /// becomes visible when promoted to the program.)
+    private var previewLayerMotions: [SourceID: ActiveLayerMotion] = [:]
+
+    /// Entrance animations STAGED off-air; each plays on the PROGRAM when promoted
+    /// on TAKE. (Deferral: not previewed live in this pass.)
+    private var pendingStudioEntrances: [SourceID: (preset: LayerEntrancePreset, duration: Double)] = [:]
+
+    /// #12: set while a TAKE-started transition is running, so a second TAKE
+    /// mid-transition is coalesced (ignored) instead of hard-jumping the program.
+    private var takeTransitionInFlight = false
+    private var takeGuardTimer: Timer?
 
     /// The scene the current layer/scene edit targets: `previewScene` (off-air)
     /// while `studioMode` is on, else the live `scene`. This is the edit-routing
@@ -1443,6 +1495,29 @@ final class AppEngine: ObservableObject {
     /// permanently 1920×1080 SDR/H.264". Default false → the recorder is deferred and
     /// the first take is native + HDR-correct.
     nonisolated(unsafe) static var _test_forceISOImmediateCanvasFallback = false
+
+    // MARK: Studio off-air staging probes (extended off-air proof)
+    /// Sources with a STAGED off-air removal (dropped from preview, still live on
+    /// the program until TAKE).
+    var _test_pendingStudioRemovals: Set<SourceID> { pendingStudioRemovals }
+    /// Count of motions STAGED off-air (not yet on the program).
+    var _test_previewLayerMotionCount: Int { previewLayerMotions.count }
+    /// Count of motions LIVE on the program render-loop provider.
+    var _test_programLayerMotionCount: Int { layerMotions.count }
+    /// Whether the LIVE render loop currently has a scene provider installed
+    /// (motion/entrance/meme). Off-air motion/entrance must NOT install one.
+    var _test_programHasSceneProvider: Bool { renderLoop?.sceneProvider != nil }
+    /// Count of entrances STAGED off-air (not yet played on the program).
+    var _test_pendingStudioEntranceCount: Int { pendingStudioEntrances.count }
+    /// #12 TAKE-in-flight guard state.
+    var _test_takeTransitionInFlight: Bool { takeTransitionInFlight }
+    /// Simulate the running transition completing (the live app clears this via the
+    /// `takeGuardTimer` once the main run loop pumps) so a test can prove the guard
+    /// is not permanently stuck.
+    func _test_clearTakeGuard() { takeTransitionInFlight = false; takeGuardTimer?.invalidate(); takeGuardTimer = nil }
+    /// Whether this source currently carries a background-`remove` key in the ONE
+    /// shared FX store (used by the FX-residual xfail — off-air leak #2).
+    func _test_sourceBackgroundIsRemove(_ id: SourceID) -> Bool { sourceEffects[id]?.background == .remove }
     #endif
     #if DEBUG
     /// sol #10 #2/#3: per-`SourceID` concurrency probes shared by the original + replacement
@@ -3569,7 +3644,7 @@ final class AppEngine: ObservableObject {
             // pending/draining preview tick can fold its frames and the preview
             // never desyncs when the source set changes (mirror `dualProgram`).
             previewProgram?.attach(source: source.id)
-            var layers = scene.layers
+            var layers = editScene.layers
             let nextZ = (layers.map(\.zIndex).max() ?? -1) + 1
             // Text/image/browser sources render premultiplied alpha with a
             // transparent background — their layer MUST honor that alpha, else the
@@ -3584,16 +3659,14 @@ final class AppEngine: ObservableObject {
                 : Layer(sourceID: source.id, zIndex: nextZ,
                         premultipliedAlpha: layerNeedsPremultipliedAlpha(source.id))
             layers.append(newLayer)
-            scene.layers = layers
-            // Studio mode: mirror the new input into the off-air preview scene too
-            // (so the preview shows the just-added source), before `applyPreset`
-            // arranges the edit target. When studio mode is off this is skipped and
-            // the path is byte-identical to before.
-            if studioMode {
-                var previewLayers = previewScene.layers
-                previewLayers.append(newLayer)
-                previewScene.layers = previewLayers
-            }
+            // Off-air routing (leak #1): in studio mode the compositing LAYER lands
+            // on the off-air `previewScene` ONLY — the live program `scene` is NOT
+            // given the new layer until TAKE, so an added source can't reach the
+            // recorder/stream/vcam before it is taken. The source/frames still
+            // register with the compositor + preview program above, so it renders
+            // in the preview. Off studio → `editScene` IS `scene`, byte-identical
+            // to the previous unconditional `scene.layers = layers`.
+            editScene.layers = layers
             applyPreset(selectedPreset)
             // Announce the new layer so the Inspector can auto-select it.
             lastAddedVideoSourceID = source.id
@@ -3721,6 +3794,25 @@ final class AppEngine: ObservableObject {
     }
 
     func removeSource(_ id: SourceID) {
+        if studioMode {
+            // Off-air routing (leak #1, removal): stage the removal on the PREVIEW
+            // scene ONLY. The layer stays on the live program AND the underlying
+            // source keeps running (its frames keep flowing), so the program output
+            // is UNCHANGED until TAKE. `promoteStudioStagedEdits` performs the real
+            // teardown once TAKE commits the removal — deferring destruction until
+            // neither `scene` nor `previewScene` references the source.
+            guard activeSources.contains(where: { $0.id == id }) else { return }
+            previewScene.layers.removeAll { $0.sourceID == id }
+            pendingStudioRemovals.insert(id)
+            return
+        }
+        performSourceTeardown(id)
+    }
+
+    /// The actual source teardown (stop capture, drop mailbox/effect chain, remove
+    /// the layer). Off studio this is `removeSource` itself; in studio it is
+    /// DEFERRED and run by `promoteStudioStagedEdits` when TAKE commits the removal.
+    private func performSourceTeardown(_ id: SourceID) {
         guard let index = activeSources.firstIndex(where: { $0.id == id }) else { return }
         // Release aggregate animated-media budget accounting for an ordinary GIF
         // source (F15); harmless no-op for non-animated sources.
@@ -6186,10 +6278,49 @@ final class AppEngine: ObservableObject {
             // preview equal to it so the next off-air edit starts from what is live.
             performSceneCommit(incoming, outgoing: scene, stingerItem: nil, hardCut: true)
             previewScene = scene
+            promoteStudioStagedEdits()
             return
         }
         // Transitions ON: run the selected transition via the live scene-switch path.
+        // #12 — TAKE-in-flight guard: a second TAKE while the previous take's
+        // transition is still running would hard-jump the program (RenderLoop
+        // interrupts the running transition with a cut to its old target). Coalesce
+        // it: ignore a TAKE while one is in flight. Minimal safe version — the
+        // in-flight window is `transitionDuration`, cleared by a timer (the live app
+        // pumps the main run loop) and by leaving studio.
+        if takeTransitionInFlight { return }
+        takeTransitionInFlight = true
+        takeGuardTimer?.invalidate()
+        takeGuardTimer = Timer.scheduledTimer(withTimeInterval: max(0.05, transitionDuration),
+                                              repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated { self?.takeTransitionInFlight = false }
+        }
         commitSceneAnimated(incoming)
+        promoteStudioStagedEdits()
+    }
+
+    /// TAKE promotion (leaks #1 removal, #3 motion/entrance): apply the off-air
+    /// edits that were STAGED — not applied to the live program — while studio mode
+    /// was on, now that `take()` has committed the preview to the program.
+    private func promoteStudioStagedEdits() {
+        // Deferred source removals: the layer left the program on this TAKE, so the
+        // underlying source can finally be torn down. Guard on the committed scene
+        // so a still-referenced source (e.g. an async stinger commit not yet landed)
+        // is not destroyed out from under the running program.
+        let removals = pendingStudioRemovals
+        pendingStudioRemovals.removeAll()
+        for id in removals where !scene.layers.contains(where: { $0.sourceID == id }) {
+            performSourceTeardown(id)
+        }
+        // Layer motion staged off-air becomes the live program motion.
+        layerMotions = previewLayerMotions
+        refreshSceneProvider()
+        // Entrances staged off-air play now on the program (frames keep flowing).
+        let entrances = pendingStudioEntrances
+        pendingStudioEntrances.removeAll()
+        for (sid, staged) in entrances {
+            installLayerEntrance(sourceID: sid, preset: staged.preset, duration: staged.duration)
+        }
     }
 
     /// Pure cue evaluator used by the live schedule and App regression tests.
@@ -6360,6 +6491,23 @@ extension AppEngine {
     /// `sceneProvider(pts)` every tick); when the entrance finishes the provider
     /// is cleared and the resting scene resumes.
     func animateLayerIn(sourceID: SourceID, preset: LayerEntrancePreset, duration: Double) {
+        if studioMode {
+            // Off-air routing (leak #3, entrance): stage the entrance. The live
+            // render loop's `sceneProvider` is UNTOUCHED, so the program is
+            // unchanged; `promoteStudioStagedEdits` plays it on the program on TAKE.
+            // (Deferral: the preview monitor does not play the staged entrance in
+            // this pass — it is a state-level stage promoted on take.)
+            pendingStudioEntrances[sourceID] = (preset, duration)
+            return
+        }
+        installLayerEntrance(sourceID: sourceID, preset: preset, duration: duration)
+    }
+
+    /// Install the entrance on the LIVE program render loop. Split out of
+    /// `animateLayerIn` so TAKE promotion (`promoteStudioStagedEdits`) can play a
+    /// staged entrance on the program even though `studioMode` is still on (which
+    /// would otherwise re-stage it).
+    private func installLayerEntrance(sourceID: SourceID, preset: LayerEntrancePreset, duration: Double) {
         guard let loop = renderLoop else { return }
         // Resting layer = where the scene currently wants the layer to sit; the
         // entrance ends exactly there.
@@ -9126,6 +9274,22 @@ extension AppEngine {
     /// Set (or clear, with `.none`) a layer's motion. A live motion drives the
     /// layer's transform every render tick off the house clock, looping.
     func setLayerMotion(_ kind: LayerMotionKind, speed: Double, for id: SourceID) {
+        if studioMode {
+            // Off-air routing (leak #3, motion): stage the motion on the PREVIEW
+            // motion set only. `layerMotions` (which drives the live render-loop
+            // provider) is untouched, so the program is unchanged;
+            // `promoteStudioStagedEdits` installs it on TAKE. (Deferral: the preview
+            // monitor renders a static `previewScene` and does not animate staged
+            // motion in this pass.)
+            if kind == .none {
+                previewLayerMotions.removeValue(forKey: id)
+            } else if let path = kind.path {
+                previewLayerMotions[id] = ActiveLayerMotion(kind: kind, motion: LayerMotion(path: path),
+                                                            speed: max(0.01, speed),
+                                                            startHouse: HouseClock.nowSeconds())
+            }
+            return
+        }
         if kind == .none {
             guard layerMotions.removeValue(forKey: id) != nil else { return }
         } else if let path = kind.path {

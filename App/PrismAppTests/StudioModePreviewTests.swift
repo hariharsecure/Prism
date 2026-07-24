@@ -124,6 +124,206 @@ final class StudioModePreviewTests: XCTestCase {
                        "after TAKE, preview and program stay in sync")
     }
 
+    // MARK: - EXTENDED OFF-AIR PROOF (off-air leaks #1 add/remove, #3 motion/
+    // entrance, #14 eye-toggle). Each mirrors the byte-invariance pattern of
+    // PreviewProgramTests.testOffAirPreviewEditLeavesProgramOutputByteUnchanged at
+    // the App state-routing level: with studio ON the edit must leave the PROGRAM
+    // scene UNCHANGED while `previewScene` reflects it, and TAKE promotes it.
+
+    private func twoLayerEngine() throws -> AppEngine {
+        let engine = AppEngine()
+        guard engine.previewProgramColorMode != nil else { throw XCTSkip("no preview program (Metal unavailable)") }
+        engine.addTextSource(text: "A")
+        engine.addTextSource(text: "B")
+        guard engine.scene.layers.count >= 2 else { throw XCTSkip("need two layers") }
+        return engine
+    }
+
+    /// LEAK #1 (add): with studio ON, adding a source lands the compositing layer
+    /// on `previewScene` ONLY — the live program scene is unchanged until TAKE, so
+    /// a just-added camera can't reach the recorder/stream/vcam before it is taken.
+    func testAddSourceInStudioLeavesProgramUnchangedUntilTake() throws {
+        let (engine, seedID) = try engineWithOneLayer()
+        engine.studioMode = true
+        let programBefore = engine.scene.layers.map(\.sourceID)
+        XCTAssertEqual(programBefore, [seedID])
+
+        engine.addTextSource(text: "B")
+        guard let newID = engine.lastAddedVideoSourceID, newID != seedID else {
+            throw XCTSkip("second text source could not be added headlessly")
+        }
+
+        XCTAssertEqual(engine.scene.layers.map(\.sourceID), programBefore,
+                       "OFF-AIR: an added source must NOT reach the live program scene before TAKE")
+        XCTAssertFalse(engine.scene.layers.contains { $0.sourceID == newID },
+                       "the added layer must be off the program pre-TAKE")
+        XCTAssertTrue(engine.previewScene.layers.contains { $0.sourceID == newID },
+                      "the added source must appear on the off-air preview scene")
+
+        engine.take()
+        XCTAssertTrue(engine.scene.layers.contains { $0.sourceID == newID },
+                      "TAKE must promote the added source onto the program")
+    }
+
+    /// LEAK #1 (remove): with studio ON, removing a source drops it from
+    /// `previewScene` ONLY — the layer stays live AND the underlying source keeps
+    /// running (deferred teardown) so the program is unchanged; TAKE commits the
+    /// removal and runs the teardown.
+    func testRemoveSourceInStudioLeavesProgramUnchangedUntilTake() throws {
+        let engine = try twoLayerEngine()
+        let victim = engine.scene.layers.sorted { $0.zIndex < $1.zIndex }.first!.sourceID
+        engine.studioMode = true
+        let programBefore = engine.scene.layers.map(\.sourceID)
+
+        engine.removeSource(victim)
+
+        XCTAssertEqual(engine.scene.layers.map(\.sourceID), programBefore,
+                       "OFF-AIR: removing a source must NOT change the live program scene before TAKE")
+        XCTAssertTrue(engine.activeSources.contains { $0.id == victim },
+                      "OFF-AIR: the underlying source must keep running (deferred teardown) until TAKE")
+        XCTAssertTrue(engine._test_pendingStudioRemovals.contains(victim), "the removal must be staged")
+        XCTAssertFalse(engine.previewScene.layers.contains { $0.sourceID == victim },
+                       "the off-air preview must drop the removed layer")
+
+        engine.take()
+        XCTAssertFalse(engine.scene.layers.contains { $0.sourceID == victim },
+                       "TAKE must promote the removal onto the program")
+        XCTAssertFalse(engine.activeSources.contains { $0.id == victim },
+                       "TAKE must run the deferred source teardown")
+        XCTAssertTrue(engine._test_pendingStudioRemovals.isEmpty, "staged removals cleared after TAKE")
+    }
+
+    /// LEAK #3 (motion): with studio ON, layer motion is STAGED — it does not
+    /// install on the live render-loop scene provider (the program does not move)
+    /// until TAKE.
+    func testLayerMotionInStudioLeavesProgramProviderUnchangedUntilTake() throws {
+        let (engine, id) = try engineWithOneLayer()
+        guard engine.renderLoop != nil else { throw XCTSkip("no render loop (Metal unavailable)") }
+        engine.studioMode = true
+        XCTAssertFalse(engine._test_programHasSceneProvider, "no provider before any motion")
+
+        engine.setLayerMotion(.orbit, speed: 1, for: id)
+
+        XCTAssertEqual(engine._test_programLayerMotionCount, 0,
+                       "OFF-AIR: layer motion must NOT install on the live program before TAKE")
+        XCTAssertFalse(engine._test_programHasSceneProvider,
+                       "OFF-AIR: an off-air motion edit must not install a live render-loop provider")
+        XCTAssertEqual(engine._test_previewLayerMotionCount, 1, "the motion must be staged off-air")
+
+        engine.take()
+        XCTAssertEqual(engine._test_programLayerMotionCount, 1, "TAKE must promote the motion to the program")
+        XCTAssertTrue(engine._test_programHasSceneProvider, "TAKE installs the live scene provider")
+    }
+
+    /// LEAK #3 (entrance): with studio ON, an entrance is STAGED — it does not start
+    /// on the live program (`animatingSourceID` stays nil, no live provider) until
+    /// TAKE plays it.
+    func testEntranceInStudioLeavesProgramUnchangedUntilTake() throws {
+        let (engine, id) = try engineWithOneLayer()
+        guard engine.renderLoop != nil else { throw XCTSkip("no render loop (Metal unavailable)") }
+        engine.studioMode = true
+
+        engine.animateLayerIn(sourceID: id, preset: .slideIn, duration: 0.5)
+
+        XCTAssertNil(engine.animatingSourceID,
+                     "OFF-AIR: an off-air entrance must NOT start on the live program")
+        XCTAssertFalse(engine._test_programHasSceneProvider,
+                       "OFF-AIR: a staged entrance must not install a live provider")
+        XCTAssertEqual(engine._test_pendingStudioEntranceCount, 1, "the entrance must be staged off-air")
+
+        engine.take()
+        XCTAssertEqual(engine.animatingSourceID, id, "TAKE must play the staged entrance on the program")
+        engine.cancelLayerAnimation() // stop the entrance clear-timer before teardown
+    }
+
+    /// LEAK #14 (UI eye-toggle): the layer UI must READ `editableLayers` — the
+    /// off-air preview in studio — so a toggle reflects (and is reversible on) the
+    /// scene it WRITES, not the on-air program snapshot. Pre-fix the row read
+    /// `engine.scene` while writing preview, so a second click could never un-hide.
+    func testEyeToggleInStudioReadsEditableSceneAndIsReversible() throws {
+        let (engine, id) = try engineWithOneLayer()
+        engine.studioMode = true
+        func editableHidden() -> Bool? { engine.editableLayers.first { $0.sourceID == id }?.isHidden }
+        func programHidden() -> Bool? { engine.scene.layers.first { $0.sourceID == id }?.isHidden }
+
+        XCTAssertEqual(editableHidden(), false, "UI reads the editable (preview) scene, starts visible")
+
+        // Exactly what LayerControlsView's eye button does: toggle from what it READS.
+        func toggleFromUI() {
+            let layer = engine.editableLayers.first { $0.sourceID == id }!
+            engine.setLayerHidden(!layer.isHidden, for: id)
+        }
+
+        toggleFromUI()
+        XCTAssertEqual(editableHidden(), true, "first toggle hides on the edited (preview) scene")
+        XCTAssertEqual(programHidden(), false, "OFF-AIR: the program is unchanged by the off-air eye toggle")
+
+        toggleFromUI()
+        XCTAssertEqual(editableHidden(), false,
+                       "second toggle must UN-hide — the row reads what it writes (the #14 bug was a stuck toggle)")
+        XCTAssertEqual(programHidden(), false, "OFF-AIR: still no program change after two off-air toggles")
+
+        toggleFromUI() // hide again, then prove TAKE promotes the preview state
+        XCTAssertEqual(editableHidden(), true)
+        engine.take()
+        XCTAssertEqual(programHidden(), true, "TAKE promotes the off-air eye-toggle state onto the program")
+    }
+
+    /// KNOWN RESIDUAL — off-air leak #2 (FX keying). Per-source FX (chroma / luma /
+    /// background key) run through ONE shared `SourceEffectPipeline` whose processed
+    /// frame is posted to a single mailbox consumed by BOTH buses
+    /// (`deliverSourceFrame`), so a studio FX edit reaches the live program BEFORE
+    /// TAKE. A correct fix needs a per-bus FX stage (stage preview FX + premult,
+    /// promote on TAKE) — deferred this pass to avoid shipping a half-broken FX
+    /// change. This xfail LOCKS the residual in and flips GREEN when it is fixed.
+    func testFXKeyingInStudioIsAKnownProgramLeakResidual() throws {
+        let (engine, id) = try engineWithOneLayer()
+        engine.studioMode = true
+        XCTAssertFalse(engine._test_sourceBackgroundIsRemove(id), "no key before the edit")
+
+        XCTExpectFailure("off-air leak #2: FX keying is a shared-pipeline residual — stage preview FX + promote on TAKE") {
+            engine.setBackground(.remove, for: id)
+            // DESIRED post-fix invariant: a studio FX key must not change the shared,
+            // program-facing FX state until TAKE. Today it changes immediately.
+            XCTAssertFalse(engine._test_sourceBackgroundIsRemove(id),
+                           "off-air: a studio FX key must not change the program-facing FX state pre-TAKE")
+        }
+    }
+
+    // MARK: - #12 TAKE-in-flight guard
+
+    /// A second TAKE while the first take's transition is still running must be
+    /// COALESCED (ignored) — pre-fix it hard-jumped the program (RenderLoop
+    /// interrupts a running transition with a cut to its old target).
+    func testTakeInFlightGuardCoalescesASecondTake() throws {
+        let engine = try twoLayerEngine()
+        guard engine.renderLoop != nil else { throw XCTSkip("no render loop (Metal unavailable)") }
+        let ids = engine.scene.layers.sorted { $0.zIndex < $1.zIndex }.map(\.sourceID)
+        let a = ids[0], b = ids[1]
+        engine.setStingerMedia(nil)
+        engine.setTransitionEnabled(true)
+        engine.setTransitionKind(.dissolve)
+        engine.setTransitionDuration(0.5)
+        engine.studioMode = true
+
+        engine.setLayerHidden(true, for: a)
+        engine.take() // starts a transition
+        XCTAssertTrue(engine._test_takeTransitionInFlight, "the first TAKE's transition is in flight")
+        XCTAssertEqual(engine.scene.layers.first { $0.sourceID == a }?.isHidden, true,
+                       "first TAKE committed edit A as the program base scene")
+
+        engine.setLayerHidden(true, for: b) // a second off-air edit
+        engine.take() // must be coalesced — no hard-jump to edit B
+        XCTAssertEqual(engine.scene.layers.first { $0.sourceID == b }?.isHidden, false,
+                       "#12: a TAKE while a transition is in flight must be IGNORED (no hard-jump to edit B)")
+
+        // Negative control: once the transition completes (guard clears), TAKE lands B.
+        engine._test_clearTakeGuard()
+        engine.take()
+        XCTAssertEqual(engine.scene.layers.first { $0.sourceID == b }?.isHidden, true,
+                       "after the guard clears, a subsequent TAKE promotes the pending edit B")
+    }
+
     /// `take()` is a no-op when studio mode is off (nothing to cut).
     func testTakeIsNoOpWhenStudioOff() throws {
         let (engine, id) = try engineWithOneLayer()
