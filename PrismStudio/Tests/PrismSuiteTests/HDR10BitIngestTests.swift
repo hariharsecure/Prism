@@ -34,7 +34,7 @@ import PrismCore
 ///
 /// SOFTWARE-VERIFIED ONLY: these synthetic 10-bit buffers verify the compositor's
 /// software decode/composite. A REAL 10-bit HDR camera / movie end-to-end and an
-/// HDR display remain UNVERIFIED-until-hardware (stage N sources + Rishi's HDR
+/// HDR display remain UNVERIFIED-until-hardware (stage N sources + the operator's HDR
 /// hardware pass).
 final class HDR10BitIngestTests: XCTestCase {
 

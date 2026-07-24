@@ -6,7 +6,7 @@ import simd
 /// Phase-0 spike corpus (`docs/UNREAL_AR_3D_CHARACTER_DESIGN.md`, "Inputs and
 /// corpus": rectangles, a sphere, a slanted plane, thin geometry, synthetic
 /// character plates, and a known-`a,b` relative-depth map). Public/synthetic
-/// only — real target-camera clips are a separate workstream needing Rishi's
+/// only — real target-camera clips are a separate workstream needing the operator's
 /// footage.
 ///
 /// Every generator returns the IOSurface-backed buffer AND a parallel row-major

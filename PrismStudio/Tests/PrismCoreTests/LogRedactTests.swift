@@ -24,7 +24,7 @@ final class LogRedactTests: XCTestCase {
     /// Non-reversible-looking: the raw identifier is NEVER a substring of the tag.
     func testHashIDDoesNotContainInput() {
         let secrets = ["47C8B2FA-1234-5678-9ABC-DEF012345678",
-                       "Rishi-iPhone-uniqueID",
+                       "the operator-iPhone-uniqueID",
                        "AppleUSBAudio:1a2b"]
         for s in secrets {
             let tag = LogRedact.hashID(s)
@@ -56,14 +56,14 @@ final class LogRedactTests: XCTestCase {
     /// A full local path collapses to its last component only.
     func testBasenameStripsDirectories() {
         XCTAssertEqual(
-            LogRedact.basename("/Users/june/Library/Application Support/Prism/sounds/kick_0007.wav"),
+            LogRedact.basename("/Users/alex/Library/Application Support/Prism/sounds/kick_0007.wav"),
             "kick_0007.wav")
         XCTAssertEqual(LogRedact.basename("/var/folders/xy/z/library.json"), "library.json")
     }
 
     /// The parent directories never survive redaction (no leak of the user's home).
     func testBasenameDropsHomeDirectory() {
-        let out = LogRedact.basename("/Users/june/secret/place/file.wav")
+        let out = LogRedact.basename("/Users/alex/secret/place/file.wav")
         XCTAssertFalse(out.contains("june"))
         XCTAssertFalse(out.contains("/"))
     }

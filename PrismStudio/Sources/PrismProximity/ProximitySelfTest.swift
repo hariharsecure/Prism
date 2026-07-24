@@ -57,7 +57,7 @@ public enum ProximitySelfTest {
 
     private static func testAdvertisementRoundTrip() throws {
         let token = try ProximityToken.random()
-        for name in ["Rishi's iPhone", "iPad", "", "Café 📷 Cam"] {
+        for name in ["Alex's iPhone", "iPad", "", "Café 📷 Cam"] {
             let adv = ProximityProtocol.Advertisement(name: name, token: token)
             guard let decoded = ProximityProtocol.Advertisement.decode(adv.encode()) else {
                 throw SelfTestError.mismatch("decode returned nil for name \"\(name)\"")
@@ -171,7 +171,7 @@ public enum ProximitySelfTest {
         // contain neither the code nor the derived PSK.
         for _ in 0..<200 {
             let token = try ProximityToken.random()
-            let payload = ProximityProtocol.Advertisement(name: "Rishi's iPhone", token: token).encode()
+            let payload = ProximityProtocol.Advertisement(name: "Alex's iPhone", token: token).encode()
             try require(!contains(payload, codeBytes),
                         "advertisement payload leaked the pairing code")
             try require(!contains(token.bytes, codeBytes),
@@ -201,11 +201,11 @@ public enum ProximitySelfTest {
 
         // A valid characteristic value (what a connected read returns) delivers
         // the token + name.
-        let blob = ProximityProtocol.Advertisement(name: "Rishi's iPhone", token: token).encode()
+        let blob = ProximityProtocol.Advertisement(name: "Alex's iPhone", token: token).encode()
         let applied = scanner.applyReadPayload(blob, peripheralID: id, at: now)
         try require(applied != nil, "characteristic read of a valid payload must yield a candidate")
         try require(applied?.token == token, "token from the characteristic read was not delivered")
-        try require(applied?.name == "Rishi's iPhone", "name from the characteristic read was not delivered")
+        try require(applied?.name == "Alex's iPhone", "name from the characteristic read was not delivered")
         try require(delivered?.token == token, "onCandidate must surface the read-delivered token")
 
         // A malformed characteristic value delivers no token (no fabrication).

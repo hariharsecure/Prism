@@ -104,7 +104,7 @@ public final class ProximityAdvertiser: NSObject {
             CBAdvertisementDataLocalNameKey: deviceName,
         ])
         startRotationTimer()
-        // Device name is .private (identifies a person, e.g. "Rishi's iPhone");
+        // Device name is .private (identifies a person, e.g. "Alex's iPhone");
         // the presence token is intentionally NOT logged (secret + anti-correlation).
         log.info("proximity: advertising as \(self.deviceName, privacy: .private)")
     }

@@ -3,7 +3,7 @@ import CoreVideo
 import Foundation
 
 /// Tile / grid effect math (DESIGN.md Build A + C — the "square boxes" family
-/// Rishi saw: a top layer whose squares blink / disappear to reveal the layer
+/// Observed: a top layer whose squares blink / disappear to reveal the layer
 /// beneath). This file is the deterministic *schedule* engine (which tiles are
 /// revealed at a given progress/phase) plus the standalone `TileRepeatRenderer`
 /// (Build C — one source drawn into an N×M grid / kaleidoscope).

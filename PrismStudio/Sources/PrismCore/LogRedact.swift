@@ -31,7 +31,7 @@ public enum LogRedact {
 
     /// The final path component only — every parent directory is dropped — so a
     /// full local path never reaches a public log.
-    /// `/Users/june/Library/Application Support/…/kick_0007.wav` → `kick_0007.wav`.
+    /// `/Users/alex/Library/Application Support/…/kick_0007.wav` → `kick_0007.wav`.
     public static func basename(_ path: some StringProtocol) -> String {
         (String(path) as NSString).lastPathComponent
     }

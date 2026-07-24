@@ -4,7 +4,7 @@ import Foundation
 
 /// The tile / grid "square boxes" family as a LIVE per-LAYER effect (T1) — the
 /// real home of the ongoing "blinking squares reveal what's underneath" look
-/// Rishi saw. Where `TransitionRenderer` composites a holed A *over* a painted B
+/// Observed. Where `TransitionRenderer` composites a holed A *over* a painted B
 /// (a self-contained A→B transition), `TileMask` punches the animated grid of
 /// transparent holes into ONE layer's frame and returns it, leaving the reveal
 /// to the real compositor: the app feeds the holed frame to a layer with

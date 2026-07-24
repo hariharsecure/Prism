@@ -4,7 +4,7 @@ import Security
 
 /// PrismProximity — Bluetooth LE proximity discovery + pairing assist (DESIGN.md
 /// §3.8). BLE does exactly three jobs here: let the Mac notice a nearby iOS
-/// companion, show "Rishi's iPhone is nearby — pair?" *before* any Wi-Fi
+/// companion, show "Alex's iPhone is nearby — pair?" *before* any Wi-Fi
 /// association, and (later) nudge a sleeping companion awake. It mirrors
 /// Continuity Camera's model: **discovery/wake over BT, media over Wi-Fi**.
 ///
@@ -77,7 +77,7 @@ public enum ProximityProtocol {
     /// No field can hold the pairing code: the encoder's only inputs are a
     /// name and a random token.
     public struct Advertisement: Equatable {
-        /// Human-facing device name, e.g. "Rishi's iPhone". Truncated to
+        /// Human-facing device name, e.g. "Alex's iPhone". Truncated to
         /// ``maxNameBytes`` UTF-8 bytes at encode time.
         public let name: String
         /// The current rotating presence token.
