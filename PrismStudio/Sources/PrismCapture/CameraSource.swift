@@ -105,10 +105,20 @@ public final class CameraSource: NSObject, VideoSource {
     /// when the session was torn down — no longer matches the armed generation and
     /// is dropped, so it never posts into a retired (or successor) run.
     private let generation = GenerationGate()
-    /// The generation the CURRENTLY-running session belongs to (read on
-    /// `captureQueue`, written on the control thread). Equal to the live generation
-    /// only while a session is running; a `stop()` bumps the live one past it.
+    /// The generation the CURRENTLY-running session belongs to (written on the
+    /// control thread at `start()`). sol #16: the delegate no longer READS this
+    /// shared value on the capture queue — a stop→restart re-stamps it with the
+    /// SUCCESSOR's generation, so an old frame still queued behind a slow callback
+    /// would read the NEW token and pass (old-frame flash). Instead each run gets a
+    /// fresh delegate proxy carrying an IMMUTABLE captured token (`CameraRunToken`),
+    /// so a frame is validated against the generation it was CAPTURED under. This
+    /// field is retained only as a diagnostic / the current run's identity.
     private let sessionGeneration = OSAllocatedUnfairLock<UInt64>(initialState: 0)
+    /// The per-run frame delegate (sol #16). Held strongly so it outlives the
+    /// capture queue's in-flight callbacks; replaced by a fresh proxy on every
+    /// `start()` so the previous run's proxy (and its retired token) drops any
+    /// straggler frame instead of stamping it with the successor's generation.
+    private var frameDelegate: CameraFrameDelegate?
     private var runtimeErrorObserver: NSObjectProtocol?
     private var selectedFormatIndex: Int?
     private var selectedFrameRate: Double?
@@ -270,7 +280,24 @@ public final class CameraSource: NSObject, VideoSource {
         }
         // Arm a fresh generation for THIS session before frames can flow, so the
         // delegate accepts only frames from the run it belongs to.
-        sessionGeneration.withLock { $0 = generation.bump() }
+        let runGeneration = generation.bump()
+        sessionGeneration.withLock { $0 = runGeneration }
+
+        // sol #16: synchronously drain the delegate queue BEFORE rearming, so a
+        // straggler frame from a just-stopped run (queued behind a slow callback)
+        // has completed — validated against the OLD, now-retired proxy token — and
+        // cannot route to the fresh proxy and read the successor's generation.
+        captureQueue.sync {}
+
+        // Install a fresh proxy carrying THIS run's IMMUTABLE token. The delegate
+        // validates every frame against the generation captured here, never a shared
+        // mutable value a later run can re-stamp.
+        let delegate = CameraFrameDelegate(
+            token: CameraRunToken(generation: runGeneration, gate: generation),
+            owner: self)
+        output.setSampleBufferDelegate(delegate, queue: captureQueue)
+        frameDelegate = delegate
+
         session.startRunning()
         state = .running
         log.info("camera running: \(self.device.localizedName, privacy: .private)")
@@ -343,7 +370,9 @@ public final class CameraSource: NSObject, VideoSource {
             kCVPixelBufferMetalCompatibilityKey as String: true,
         ]
         output.alwaysDiscardsLateVideoFrames = true
-        output.setSampleBufferDelegate(self, queue: captureQueue)
+        // sol #16: the sample-buffer delegate is installed per-run in `start()` (a
+        // fresh `CameraFrameDelegate` with an immutable token), NOT here — so a
+        // restart never routes an old frame through a shared, re-stamped generation.
 
         guard session.canAddOutput(output) else {
             throw CaptureError.cannotAddOutput(device: device.localizedName)
@@ -364,22 +393,52 @@ public final class CameraSource: NSObject, VideoSource {
     }
 }
 
-// MARK: - AVCaptureVideoDataOutputSampleBufferDelegate
+// MARK: - Per-run frame delegate + immutable token (sol #16)
 
-extension CameraSource: AVCaptureVideoDataOutputSampleBufferDelegate {
-    public func captureOutput(
+/// An IMMUTABLE per-run capture token. It pairs the generation the session was
+/// armed with at the instant its delegate proxy was installed with the shared
+/// `GenerationGate`, and reports whether that captured run is still live. Because
+/// the generation is captured ONCE (never re-read from a mutable field), a frame
+/// is always validated against the generation it was CAPTURED under — so a
+/// stop→restart cannot re-stamp an old queued frame with the successor's token.
+struct CameraRunToken {
+    let generation: UInt64
+    let gate: GenerationGate
+    /// Whether the run this token was captured for is still the live one.
+    var isCurrent: Bool { gate.isCurrent(generation) }
+}
+
+/// The sample-buffer delegate for exactly ONE capture run. A fresh instance is
+/// installed on every `start()` carrying that run's immutable `CameraRunToken`, so
+/// a straggler frame from a retired run is dropped by its OWN (old) proxy's token
+/// rather than reading a shared value a later run has advanced.
+final class CameraFrameDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+    let token: CameraRunToken
+    private weak var owner: CameraSource?
+
+    init(token: CameraRunToken, owner: CameraSource) {
+        self.token = token
+        self.owner = owner
+        super.init()
+    }
+
+    func captureOutput(
         _ output: AVCaptureOutput,
         didOutput sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection
     ) {
-        // Generation gate: drop a frame that crossed a stop/restart boundary. The
-        // frame's session generation was armed at `start()`; if `stop()` has since
-        // retired it (or a later run re-armed a newer one) the captured value no
-        // longer matches the live generation, so this stale frame is dropped
-        // instead of posting into a retired/successor run.
-        let armed = sessionGeneration.withLock { $0 }
-        guard generation.isCurrent(armed) else { return }
+        // sol #16: validate against THIS run's immutable captured token. If `stop()`
+        // (or a later run) has retired it, the stale frame is dropped instead of
+        // posting into a retired / successor run.
+        guard token.isCurrent else { return }
+        owner?.handleCapturedFrame(sampleBuffer)
+    }
+}
 
+extension CameraSource {
+    /// Deliver one validated frame (the generation check already passed on the
+    /// per-run proxy). Fileprivate so only the proxy calls it.
+    fileprivate func handleCapturedFrame(_ sampleBuffer: CMSampleBuffer) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
         // Zero-copy invariant (§3.5): only IOSurface-backed buffers enter the graph.

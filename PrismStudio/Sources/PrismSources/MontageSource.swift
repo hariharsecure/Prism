@@ -276,6 +276,19 @@ public final class MontageSource: VideoSource, @unchecked Sendable {
 
     // MARK: Lifecycle
 
+    /// sol #8: validate that the reel can BEGIN (its first item loads) WITHOUT
+    /// launching the director timer or wiring callbacks — so a transactional
+    /// reconfigure can confirm the replacement is good BEFORE retiring the
+    /// predecessor, yet not feed the shared effect pipeline / mixer channel until the
+    /// predecessor has drained. Mirrors the fail-fast `startLocked()` performs on the
+    /// FIRST slot; the probe slot is torn down immediately (nothing keeps running).
+    public func validateStartable() throws {
+        let firstSlot = makeSlot(ordinal: 0)
+        do { try firstSlot.load() }
+        catch { firstSlot.stop(); throw error }
+        firstSlot.stop()
+    }
+
     public func start() throws {
         try lifecycleQueue.sync { try startLocked() }
     }

@@ -1533,6 +1533,17 @@ final class AppEngine: ObservableObject {
     /// the replacement then fails and the predecessor is left stranded (stopped, no recovery) —
     /// reproducing the bug the transactional (build-validate-then-swap) fix eliminates.
     static var _test_reconfigStopPredecessorFirst = false
+    /// sol #8 ordering seam: when non-nil, a transactional movie/montage reconfigure appends
+    /// `"drainA"` when the predecessor has been retired + DRAINED and `"armB"` when the
+    /// successor has been armed (callbacks wired + started). The fix produces
+    /// `["drainA", "armB"]` — the predecessor's callbacks are quiesced BEFORE the successor
+    /// feeds the shared one-thread effect pipeline / one-caller mixer channel.
+    static var _test_reconfigOrderLog: [String]?
+    /// NEGATIVE CONTROL (sol #8): when true, a reconfigure ARMS the successor (starts its
+    /// decoder loops feeding the shared pipeline/channel) BEFORE draining the predecessor —
+    /// reproducing the concurrent-feed race the split-then-swap fix eliminates
+    /// (order log becomes `["armB", "drainA"]`).
+    static var _test_reconfigArmBeforeDrain = false
     /// sol #10 #2/#3 test hook: fired INSIDE every gated screen delivery body, UNDER the gate
     /// lock (between the concurrency `enter` and `exit`). A forced-overlap probe pins one
     /// generation's body here (holding its gate lock) while it drives the other generation, to
@@ -3345,24 +3356,56 @@ final class AppEngine: ObservableObject {
                 let source = try MovieSource(id: id, fileURL: entry.fileURL,
                                              canvasSize: sourceCanvas,
                                              contentMode: .aspectFit, loop: loop)
-                let pipeline = self.effectPipelines[id]
-                source.onFrame = { [mailbox, monitor = self.linkDebugMonitor, pipeline, isoTap = self.isoTap, verticalTap = self.verticalTap, directorTap = self.directorTap, sid = id] frame in
-                    Self.deliverSourceFrame(frame, pipeline: pipeline, monitor: monitor,
-                                            isoTap: isoTap, verticalTap: verticalTap,
-                                            directorTap: directorTap, sid: sid, mailbox: mailbox)
-                }
-                // Reuse the existing mixer channel (same id) if the clip has audio.
-                if source.hasAudioTrack, let channel = self.audioMixer.channel(id: id) {
-                    source.onAudio = { [multitrackTap = self.multitrackTap] packet in
-                        channel.ingest(packet)
-                        multitrackTap.append(packet)
-                    }
-                }
-                try source.start()   // validates the replacement (a bad file throws HERE)
+                // sol #8: CONSTRUCT + VALIDATE only — no callbacks wired, no decoder
+                // loops, no ingest into the shared effect pipeline / mixer channel yet.
+                // The successor is ARMED at commit, AFTER the predecessor has drained,
+                // so two generations never feed the one-thread pipeline / one-caller
+                // channel at once. A bad file still throws HERE (predecessor untouched).
+                try source.validateStartable()
                 return source
             },
             commit: { source in
-                if !stopFirst { entry.source.stop() }   // old decoder's closures go quiet — only now
+                // sol #8: arm the successor = wire its shared-pipeline / shared-channel
+                // callbacks (deferred until now) + start its decoder loops.
+                let armB: () -> Void = {
+                    let pipeline = self.effectPipelines[id]
+                    source.onFrame = { [mailbox, monitor = self.linkDebugMonitor, pipeline, isoTap = self.isoTap, verticalTap = self.verticalTap, directorTap = self.directorTap, sid = id] frame in
+                        Self.deliverSourceFrame(frame, pipeline: pipeline, monitor: monitor,
+                                                isoTap: isoTap, verticalTap: verticalTap,
+                                                directorTap: directorTap, sid: sid, mailbox: mailbox)
+                    }
+                    if source.hasAudioTrack, let channel = self.audioMixer.channel(id: id) {
+                        source.onAudio = { [multitrackTap = self.multitrackTap] packet in
+                            channel.ingest(packet)
+                            multitrackTap.append(packet)
+                        }
+                    }
+                    // Validated in `prepare`, so this start is deterministic-success; a
+                    // defensive failure only surfaces `lastError` (predecessor already retired).
+                    do { try source.start() }
+                    catch { self.lastError = "Couldn't start updated video for \(descriptor.name): \(error.localizedDescription)" }
+                    #if DEBUG
+                    Self._test_reconfigOrderLog?.append("armB")
+                    #endif
+                }
+                let drainA: () -> Void = {
+                    entry.source.stop()   // retire + synchronously DRAIN the predecessor's callbacks
+                    #if DEBUG
+                    Self._test_reconfigOrderLog?.append("drainA")
+                    #endif
+                }
+                #if DEBUG
+                if Self._test_reconfigArmBeforeDrain {
+                    armB()                       // NEGATIVE CONTROL: concurrent feed (pre-fix)
+                    if !stopFirst { drainA() }
+                } else {
+                    if !stopFirst { drainA() }   // retire + DRAIN predecessor FIRST
+                    armB()                       // THEN arm the successor
+                }
+                #else
+                if !stopFirst { drainA() }   // retire + DRAIN predecessor FIRST
+                armB()                       // THEN arm the successor
+                #endif
                 self.movieSources[id] = MovieEntry(source: source, fileURL: entry.fileURL,
                                                    loop: loop, scoped: entry.scoped)
                 self.activeSources[index] = ActiveSource(id: id, descriptor: descriptor,
@@ -3618,26 +3661,54 @@ final class AppEngine: ObservableObject {
                                                interval: entry.interval, transition: entry.transition,
                                                kenBurns: entry.kenBurns, shuffle: entry.shuffle,
                                                loop: entry.loop)
-                let pipeline = self.effectPipelines[id]
-                source.onFrame = { [mailbox, monitor = self.linkDebugMonitor, pipeline, isoTap = self.isoTap, verticalTap = self.verticalTap, directorTap = self.directorTap, sid = id] frame in
-                    Self.deliverSourceFrame(frame, pipeline: pipeline, monitor: monitor,
-                                            isoTap: isoTap, verticalTap: verticalTap,
-                                            directorTap: directorTap, sid: sid, mailbox: mailbox)
-                }
-                // Reuse the existing mixer channel (same id) if the reel has audio — the
-                // item set is unchanged by a reconfigure, so hasAudioContent is stable
-                // (mirrors setMovieLoop's audio re-wire on an in-place rebuild).
-                if source.hasAudioContent, let channel = self.audioMixer.channel(id: id) {
-                    source.onAudio = { [multitrackTap = self.multitrackTap] packet in
-                        channel.ingest(packet)
-                        multitrackTap.append(packet)
-                    }
-                }
-                try source.start()   // validates the replacement (bad first item throws HERE)
+                // sol #8: CONSTRUCT + VALIDATE only — no callbacks wired, no director
+                // timer, no ingest into the shared effect pipeline / mixer channel yet.
+                // The successor is ARMED at commit, AFTER the predecessor has drained,
+                // so two generations never feed the one-thread pipeline / one-caller
+                // channel at once. A bad first item still throws HERE (predecessor untouched).
+                try source.validateStartable()
                 return source
             },
             commit: { source in
-                if !stopFirst { old.stop() }   // retire the predecessor ONLY once the replacement is good
+                // sol #8: arm the successor = wire its shared-pipeline / shared-channel
+                // callbacks (deferred until now) + start its director loop.
+                let armB: () -> Void = {
+                    let pipeline = self.effectPipelines[id]
+                    source.onFrame = { [mailbox, monitor = self.linkDebugMonitor, pipeline, isoTap = self.isoTap, verticalTap = self.verticalTap, directorTap = self.directorTap, sid = id] frame in
+                        Self.deliverSourceFrame(frame, pipeline: pipeline, monitor: monitor,
+                                                isoTap: isoTap, verticalTap: verticalTap,
+                                                directorTap: directorTap, sid: sid, mailbox: mailbox)
+                    }
+                    if source.hasAudioContent, let channel = self.audioMixer.channel(id: id) {
+                        source.onAudio = { [multitrackTap = self.multitrackTap] packet in
+                            channel.ingest(packet)
+                            multitrackTap.append(packet)
+                        }
+                    }
+                    do { try source.start() }
+                    catch { self.lastError = "Couldn't start updated montage: \(error.localizedDescription)" }
+                    #if DEBUG
+                    Self._test_reconfigOrderLog?.append("armB")
+                    #endif
+                }
+                let drainA: () -> Void = {
+                    old.stop()   // retire + synchronously DRAIN the predecessor's callbacks
+                    #if DEBUG
+                    Self._test_reconfigOrderLog?.append("drainA")
+                    #endif
+                }
+                #if DEBUG
+                if Self._test_reconfigArmBeforeDrain {
+                    armB()                       // NEGATIVE CONTROL: concurrent feed (pre-fix)
+                    if !stopFirst { drainA() }
+                } else {
+                    if !stopFirst { drainA() }   // retire + DRAIN predecessor FIRST
+                    armB()                       // THEN arm the successor
+                }
+                #else
+                if !stopFirst { drainA() }   // retire + DRAIN predecessor FIRST
+                armB()                       // THEN arm the successor
+                #endif
                 self.montageSources[id] = entry
                 self.activeSources[index] = ActiveSource(id: id, descriptor: descriptor,
                                                          backing: .generated(source), mailbox: mailbox)

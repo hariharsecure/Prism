@@ -115,6 +115,57 @@ final class TransactionalMontageReconfigTests: XCTestCase {
         XCTAssertTrue(neg.error, "the failure must surface lastError in the pre-fix path too")
     }
 
+    // MARK: sol #8 — ordering: drain predecessor BEFORE arming successor
+
+    /// Set up an engine with one running montage and return it plus the source id.
+    private func makeRunningMontage() async throws -> (AppEngine, SourceID) {
+        guard MTLCreateSystemDefaultDevice() != nil else { throw XCTSkip("no Metal device") }
+        let png = try writePNG()
+        addTeardownBlock { try? FileManager.default.removeItem(at: png) }
+        let engine = AppEngine()
+        guard engine.renderLoop != nil else { await engine.shutdown(); throw XCTSkip("no render loop") }
+        engine.addMontageSource(fileURLs: [png], interval: 1.0)
+        try await pollUntil(2.0) { !engine.integrationDebugMontageSourceIDs.isEmpty }
+        let id = try XCTUnwrap(engine.integrationDebugMontageSourceIDs.first)
+        try await pollUntil(2.0) { engine.integrationDebugGeneratedBacking(for: id)?.state == .running }
+        return (engine, id)
+    }
+
+    /// FIX: the transactional reconfigure fully retires + DRAINS the predecessor
+    /// (its callbacks quiesce) BEFORE the successor is armed into the shared
+    /// one-thread effect pipeline / one-caller mixer channel — so the two
+    /// generations never feed those non-thread-safe resources concurrently.
+    func testReconfigureDrainsPredecessorBeforeArmingSuccessor() async throws {
+        let (engine, id) = try await makeRunningMontage()
+        AppEngine._test_reconfigOrderLog = []
+        defer { AppEngine._test_reconfigOrderLog = nil }
+
+        engine.reconfigureMontage(for: id, interval: 3.5)
+
+        XCTAssertEqual(AppEngine._test_reconfigOrderLog, ["drainA", "armB"],
+                       "sol #8: the predecessor must be drained BEFORE the successor is armed")
+        await engine.shutdown()
+    }
+
+    /// NEGATIVE CONTROL: the pre-fix ordering ARMS the successor (starts its loops
+    /// feeding the shared pipeline/channel) BEFORE draining the predecessor — the
+    /// concurrent-feed race. Proves the ordering assertion is not vacuous.
+    func testPreFixArmsSuccessorBeforeDraining() async throws {
+        let (engine, id) = try await makeRunningMontage()
+        AppEngine._test_reconfigOrderLog = []
+        AppEngine._test_reconfigArmBeforeDrain = true
+        defer {
+            AppEngine._test_reconfigOrderLog = nil
+            AppEngine._test_reconfigArmBeforeDrain = false
+        }
+
+        engine.reconfigureMontage(for: id, interval: 3.5)
+
+        XCTAssertEqual(AppEngine._test_reconfigOrderLog, ["armB", "drainA"],
+                       "negative control vacuous: the pre-fix path did not arm the successor before draining")
+        await engine.shutdown()
+    }
+
     /// POSITIVE CONTROL: a valid reconfigure still swaps the source correctly.
     func testValidReconfigSwapsSource() async throws {
         guard MTLCreateSystemDefaultDevice() != nil else { throw XCTSkip("no Metal device") }

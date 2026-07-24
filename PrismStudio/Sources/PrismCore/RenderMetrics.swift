@@ -82,6 +82,44 @@ public final class RenderMetrics: @unchecked Sendable {
 
     private let lock = OSAllocatedUnfairLock<Storage>(initialState: Storage())
 
+    // MARK: Reader-side scratch (sol #19)
+
+    /// Preallocated per-ring copy buffers, sized to each ring's capacity so
+    /// `snapshot()` copies windows out under the hot-path lock WITHOUT allocating,
+    /// then sorts them here — off that lock. Guarded by its OWN lock so concurrent
+    /// readers serialize among themselves and NEVER on the hot-path `lock`. The
+    /// bank order is fixed: [frameWork, deadlineSlack, cpu×N, gpu×N, queueItems,
+    /// queueBytes, queueAgeUs] (N = Subsystem.allCases.count).
+    private struct ReaderScratch {
+        var banks: [[Int64]]
+        init() {
+            let n = Subsystem.allCases.count
+            var b: [[Int64]] = [
+                [Int64](repeating: 0, count: 1024),   // frameWork
+                [Int64](repeating: 0, count: 1024),   // deadlineSlack
+            ]
+            b.append(contentsOf: (0..<n).map { _ in [Int64](repeating: 0, count: 512) }) // cpu
+            b.append(contentsOf: (0..<n).map { _ in [Int64](repeating: 0, count: 512) }) // gpu
+            b.append([Int64](repeating: 0, count: 512))   // queueItems
+            b.append([Int64](repeating: 0, count: 512))   // queueBytes
+            b.append([Int64](repeating: 0, count: 512))   // queueAgeUs
+            banks = b
+        }
+    }
+    private let readerScratch = OSAllocatedUnfairLock<ReaderScratch>(initialState: ReaderScratch())
+
+    #if DEBUG
+    /// Repro seam (sol #19): reproduce the PRE-FIX behaviour — allocate + sort every
+    /// window UNDER the hot-path lock (the original inline `snapshot()`), so a test
+    /// can prove a concurrent `record*` is blocked for the whole sort. Default off.
+    public var _test_sortUnderHotLock = false
+    /// Repro seam (sol #19): invoked once during `snapshot()`'s percentile (sort)
+    /// phase — with the hot-path lock RELEASED in the fixed path, HELD in the
+    /// `_test_sortUnderHotLock` pre-fix path. A test uses it to prove a concurrent
+    /// `record*` proceeds (fixed) / blocks (pre-fix) while percentiles are computed.
+    public var _test_duringSortHook: (() -> Void)?
+    #endif
+
     public init() {}
 
     // MARK: Hot-path recording (called on render / capture threads)
@@ -200,25 +238,100 @@ public final class RenderMetrics: @unchecked Sendable {
         public var totalDropped: UInt64 { droppedByReason.reduce(0, +) }
     }
 
-    /// Compute a consistent snapshot. Copies each window and sorts it — O(n log n)
-    /// paid by the reader, never by the render thread.
+    /// Compute a consistent snapshot. sol #19: the render/capture hot path only ever
+    /// blocks for PHASE 1 — an O(n) copy of each window's samples out under a SHORT
+    /// hold of the hot-path lock. The O(n log n) percentile sorts (PHASE 2) run OFF
+    /// that lock, so a `record*` on the render thread is never serialized behind up
+    /// to 13 windows' worth of sorting during a GetStats request. The numbers are
+    /// byte-for-byte identical to the old sort-under-the-lock path.
     public func snapshot() -> Snapshot {
-        lock.withLock { s in
-            Snapshot(
-                frameWork: s.frameWork.percentiles(),
-                deadlineSlack: s.deadlineSlack.percentiles(),
-                cpu: s.cpu.map { $0.percentiles() },
-                gpu: s.gpu.map { $0.percentiles() },
-                queueItems: s.queueItems.percentiles(),
-                queueBytes: s.queueBytes.percentiles(),
-                queueAgeUs: s.queueAgeUs.percentiles(),   // unit = microseconds; caller uses raw/1000
-                deliveredByMedia: s.deliveredByMedia,
-                droppedByMedia: s.droppedByMedia,
-                droppedByReason: s.droppedByReason,
-                physFootprintMB: Double(s.physFootprintBytes) / 1_048_576,
-                metalAllocatedMB: Double(s.metalAllocatedBytes) / 1_048_576,
-                cpuPercent: s.cpuPercent)
+        #if DEBUG
+        if _test_sortUnderHotLock {
+            // NEGATIVE CONTROL: the exact pre-fix path — allocate + sort every window
+            // while holding the hot-path lock (`percentiles()` does both), with the
+            // sort-phase hook fired UNDER the lock so a concurrent record* blocks.
+            return lock.withLock { s in
+                _test_duringSortHook?()
+                return Snapshot(
+                    frameWork: s.frameWork.percentiles(),
+                    deadlineSlack: s.deadlineSlack.percentiles(),
+                    cpu: s.cpu.map { $0.percentiles() },
+                    gpu: s.gpu.map { $0.percentiles() },
+                    queueItems: s.queueItems.percentiles(),
+                    queueBytes: s.queueBytes.percentiles(),
+                    queueAgeUs: s.queueAgeUs.percentiles(),
+                    deliveredByMedia: s.deliveredByMedia,
+                    droppedByMedia: s.droppedByMedia,
+                    droppedByReason: s.droppedByReason,
+                    physFootprintMB: Double(s.physFootprintBytes) / 1_048_576,
+                    metalAllocatedMB: Double(s.metalAllocatedBytes) / 1_048_576,
+                    cpuPercent: s.cpuPercent)
+            }
         }
+        #endif
+        return readerScratch.withLock { scratch -> Snapshot in
+            let n = Subsystem.allCases.count
+            var meta = [(count: Int, sum: Int64)](repeating: (0, 0), count: scratch.banks.count)
+
+            // PHASE 1 — SHORT hot-path lock: copy windows + snapshot counters. No sort.
+            let flat: FlatCounters = lock.withLock { s in
+                meta[0] = s.frameWork.copyWindow(into: &scratch.banks[0])
+                meta[1] = s.deadlineSlack.copyWindow(into: &scratch.banks[1])
+                var idx = 2
+                for i in 0..<n { meta[idx] = s.cpu[i].copyWindow(into: &scratch.banks[idx]); idx += 1 }
+                for i in 0..<n { meta[idx] = s.gpu[i].copyWindow(into: &scratch.banks[idx]); idx += 1 }
+                let itemsIdx = idx, bytesIdx = idx + 1, ageIdx = idx + 2
+                meta[itemsIdx] = s.queueItems.copyWindow(into: &scratch.banks[itemsIdx])
+                meta[bytesIdx] = s.queueBytes.copyWindow(into: &scratch.banks[bytesIdx])
+                meta[ageIdx] = s.queueAgeUs.copyWindow(into: &scratch.banks[ageIdx])
+                return FlatCounters(
+                    deliveredByMedia: s.deliveredByMedia,
+                    droppedByMedia: s.droppedByMedia,
+                    droppedByReason: s.droppedByReason,
+                    physFootprintBytes: s.physFootprintBytes,
+                    metalAllocatedBytes: s.metalAllocatedBytes,
+                    cpuPercent: s.cpuPercent)
+            }
+
+            #if DEBUG
+            _test_duringSortHook?()   // hot-path lock released → a concurrent record* proceeds
+            #endif
+
+            // PHASE 2 — OFF the hot-path lock: sort each copied window + reduce. Plain
+            // loops (no nested closures over the inout `scratch`) so bank order stays
+            // aligned with PHASE 1.
+            var out = [Percentiles](repeating: .zero, count: scratch.banks.count)
+            for i in 0..<scratch.banks.count {
+                out[i] = PercentileRing.percentiles(sorting: &scratch.banks[i],
+                                                    count: meta[i].count, sum: meta[i].sum)
+            }
+            let itemsIdx = 2 + 2 * n, bytesIdx = 2 + 2 * n + 1, ageIdx = 2 + 2 * n + 2
+            return Snapshot(
+                frameWork: out[0],
+                deadlineSlack: out[1],
+                cpu: Array(out[2 ..< (2 + n)]),
+                gpu: Array(out[(2 + n) ..< (2 + 2 * n)]),
+                queueItems: out[itemsIdx],
+                queueBytes: out[bytesIdx],
+                queueAgeUs: out[ageIdx],   // unit = microseconds; caller uses raw/1000
+                deliveredByMedia: flat.deliveredByMedia,
+                droppedByMedia: flat.droppedByMedia,
+                droppedByReason: flat.droppedByReason,
+                physFootprintMB: Double(flat.physFootprintBytes) / 1_048_576,
+                metalAllocatedMB: Double(flat.metalAllocatedBytes) / 1_048_576,
+                cpuPercent: flat.cpuPercent)
+        }
+    }
+
+    /// The non-distribution counters copied out under the hot-path lock alongside
+    /// the sample windows (sol #19 PHASE 1).
+    private struct FlatCounters {
+        var deliveredByMedia: [UInt64]
+        var droppedByMedia: [UInt64]
+        var droppedByReason: [UInt64]
+        var physFootprintBytes: UInt64
+        var metalAllocatedBytes: UInt64
+        var cpuPercent: Double
     }
 }
 
@@ -261,13 +374,52 @@ public struct PercentileRing: Sendable {
     }
 
     /// Nearest-rank percentile of the resident window. `p` in [0, 100].
-    /// Exact for the window (no bucket approximation).
+    /// Exact for the window (no bucket approximation). Allocates + sorts a private
+    /// scratch — used by unit tests and any caller that isn't on the hot-path lock.
+    /// The reader-side `RenderMetrics.snapshot()` instead uses the two-phase
+    /// `copyWindow` / `percentiles(sorting:)` split so the sort never runs under the
+    /// hot-path lock (sol #19).
     public func percentiles() -> RenderMetrics.Percentiles {
         guard count > 0 else { return .zero }
         // Valid samples always occupy indices 0..<count: the head only wraps
         // after the window has filled, at which point count == capacity.
         var scratch = Array(storage[0..<count])
-        scratch.sort()
+        return Self.percentiles(sorting: &scratch, count: count, sum: residentSum)
+    }
+
+    /// sol #19 — PHASE 1 (runs under the hot-path lock): copy the resident window's
+    /// samples into `scratch` and hand back the counters needed to finish the
+    /// percentiles LATER, off the lock. Only an O(n) memcpy — no sort, no
+    /// allocation once `scratch` is preallocated to the ring's capacity (the reader
+    /// preallocates it), so a concurrent hot-path `record` waits at most for the
+    /// copy, never for the O(n log n) sort.
+    @inline(__always)
+    func copyWindow(into scratch: inout [Int64]) -> (count: Int, sum: Int64) {
+        if scratch.count < count {
+            scratch = [Int64](repeating: 0, count: Swift.max(count, storage.count))
+        }
+        if count > 0 {
+            storage.withUnsafeBufferPointer { src in
+                scratch.withUnsafeMutableBufferPointer { dst in
+                    dst.baseAddress!.update(from: src.baseAddress!, count: count)
+                }
+            }
+        }
+        return (count, residentSum)
+    }
+
+    /// sol #19 — PHASE 2 (runs OFF the hot-path lock): sort the copied window IN
+    /// PLACE and reduce it to percentiles. Identical math to `percentiles()`, just
+    /// separated so the sort is paid outside any lock the render/capture threads
+    /// contend on.
+    static func percentiles(sorting scratch: inout [Int64], count: Int, sum: Int64)
+        -> RenderMetrics.Percentiles {
+        guard count > 0 else { return .zero }
+        scratch[0..<count].sort()
+        func rank(_ p: Int) -> Int {
+            let r = Int((Double(p) / 100.0 * Double(count)).rounded(.up)) - 1
+            return Swift.min(count - 1, Swift.max(0, r))
+        }
         return RenderMetrics.Percentiles(
             count: count,
             min: scratch[0],
@@ -275,13 +427,7 @@ public struct PercentileRing: Sendable {
             p95: scratch[rank(95)],
             p99: scratch[rank(99)],
             max: scratch[count - 1],
-            mean: Double(residentSum) / Double(count))
-    }
-
-    /// Nearest-rank index into the sorted window for percentile `p`.
-    private func rank(_ p: Int) -> Int {
-        let r = Int((Double(p) / 100.0 * Double(count)).rounded(.up)) - 1
-        return Swift.min(count - 1, Swift.max(0, r))
+            mean: Double(sum) / Double(count))
     }
 }
 

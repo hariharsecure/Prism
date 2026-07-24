@@ -265,6 +265,16 @@ public final class MovieSource: VideoSource, AudioSource, @unchecked Sendable {
 
     // MARK: Lifecycle (atomic — M3 nested-stop safe, M6 concurrent-safe)
 
+    /// sol #8: validate that decoding can BEGIN (a video reader is creatable) WITHOUT
+    /// launching the delivery loops or wiring callbacks — so a transactional
+    /// reconfigure can confirm the replacement is good BEFORE retiring the
+    /// predecessor, yet not feed the shared effect pipeline / mixer channel until the
+    /// predecessor has drained. Mirrors the fail-fast `start()` performs; a reader
+    /// built here is discarded (nothing is started).
+    public func validateStartable() throws {
+        _ = try makeVideoReader()
+    }
+
     public func start() throws {
         let onVideoQueue = DispatchQueue.getSpecific(key: videoQueueKey) != nil
         let onAudioQueue = DispatchQueue.getSpecific(key: audioQueueKey) != nil

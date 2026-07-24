@@ -118,13 +118,30 @@ public final class ScreenSource: NSObject, VideoSource, AudioSource, @unchecked 
     /// The generation the CURRENTLY-running stream belongs to (read on the sample
     /// queues, written when a start commits to `.running`).
     private let runningGeneration = OSAllocatedUnfairLock<UInt64>(initialState: 0)
-    /// The background task spawned by the most recent `stop()` to tear the
-    /// SCStream down. Stored so a caller (app shutdown) can AWAIT the async
-    /// `stopCapture()` via `awaitTeardown()` — a bounded external-output barrier
-    /// (2c) — instead of racing process exit against a still-open capture stream.
-    private let stopTaskLock = OSAllocatedUnfairLock<Task<Void, Never>?>(initialState: nil)
+    /// sol #6 — ONE lifecycle box serializing the published stream, the in-flight
+    /// START task, and the teardown (stop) task under a single lock. Folding these
+    /// together closes the start-after-shutdown / erase-successor races:
+    ///  - the published stream is tagged with the generation it belongs to, so a
+    ///    retiring start / a stop teardown clears it ONLY when it is that run's
+    ///    stream (never a fast successor's), and
+    ///  - a teardown AWAITS the in-flight start task (not just a stop task), so a
+    ///    start that is mid-`startCapture()` past the shutdown barrier is joined
+    ///    instead of leaking a live capture past process exit.
+    private struct LifecycleBoxes {
+        /// The currently-published SCStream (nil until a start publishes, cleared on
+        /// teardown / a retired start's self-cleanup).
+        var stream: SCStream?
+        /// The generation `stream` was published under — the identity a retiring
+        /// path matches on so it never clears a successor's stream.
+        var streamGeneration: UInt64 = 0
+        /// The most recent in-flight START task (awaited by a teardown so the barrier
+        /// joins a start mid-`startCapture()`).
+        var startTask: Task<Void, Never>?
+        /// The most recent teardown task (awaited by `awaitTeardown()`).
+        var stopTask: Task<Void, Never>?
+    }
+    private let lifecycle = OSAllocatedUnfairLock<LifecycleBoxes>(initialState: LifecycleBoxes())
     private let target: ScreenTarget
-    private var stream: SCStream?
     private let videoQueue = DispatchQueue(label: "studio.prism.screen.video")
     private let audioQueue = DispatchQueue(label: "studio.prism.screen.audio")
     private let log = EngineLog.logger("screen")
@@ -176,14 +193,20 @@ public final class ScreenSource: NSObject, VideoSource, AudioSource, @unchecked 
 
         // Arm a fresh generation for THIS start and hand it to the async task so a
         // stop/restart that races the resolve retires this attempt (the successor
-        // owns a newer generation).
+        // owns a newer generation). Store the task under the lifecycle lock so a
+        // concurrent stop can AWAIT it (sol #6 — teardown joins an in-flight start).
         let gen = generation.bump()
-        Task { [weak self] in
+        let task = Task { [weak self] () -> Void in
             await self?.resolveAndStart(generation: gen)
         }
+        lifecycle.withLock { $0.startTask = task }
     }
 
-    /// Non-blocking. Stops the stream on a background task, then → `.idle`.
+    /// Non-blocking. Stops the stream on a background task, then → `.idle`. sol #6:
+    /// the teardown AWAITS the in-flight start task before tearing down, so a start
+    /// that is mid-`startCapture()` is joined (never left to install + start a
+    /// capture AFTER the shutdown barrier), and it stops the published stream ONLY
+    /// when that stream still belongs to a RETIRED run (never a fast successor's).
     public func stop() {
         let shouldStop = stateLock.withLock { state -> Bool in
             guard state == .starting || state == .running else { return false }
@@ -196,29 +219,51 @@ public final class ScreenSource: NSObject, VideoSource, AudioSource, @unchecked 
         // sample a torn-down stream still delivers now fail the generation check.
         generation.bump()
 
-        let stream = self.stream
-        self.stream = nil
+        let inFlightStart = lifecycle.withLock { $0.startTask }
         let task = Task { [weak self] in
+            // Join the in-flight start FIRST (sol #6 race (a)): a start past its early
+            // generation check must finish (and, being retired, unwind its own stream)
+            // before the barrier completes — never install a live capture afterwards.
+            await inFlightStart?.value
+            guard let self else { return }
+            // Take the published stream ONLY if it is a retired run's — a fast
+            // successor (a restart that already re-published) owns the live one.
+            let live = self.generation.current
+            let stream = self.lifecycle.withLock { boxes -> SCStream? in
+                guard let s = boxes.stream,
+                      Self.teardownMayStopPublishedStream(publishedGeneration: boxes.streamGeneration,
+                                                          live: live) else { return nil }
+                boxes.stream = nil
+                return s
+            }
             if let stream {
                 do { try await stream.stopCapture() }
-                catch { self?.log.debug("stopCapture: \(error.localizedDescription) (already stopped?)") }
+                catch { self.log.debug("stopCapture: \(error.localizedDescription) (already stopped?)") }
             }
-            self?.setState(.idle)
+            self.setState(.idle)
         }
-        stopTaskLock.withLock { $0 = task }
+        lifecycle.withLock { $0.stopTask = task }
     }
 
     /// Await the async SCStream teardown kicked off by the most recent `stop()`
-    /// (2c external-output barrier). Returns immediately when no stop is in
-    /// flight. Safe to call after `stop()` on any actor/thread.
+    /// (2c external-output barrier). Because the teardown task itself awaits the
+    /// in-flight START task, this transitively joins a start that is mid-
+    /// `startCapture()` (sol #6). Returns immediately when no stop is in flight.
+    /// Safe to call after `stop()` on any actor/thread.
     public func awaitTeardown() async {
-        let task = stopTaskLock.withLock { $0 }
+        let task = lifecycle.withLock { $0.stopTask }
         await task?.value
     }
 
     // MARK: - Async start path
 
     private func resolveAndStart(generation gen: UInt64) async {
+        // The stream THIS attempt published (nil until publication). A retiring path
+        // clears `lifecycle.stream` ONLY when it still holds this exact stream —
+        // matched on the generation it was published under — so a slow/retired start
+        // can never erase a successor's freshly-published stream (sol #6 race (b)).
+        var ourStream: SCStream?
+
         do {
             // Off-screen windows included so minimized/occluded windows stay capturable.
             let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false)
@@ -229,21 +274,46 @@ public final class ScreenSource: NSObject, VideoSource, AudioSource, @unchecked 
             // we were resolving. Gate on the generation, not the bare state: a
             // RESTART sets `.starting` again, so `state == .starting` would wrongly
             // let this retired task proceed and commit its stale stream.
-            guard generation.isCurrent(gen) else { return }
+            guard Self.startMayCommit(captured: gen, live: generation.current) else { return }
 
             let stream = SCStream(filter: filter, configuration: streamConfig, delegate: self)
+            ourStream = stream
             if configuration.videoEnabled {
                 try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: videoQueue)
             }
             if configuration.capturesAudio {
                 try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
             }
-            self.stream = stream
+
+            // Publish under the lifecycle lock, but ONLY if still current. A stop()
+            // that bumped the generation retires us here → do not publish; unwind.
+            let published = lifecycle.withLock { boxes -> Bool in
+                guard Self.startMayCommit(captured: gen, live: generation.current) else { return false }
+                boxes.stream = stream
+                boxes.streamGeneration = gen
+                return true
+            }
+            guard published else {
+                try? await stream.stopCapture()   // never went live; symmetric cleanup
+                return
+            }
+
             try await stream.startCapture()
 
-            guard generation.isCurrent(gen) else {
-                // stop()/restart raced startCapture; unwind this retired stream.
-                self.stream = nil
+            // Re-check after the async start. If retired mid-`startCapture()`, clear
+            // ONLY our own published stream and tear it down (never a successor's).
+            let stillCurrent = lifecycle.withLock { boxes -> Bool in
+                guard Self.startMayCommit(captured: gen, live: generation.current) else {
+                    if boxes.stream === stream,
+                       Self.mayClearPublishedStream(publishedGeneration: boxes.streamGeneration,
+                                                    retiringGeneration: gen) {
+                        boxes.stream = nil
+                    }
+                    return false
+                }
+                return true
+            }
+            guard stillCurrent else {
                 try? await stream.stopCapture()
                 return
             }
@@ -254,13 +324,50 @@ public final class ScreenSource: NSObject, VideoSource, AudioSource, @unchecked 
             log.info("running: \(self.descriptor.id) \(streamConfig.width)x\(streamConfig.height) @\(self.configuration.targetFPS)fps audio=\(self.configuration.capturesAudio)")
         } catch {
             // A retired attempt that failed must not clobber the live run's state or
-            // fire a stale onError into the successor.
-            guard generation.isCurrent(gen) else { return }
-            self.stream = nil
+            // fire a stale onError into the successor — but it must still unwind its
+            // OWN published stream.
+            clearStreamIfStillPublished(ourStream, retiringGeneration: gen)
+            guard Self.startMayCommit(captured: gen, live: generation.current) else { return }
             setState(.failed)
             log.error("start failed for \(self.descriptor.id): \(error.localizedDescription)")
             onError?(error)
         }
+    }
+
+    /// Clear `lifecycle.stream` ONLY when it still holds the exact stream `s` this
+    /// attempt published (matched on the retiring generation) — never a successor's.
+    private func clearStreamIfStillPublished(_ s: SCStream?, retiringGeneration gen: UInt64) {
+        guard let s else { return }
+        lifecycle.withLock { boxes in
+            if boxes.stream === s,
+               Self.mayClearPublishedStream(publishedGeneration: boxes.streamGeneration,
+                                            retiringGeneration: gen) {
+                boxes.stream = nil
+            }
+        }
+    }
+
+    // MARK: - Pure lifecycle decisions (sol #6 — unit-testable without ScreenCaptureKit)
+
+    /// A resumed/awaited start attempt may COMMIT (publish its stream, go running)
+    /// ONLY while its captured generation is still the live one; a retired attempt
+    /// (a stop/restart bumped past it) must drop.
+    static func startMayCommit(captured: UInt64, live: UInt64) -> Bool {
+        GenerationGate.accepts(live: live, captured: captured)
+    }
+
+    /// A retiring START (or its failure path) may clear the published stream ONLY
+    /// when that stream is the one THIS attempt published — never a successor's.
+    /// The generation the stream was published under is the identity (each
+    /// generation publishes at most one stream, so this matches object identity).
+    static func mayClearPublishedStream(publishedGeneration: UInt64, retiringGeneration: UInt64) -> Bool {
+        publishedGeneration == retiringGeneration
+    }
+
+    /// A stop TEARDOWN may stop the published stream ONLY when it belongs to a
+    /// RETIRED run (not a fast successor that already re-published the live one).
+    static func teardownMayStopPublishedStream(publishedGeneration: UInt64, live: UInt64) -> Bool {
+        !GenerationGate.accepts(live: live, captured: publishedGeneration)
     }
 
     private func makeFilter(content: SCShareableContent) throws -> SCContentFilter {
@@ -355,6 +462,28 @@ public final class ScreenSource: NSObject, VideoSource, AudioSource, @unchecked 
     #if DEBUG
     /// The live lifecycle generation (proves a stop→start advances it).
     public var _test_generation: UInt64 { generation.current }
+
+    /// sol #6 test seam (headless — no ScreenCaptureKit): inject a fake in-flight
+    /// START task so a test can prove a teardown/`awaitTeardown()` JOINS it before
+    /// completing (a start that is mid-`startCapture()` past the shutdown barrier).
+    public func _test_setInFlightStartTask(_ task: Task<Void, Never>) {
+        lifecycle.withLock { $0.startTask = task }
+    }
+
+    /// sol #6 test seam (headless): run the SAME teardown ordering as `stop()` — bump
+    /// the generation, capture the in-flight start task, then a stop task that AWAITS
+    /// it before finishing to `.idle` — WITHOUT touching a real SCStream. Lets a test
+    /// assert `awaitTeardown()` does not return until the injected start completes.
+    public func _test_beginTeardownAwaitingStart() {
+        stateLock.withLock { $0 = .stopping }
+        generation.bump()
+        let inFlightStart = lifecycle.withLock { $0.startTask }
+        let task = Task { [weak self] in
+            await inFlightStart?.value
+            self?.setState(.idle)
+        }
+        lifecycle.withLock { $0.stopTask = task }
+    }
     #endif
 }
 
@@ -366,7 +495,8 @@ extension ScreenSource: SCStreamOutput, SCStreamDelegate {
         // Drop a sample that crossed a stop/restart boundary: it must come from the
         // live stream AND the running generation, or it is a straggler from a
         // retired run posting into the successor.
-        guard stream === self.stream else { return }
+        let live = lifecycle.withLock { $0.stream }
+        guard stream === live else { return }
         let armed = runningGeneration.withLock { $0 }
         guard generation.isCurrent(armed) else { return }
         guard state == .running, CMSampleBufferIsValid(sampleBuffer) else { return }
@@ -384,11 +514,15 @@ extension ScreenSource: SCStreamOutput, SCStreamDelegate {
     /// disconnected) → `.failed` + `onError`.
     public func stream(_ stream: SCStream, didStopWithError error: Error) {
         // Only the live stream may fail the source: a retired stream's async stop
-        // error must not knock down the successor run.
-        guard stream === self.stream else { return }
+        // error must not knock down the successor run. Clear the published stream
+        // ONLY when it is this exact live stream AND its run is still current.
         let armed = runningGeneration.withLock { $0 }
-        guard generation.isCurrent(armed) else { return }
-        self.stream = nil
+        let cleared = lifecycle.withLock { boxes -> Bool in
+            guard boxes.stream === stream, generation.isCurrent(armed) else { return false }
+            boxes.stream = nil
+            return true
+        }
+        guard cleared else { return }
         setState(.failed)
         log.error("stream stopped: \(self.descriptor.id): \(error.localizedDescription)")
         onError?(error)
