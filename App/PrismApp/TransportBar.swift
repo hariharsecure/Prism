@@ -555,7 +555,12 @@ struct TransportBar: View {
             Button {
                 vcamPopoverShown.toggle()
             } label: {
+                // Enlarge the CLICKABLE area to a comfortable pointer target (macOS
+                // HIG) even though the info glyph stays small (Phase 4c AX audit —
+                // the bare icon was ~13×13). contentShape makes the whole frame hit.
                 Image(systemName: "info.circle")
+                    .frame(minWidth: 28, minHeight: 28)
+                    .contentShape(Rectangle())
             }
             .accessibilityIdentifier("transport.vcam.info")
             .accessibilityLabel("Virtual camera status")
@@ -717,7 +722,11 @@ struct TransportBar: View {
         Button {
             showHelp = true
         } label: {
+            // Comfortable pointer hit target even though the glyph stays small
+            // (Phase 4c AX audit — the bare icon was ~13×13).
             Image(systemName: "questionmark.circle")
+                .frame(minWidth: 28, minHeight: 28)
+                .contentShape(Rectangle())
         }
         .accessibilityIdentifier("transport.help.button")
         .accessibilityLabel("Getting Started help")

@@ -43,6 +43,9 @@ struct GeneratedSourceRow: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(Color.accentColor)
+                .accessibilityIdentifier("generated.text.edit")
+                .accessibilityLabel("Edit text")
+                .minHitTarget()
                 .help("Edit text")
                 .popover(isPresented: $editing, arrowEdge: .trailing) {
                     VStack(alignment: .leading, spacing: 10) {
@@ -70,6 +73,9 @@ struct GeneratedSourceRow: View {
             }
             .buttonStyle(.plain)
             .foregroundStyle(.red)
+            .accessibilityIdentifier("generated.source.remove")
+            .accessibilityLabel("Remove source")
+            .minHitTarget()
             .help("Remove source")
         }
     }

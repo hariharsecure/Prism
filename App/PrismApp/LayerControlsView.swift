@@ -75,6 +75,7 @@ struct LayerControlsView: View {
                 .accessibilityValue(layer.isHidden ? "Hidden" : "Visible")
                 .accessibilityHint(layer.isHidden ? "Show this layer." : "Hide this layer.")
                 .buttonStyle(.plain)
+                .minHitTarget()
                 .help(layer.isHidden ? "Show layer" : "Hide layer")
 
                 Text(engine.displayName(for: layer.sourceID))
@@ -95,6 +96,7 @@ struct LayerControlsView: View {
                 .accessibilityLabel("Bring forward")
                 .accessibilityHint("Move this layer one step toward the front.")
                 .buttonStyle(.plain)
+                .minHitTarget()
                 .help("Bring forward")
 
                 Button {
@@ -106,6 +108,7 @@ struct LayerControlsView: View {
                 .accessibilityLabel("Send backward")
                 .accessibilityHint("Move this layer one step toward the back.")
                 .buttonStyle(.plain)
+                .minHitTarget()
                 .help("Send backward")
             }
 
@@ -117,6 +120,7 @@ struct LayerControlsView: View {
                     .accessibilityIdentifier("layers.row.frame.\(preset.rawValue)")
                     .buttonStyle(.bordered)
                     .controlSize(.mini)
+                    .minHitHeight()
                     .help("Position & size this layer: \(preset.rawValue)")
                 }
 
@@ -143,6 +147,9 @@ struct LayerControlsView: View {
                 .menuStyle(.borderlessButton)
                 .fixedSize()
                 .controlSize(.mini)
+                // Enlarge the CLICKABLE area (contentShape) even though the borderless
+                // menu's own AXFrame stays at its ~18pt intrinsic height (Phase 4c).
+                .minHitTarget()
                 .help("Animate this layer in (slide / fade / scale / pop)")
             }
         }
@@ -202,7 +209,9 @@ struct TransitionControlsView: View {
                     .accessibilityIdentifier("transition.duration.slider")
                     .accessibilityLabel("Transition duration")
                     .accessibilityValue(String(format: "%.1f seconds", engine.transitionDuration))
+                    .controlSize(.large)
                     .frame(width: 120)
+                    .minHitHeight()
                     .disabled(!engine.transitionEnabled)
                 Text(String(format: "%.1fs", engine.transitionDuration))
                     .font(.caption.monospacedDigit())
@@ -239,6 +248,9 @@ struct TransitionControlsView: View {
             .accessibilityHint("Choose live media for cue-frame stinger scene switches, or None to use the effect picker.")
             .menuStyle(.borderlessButton)
             .fixedSize()
+            // Enlarge the CLICKABLE area (contentShape) even though the borderless
+            // menu's own AXFrame stays at its ~17pt intrinsic height (Phase 4c).
+            .minHitTarget()
             .help("Choose live media for cue-frame stinger scene switches; choose None to use the Effect picker")
 
             Spacer(minLength: 0)

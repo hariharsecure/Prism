@@ -102,6 +102,7 @@ struct SourcesSidebar: View {
                 .accessibilityHint("Share a display or app window. Prompts for Screen Recording permission.")
                 .buttonStyle(.plain)
                 .foregroundStyle(Color.accentColor)
+                .minHitHeight()
                 .help("Share a display or app window (prompts for Screen Recording permission)")
 
                 // Screen sources already on the canvas (removable here).
@@ -123,6 +124,7 @@ struct SourcesSidebar: View {
                     get: { engine.linkEnabled },
                     set: { engine.setLinkEnabled($0) }))
                     .accessibilityIdentifier("sources.link.toggle")
+                    .minHitHeight()
                     .help("Start the Prism Camera listener so iPhones can pair over Wi-Fi. Off by default.")
 
                 if engine.linkEnabled {
@@ -301,6 +303,7 @@ struct SourcesSidebar: View {
         .accessibilityHint("Remove this source from the scene.")
         .buttonStyle(.plain)
         .foregroundStyle(.red)
+        .minHitTarget()
         .help("Remove source")
     }
 }

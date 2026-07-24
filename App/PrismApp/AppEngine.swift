@@ -692,6 +692,10 @@ final class AppEngine: ObservableObject {
     /// The dynamic range the preview program currently composites in (nil if there
     /// is no preview program). Test-visible so HDR parity can be asserted.
     var previewProgramColorMode: MetalCompositor.ColorMode? { previewProgram?.colorMode }
+    /// The canvas dimensions the preview program currently composites at (nil if
+    /// there is no preview program). Test-visible so a canvas-resolution change can
+    /// assert the studio-preview compositor followed the primary to the new size.
+    var previewProgramSize: (width: Int, height: Int)? { previewProgram?.size }
     /// Preview program-frame consumer: an off-air preview store ONLY (no recorder,
     /// no vcam, no fan-out).
     private let previewSink = PreviewProgramSink()
@@ -7003,6 +7007,29 @@ extension AppEngine {
             lastError = "Couldn't rebuild the compositor at \(config.resolution.label)."
             return
         }
+        // Rebuild the studio PREVIEW program at the NEW canvas size in the CURRENT
+        // color mode, mirroring the HDR-rebuild path's parity: the preview compositor
+        // is a fixed-dimension raster built at construction, so a resolution change
+        // that rebuilds only the primary leaves the preview compositing at the OLD
+        // size (Phase 3a Stage 1 follow-up). Same fence discipline as setHDREnabled
+        // (`quiesce` the old, `resume` on the failure path). Built at the NEW program
+        // canvas size in `mode`; every failure path below restores `oldPreview`.
+        let oldPreview = previewProgram
+        let newPreview: PreviewProgram? = metalDevice.flatMap { dev -> PreviewProgram? in
+            guard let p = try? PreviewProgram(device: dev,
+                                              width: config.width,
+                                              height: config.height,
+                                              colorMode: mode) else { return nil }
+            p.onPreviewFrame = { [previewSink] frame in previewSink.consume(frame) }
+            p.scene = previewScene
+            return p
+        }
+        if oldPreview != nil && newPreview == nil {
+            canvasConfig = previous
+            lastError = "Couldn't rebuild the preview program at \(config.resolution.label)."
+            return
+        }
+        previewProgram = newPreview ?? oldPreview
         let old = renderLoop
         // Quiesce the old render thread FIRST (shared animated-FX GPU / mailboxes
         // are single-consumer): a failed quiesce is a near-no-op that leaves the
@@ -7010,10 +7037,16 @@ extension AppEngine {
         if let old, old.stop() == false {
             canvasConfig = previous
             renderLoop = old
+            previewProgram = oldPreview // old loop's tick closure references oldPreview
             resumeRenderLoopAfterFailedQuiesce(old)
             lastError = "Canvas change couldn't proceed — the current render pass didn't quiesce. Preview kept running; try again."
             return
         }
+        // Old render thread confirmed gone: fence the OLD preview program so a stale
+        // old-size preview frame (still draining off the old loop's tick snapshot)
+        // cannot reach the preview sink after the new program's first frame. Revived
+        // on the start-fail path below (which restores `oldPreview`).
+        if newPreview !== oldPreview { oldPreview?.quiesce() }
         invalidatePendingStingerCue(drain: true)
         cancelActiveStingerTransition()
         cancelLayerAnimation()
@@ -7025,6 +7058,8 @@ extension AppEngine {
         guard newLoop.start() else {
             // Rebuild + restart the OLD-size loop so preview isn't left frozen.
             canvasConfig = previous
+            previewProgram = oldPreview // restore the old loop's captured preview program
+            oldPreview?.resume()        // revive the fenced old preview program
             if let revived = buildRenderLoop(colorMode: mode) {
                 installAllMailboxes(on: revived)
                 revived.scene = scene

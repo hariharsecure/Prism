@@ -147,6 +147,46 @@ final class CanvasConfigTests: XCTestCase {
         _ = await engine.stopRecording()
     }
 
+    /// REPRODUCE-FIRST (Phase 3a Stage 1 follow-up): a canvas resolution change must
+    /// rebuild the studio-mode PREVIEW compositor at the NEW size, not just the primary
+    /// render loop. Before the fix `setCanvasConfig` rebuilt only the primary, so the
+    /// preview program kept compositing at the OLD dimensions after a resolution change.
+    func testSetCanvasConfigRebuildsPreviewAtNewSize() throws {
+        AppEngine.persistCanvasConfig(.default)
+        let engine = AppEngine()
+        try XCTSkipIf(engine.previewProgramSize == nil, "no preview program (Metal unavailable)")
+
+        // Starts at the 1080p default.
+        XCTAssertEqual(engine.previewProgramSize?.width, 1920)
+        XCTAssertEqual(engine.previewProgramSize?.height, 1080)
+
+        engine.setCanvasConfig(CanvasConfig(resolution: .r1440, frameRate: .fps30))
+
+        XCTAssertEqual(engine.previewProgramSize?.width, 2560,
+                       "preview compositor width must follow the canvas change")
+        XCTAssertEqual(engine.previewProgramSize?.height, 1440,
+                       "preview compositor height must follow the canvas change")
+
+        // A second change (down to 720p) also propagates — no stale dimensions.
+        engine.setCanvasConfig(CanvasConfig(resolution: .r720, frameRate: .fps60))
+        XCTAssertEqual(engine.previewProgramSize?.width, 1280)
+        XCTAssertEqual(engine.previewProgramSize?.height, 720)
+    }
+
+    /// The preview-program rebuild preserves color mode: a canvas change made while
+    /// HDR is on must rebuild the preview in HDR (not silently drop to SDR), mirroring
+    /// the primary's `hdrEnabled ? .hdr : .sdr` parity.
+    func testSetCanvasConfigPreservesPreviewColorMode() throws {
+        AppEngine.persistCanvasConfig(.default)
+        let engine = AppEngine()
+        try XCTSkipIf(engine.previewProgramColorMode == nil, "no preview program (Metal unavailable)")
+
+        let modeBefore = engine.previewProgramColorMode
+        engine.setCanvasConfig(CanvasConfig(resolution: .r1440, frameRate: .fps30))
+        XCTAssertEqual(engine.previewProgramColorMode, modeBefore,
+                       "canvas change must keep the preview in the current color mode")
+    }
+
     // MARK: On-air guard
 
     /// Changing the canvas is refused while an output is on-air — the picker is

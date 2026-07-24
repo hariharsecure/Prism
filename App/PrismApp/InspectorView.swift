@@ -1285,6 +1285,8 @@ private struct SourceInspector: View {
                 if !editing { commitGrade(immediate: true) }
             }
             .accessibilityIdentifier("inspector.color.\(title.lowercased()).slider")
+            .controlSize(.large)
+            .minHitHeight()
             .onChange(of: value.wrappedValue) { commitGrade() }
         }
     }
@@ -1302,6 +1304,8 @@ private struct SourceInspector: View {
             }
             Slider(value: value, in: range)
                 .accessibilityIdentifier(id)
+                .controlSize(.large)
+                .minHitHeight()
                 .onChange(of: value.wrappedValue) { onCommit() }
         }
     }
@@ -1330,6 +1334,8 @@ private struct SourceInspector: View {
                 if !editing { commitGrade(immediate: true) }
             }
             .accessibilityIdentifier("inspector.color.\(group.lowercased()).\(label.lowercased()).slider")
+            .controlSize(.large)
+            .minHitHeight()
             .onChange(of: value.wrappedValue) { commitGrade() }
             .tint(tint)
         }
