@@ -172,6 +172,15 @@ public actor RTMPStreamOutput {
         maxReconnectAttempts = max(0, count)
     }
 
+    /// #20: the reconnect-attempt sequence for a disconnect given the configured
+    /// maximum. ZERO configured attempts means DO NOT reconnect — the pre-fix
+    /// loop `1...max(1, maxReconnectAttempts)` clamped 0 up to 1 and always
+    /// retried once, contradicting the "0 = no reconnect" setting. Pure +
+    /// `internal` so the contract is unit-testable without a live socket.
+    static func reconnectAttempts(max maxAttempts: Int) -> Range<Int> {
+        maxAttempts <= 0 ? (0..<0) : (1..<(maxAttempts + 1))
+    }
+
     // MARK: Lifecycle
 
     /// Connects and publishes. `url` is the ingest endpoint
@@ -255,7 +264,8 @@ public actor RTMPStreamOutput {
         log.warning("connection lost; reconnecting")
         connection = nil
         stream = nil
-        for attempt in 1...max(1, maxReconnectAttempts) {
+        let attempts = Self.reconnectAttempts(max: maxReconnectAttempts)
+        for attempt in attempts {
             state = .reconnecting(attempt: attempt)
             // Exponential backoff, capped at 30 s.
             let delay = min(30.0, pow(2.0, Double(attempt - 1)))
@@ -270,7 +280,11 @@ public actor RTMPStreamOutput {
                 log.warning("reconnect attempt \(attempt) failed: \(String(describing: error), privacy: .public)")
             }
         }
-        state = .failed(reason: "reconnect attempts exhausted")
+        // #20: with 0 configured attempts `attempts` is empty — the loop never
+        // runs and we drop straight to a terminal state with NO reconnect.
+        state = .failed(reason: attempts.isEmpty
+                        ? "connection lost (reconnect disabled)"
+                        : "reconnect attempts exhausted")
     }
 
     /// Unpublishes and closes. The instance can `connect` again afterwards.

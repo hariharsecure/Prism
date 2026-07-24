@@ -106,6 +106,15 @@ public struct Destination: Sendable, Identifiable, Equatable {
         self.key = key
         self.enabled = enabled
     }
+
+    /// #9: whether this destination can actually publish — it must be ENABLED and
+    /// carry a non-empty ingest URL. The "Add" button creates an enabled BLANK
+    /// destination (empty URL/key); such a target must NOT count toward
+    /// `canGoLive` nor be attempted at start, or a destinations-only broadcast
+    /// would report "live" with nothing publishing.
+    public var isPublishable: Bool {
+        enabled && !url.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
 }
 
 // MARK: - Additive conformance for the (unchanged) RTMP output

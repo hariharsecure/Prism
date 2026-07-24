@@ -1200,6 +1200,16 @@ final class AppEngine: ObservableObject {
     private var streamStatsTimer: Timer?
     private var configuredStreamURL: String?
     private var configuredStreamKey: String?
+    /// #9: how many configured destinations of a destinations-only broadcast have
+    /// reported publishing vs failed. Drives the aggregate lifecycle
+    /// (`preparing` → `live` / `degraded` / `failed`) via `destinationsOnlyEvent`.
+    /// Reset on every start/teardown.
+    private var destinationsPublished = 0
+    private var destinationsFailed = 0
+    /// #10: a go-live requested WHILE a stop is still closing the socket. Held
+    /// here and run only after the external-output close completes, so a restart
+    /// never opens B's socket while A's is still publishing.
+    private var pendingStreamStart: (() -> Void)?
     /// The streaming output's requested-vs-confirmed state (2f) — the SINGLE
     /// SOURCE OF TRUTH for `isStreaming`, `streamStateDescription`, and the
     /// streaming half of `isOnAir`. Written only through the RTMP-state / stop /
@@ -5615,13 +5625,73 @@ final class AppEngine: ObservableObject {
         return !hasClassicRTMP
     }
 
+    /// #9: whether Go Live has a publishable target — a complete primary (URL +
+    /// key) OR ≥1 PUBLISHABLE destination (enabled + non-empty URL). An enabled
+    /// BLANK destination does NOT count, so a destinations-only go-live can no
+    /// longer start with nothing to send. Pure → unit-testable.
+    static func canGoLive(primaryURL: String, primaryKey: String,
+                          destinations: [Destination]) -> Bool {
+        let hasPrimary = !primaryURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !primaryKey.isEmpty
+        return hasPrimary || destinations.contains(where: \.isPublishable)
+    }
+
+    /// #9: the lifecycle event a destinations-only broadcast should apply given how
+    /// many of its configured destinations have reported publishing vs failed.
+    /// `nil` = no transition yet (stay `.preparing`, nothing has published).
+    /// Pure → each transition is unit-testable without a socket:
+    ///  - ≥1 publishing, none failed → `.socketPublishing` (→ `.live`)
+    ///  - ≥1 publishing, ≥1 failed  → `.degraded` (partial)
+    ///  - 0 publishing, every one failed → `.failed`
+    static func destinationsOnlyEvent(published: Int, failed: Int, total: Int) -> StreamOutputEvent? {
+        if published > 0 {
+            return failed > 0
+                ? .degraded(reason: "\(failed) of \(total) destination(s) failed")
+                : .socketPublishing
+        }
+        if total > 0, failed >= total {
+            return .failed(reason: "all \(total) destination(s) failed to connect")
+        }
+        return nil
+    }
+
+    /// #5: whether an RTMP state event from an observer started at
+    /// `eventGeneration` for `eventOutput` should be APPLIED to the engine. The
+    /// guard that stops a CANCELLED observer from tearing down its SUCCESSOR: a
+    /// stale event from a superseded generation, or from a different output
+    /// instance than the current one, must be DROPPED (else stream A's late
+    /// `.failed` clears stream B). Pure → unit-testable with two outputs.
+    static func streamEventIsCurrent(eventGeneration: UInt64, currentGeneration: UInt64,
+                                     eventOutput: RTMPStreamOutput,
+                                     currentOutput: RTMPStreamOutput?) -> Bool {
+        eventGeneration == currentGeneration && eventOutput === currentOutput
+    }
+
+    /// #10: a go-live that lands while the streaming lifecycle is `.stopping`
+    /// (A's socket is still closing) must be SERIALIZED — queued behind the close
+    /// rather than run immediately — so B never publishes into A's open socket
+    /// (same key rejected / session evicted). Pure → unit-testable.
+    static func startShouldQueueBehindStop(currentState: StreamOutputState) -> Bool {
+        currentState == .stopping
+    }
+
     private func startStreamInternal(url: String, streamKey: String) {
         guard !didShutdown else { return } // Codex #4: don't attach outputs after shutdown
+        // #10: a start that lands while a stop is still closing the socket is
+        // SERIALIZED — held until the close completes (see `finishStreamTeardown`),
+        // so B never publishes while A's socket is still open.
+        if Self.startShouldQueueBehindStop(currentState: streamOutputState) {
+            pendingStreamStart = { [weak self] in self?.startStreamInternal(url: url, streamKey: streamKey) }
+            return
+        }
         guard streamEncoder == nil, !isStreaming else { return }
-        let enabledDestinations = destinations.filter(\.enabled)
+        // #9: only PUBLISHABLE destinations (enabled + non-empty URL) are brought
+        // up — an enabled BLANK destination can't publish and must not make a
+        // destinations-only broadcast falsely report "live".
+        let enabledDestinations = destinations.filter(\.isPublishable)
         let hasPrimary = !url.isEmpty && !streamKey.isEmpty
         guard hasPrimary || !enabledDestinations.isEmpty else {
-            lastError = "No stream target — enter an RTMP URL and key, or enable a destination."
+            lastError = "No valid stream target — enter an RTMP URL and key, or enable a destination with a URL."
             return
         }
         let w = canvasConfig.width, h = canvasConfig.height
@@ -5685,11 +5755,13 @@ final class AppEngine: ObservableObject {
         rtmpOutput = rtmp
         self.broadcaster = broadcaster
         streamStartDate = Date()
-        // 2f: enter the streaming lifecycle. With a single-RTMP primary we are
-        // only REQUESTED (`.preparing`) until the socket confirms `.publishing`;
-        // a destinations-only broadcast is CONFIRMED live as soon as the encoder
-        // runs. `isStreaming`/`isOnAir` derive from this.
-        streamOutputState = StreamOutputState.reduce(.idle, on: .requestStart(hasPrimary: hasPrimary))
+        // 2f/#9: enter the streaming lifecycle at REQUESTED (`.preparing`). A
+        // single-RTMP primary is confirmed when its socket publishes; a
+        // destinations-only broadcast is confirmed only when ≥1 destination
+        // reports publishing (NOT the instant the encoder runs) —
+        // `updateDestinationsOnlyState` drives that. `isStreaming`/`isOnAir`
+        // derive from this.
+        streamOutputState = StreamOutputState.reduce(.idle, on: .requestStart)
         // Reset all live counters on START so GetStreamStatus never reports the
         // previous stream's totals before the first stats tick (Codex #7).
         streamDroppedAppends = 0
@@ -5697,6 +5769,8 @@ final class AppEngine: ObservableObject {
         streamBytesOut = 0
         streamTotalFrames = 0
         streamHasPublished = false
+        destinationsPublished = 0   // #9: aggregate destinations-only confirmation
+        destinationsFailed = 0
         broadcastVideoFrames = 0
         broadcastAudioFrames = 0
         broadcastDestinationsConfigured = 0
@@ -5728,10 +5802,14 @@ final class AppEngine: ObservableObject {
             broadcastDestinationsConfigured = enabledDestinations.count
             for dest in enabledDestinations {
                 trackedConnect { [weak self] in
-                    do { _ = try await broadcaster.add(dest) }
-                    catch {
+                    do {
+                        _ = try await broadcaster.add(dest)
+                        // #9: a successful add means this destination is publishing.
+                        self?.destinationDidPublish()
+                    } catch {
                         guard !Task.isCancelled else { return }
                         self?.lastError = "Destination \"\(dest.name)\" failed to connect: \(error.localizedDescription)"
+                        self?.destinationDidFail()
                     }
                 }
             }
@@ -5740,10 +5818,24 @@ final class AppEngine: ObservableObject {
 
         // Single-RTMP primary: observe its state + connect (unchanged hardened path).
         if let rtmp {
+            // #5: capture THIS stream's generation + output identity. Before
+            // applying any event we re-check both (and cancellation) so a stale
+            // event from a superseded/cancelled observer can't tear down its
+            // SUCCESSOR — stream A's late `.failed`, queued on the main actor
+            // after stop-A/start-B ran, is DROPPED instead of clearing B.
             streamStateTask = Task { [weak self] in
                 let updates = await rtmp.stateUpdates
                 for await state in updates {
-                    await MainActor.run { self?.streamStateChanged(state) }
+                    if Task.isCancelled { break }
+                    await MainActor.run { [weak self] in
+                        guard let self, !Task.isCancelled,
+                              AppEngine.streamEventIsCurrent(eventGeneration: generation,
+                                                             currentGeneration: self.streamGeneration,
+                                                             eventOutput: rtmp,
+                                                             currentOutput: self.rtmpOutput)
+                        else { return }
+                        self.streamStateChanged(state)
+                    }
                 }
             }
             // Attempt the connection (a bad URL / no server fails gracefully here).
@@ -5766,17 +5858,71 @@ final class AppEngine: ObservableObject {
                 }
             }
             startStreamStatsTimer()
+        }
+        // #9: a destinations-only broadcast is NOT live just because the encoder
+        // runs. It stays `.preparing` until a destination reports publishing;
+        // `destinationDidPublish`/`destinationDidFail` (fired by the connect tasks
+        // above) drive the aggregate `preparing → live / degraded / failed`.
+    }
+
+    /// #9: a destinations-only destination confirmed publishing.
+    private func destinationDidPublish() {
+        destinationsPublished += 1
+        updateDestinationsOnlyState()
+    }
+
+    /// #9: a destinations-only destination failed to connect.
+    private func destinationDidFail() {
+        destinationsFailed += 1
+        updateDestinationsOnlyState()
+    }
+
+    /// #9: fold the per-destination outcomes of a destinations-only broadcast into
+    /// the single lifecycle state. Only runs for a destinations-only broadcast
+    /// (no single-RTMP primary drives the state) and only while still resolving
+    /// (`preparing`/`degraded`/`live`) — never re-animates a stop/teardown.
+    private func updateDestinationsOnlyState() {
+        guard rtmpOutput == nil else { return }   // a primary drives the state itself
+        switch streamOutputState {
+        case .preparing, .degraded, .live: break  // still resolving destination outcomes
+        default: return                            // stopping / idle / failed — leave it
+        }
+        guard let event = Self.destinationsOnlyEvent(published: destinationsPublished,
+                                                     failed: destinationsFailed,
+                                                     total: broadcastDestinationsConfigured)
+        else { return }                            // nothing published yet → stay preparing
+        if case .failed = StreamOutputState.reduce(streamOutputState, on: event) {
+            // Every destination failed — tear the (now dead) broadcast down.
+            controlServer.publish(.streamStateChanged(active: false, state: .stopped))
+            finishStreamTeardown(terminal: .failed(reason: "all \(broadcastDestinationsConfigured) destination(s) failed to connect"))
         } else {
-            // Destinations-only: no single RTMP to publish; the broadcast is live
-            // as soon as the encoder runs (per-destination state is in the HUD).
             streamHasPublished = true
+            streamOutputState = StreamOutputState.reduce(streamOutputState, on: event)
+            writeLinkDebugState()
         }
     }
 
+    #if DEBUG
+    /// Test seam (#10): force the streaming lifecycle into a given state WITHOUT a
+    /// live encoder/socket, so the "restart is serialized behind the close" rule
+    /// is unit-testable without hardware.
+    func _test_setStreamOutputState(_ state: StreamOutputState) { streamOutputState = state }
+    /// Test seam (#10): whether a go-live requested during `.stopping` was QUEUED
+    /// (held behind the close) rather than started.
+    var _test_pendingStreamStartQueued: Bool { pendingStreamStart != nil }
+    #endif
+
     func stopStream() {
         guard isStreaming else { return }
+        // #10: an operator stop that lands while a previous stop is still closing
+        // is a redundant no-op — don't restart the teardown or clear the queued
+        // restart. (`.stopping` still counts as `isStreaming`.)
+        guard streamOutputState != .stopping else { return }
         controlServer.publish(.streamStateChanged(active: false, state: .stopped))
-        finishStreamTeardown(terminal: .idle)
+        // #10: enter `.stopping` synchronously and publish the terminal idle only
+        // AFTER the socket close completes, so a restart is serialized behind the
+        // open-socket window (isStreaming stays true through the close).
+        finishStreamTeardown(terminal: .idle, deferTerminalUntilClosed: true)
     }
 
     private func streamStateChanged(_ state: RTMPStreamOutput.ConnectionState) {
@@ -5815,7 +5961,8 @@ final class AppEngine: ObservableObject {
     /// awaits `RTMPStreamOutput.close()` — which cancels the consumer/watcher
     /// tasks and finishes the ingest continuation — so no path leaves a live
     /// RTMP session or a running connect Task behind.
-    private func finishStreamTeardown(terminal: StreamOutputState) {
+    private func finishStreamTeardown(terminal: StreamOutputState,
+                                      deferTerminalUntilClosed: Bool = false) {
         streamStatsTimer?.invalidate(); streamStatsTimer = nil
         broadcastStatsTimer?.invalidate(); broadcastStatsTimer = nil
         streamStateTask?.cancel(); streamStateTask = nil
@@ -5842,11 +5989,56 @@ final class AppEngine: ObservableObject {
         streamTotalFrames = 0
         streamDroppedAppends = 0
         broadcastDestinationsConfigured = 0
-        // 2f: the terminal state (`.idle` for a clean stop/close, `.failed` for a
+        destinationsPublished = 0
+        destinationsFailed = 0
+        // Tear down every restream destination (unpublish + close each output).
+        // Codex #4: cancel + AWAIT every in-flight per-destination connect Task
+        // FIRST, so no `broadcaster.add(dest)` finishes (assigning a live
+        // connection/stream) after `shutdown()` — which would leave a destination
+        // publishing past stop. The await guarantees connect-then-shutdown order
+        // even though actor reentrancy would otherwise interleave them.
+        let connectTasks = Array(destinationConnectTasks.values)
+        destinationConnectTasks.removeAll()
+
+        // #10: for an OPERATOR STOP we enter `.stopping` NOW (isStreaming stays
+        // true) and publish the terminal idle only AFTER the socket close
+        // completes — so a restart requested mid-stop is SERIALIZED behind the
+        // open-socket window. Failure/closed paths (the socket is already down)
+        // keep the pre-2f SYNCHRONOUS terminal so callers polling `isStreaming`
+        // right after see it stopped.
+        if deferTerminalUntilClosed {
+            streamOutputState = .stopping
+            // ONE owned close: await the RTMP socket AND the broadcaster/SRT
+            // destinations, THEN publish the terminal state and run any go-live
+            // that was queued while we were stopping. 2c: owned so `shutdown()`
+            // still awaits it before the process exits.
+            trackExternalOutputClose { [weak self] in
+                connectTask?.cancel()
+                await connectTask?.value
+                await rtmp?.close()
+                for t in connectTasks { t.cancel() }
+                for t in connectTasks { await t.value }
+                await broadcaster?.shutdown()
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    // Only publish idle if we're still stopping THIS teardown —
+                    // a failure event can't have raced past `.stopping`.
+                    if self.streamOutputState == .stopping {
+                        self.streamOutputState = terminal
+                        self.writeLinkDebugState()
+                    }
+                    let pending = self.pendingStreamStart
+                    self.pendingStreamStart = nil
+                    pending?()   // #10: the deferred restart runs AFTER A's close
+                }
+            }
+            return
+        }
+
+        // 2f: the terminal state (`.idle` for a clean close, `.failed` for a
         // failure) is the single source of truth; `isStreaming` (now false) and
-        // `streamStateDescription` derive from it. Set SYNCHRONOUSLY so callers
-        // that poll `isStreaming` right after `stopStream()` see it stopped —
-        // preserving the pre-2f timing — while the socket close is AWAITED
+        // `streamStateDescription` derive from it. Set SYNCHRONOUSLY — the socket
+        // is already closing/closed on these paths — while the close is AWAITED
         // separately via the external-output barrier below.
         streamOutputState = terminal
         // Cancel + await the connect Task (so a connect that publishes right as
@@ -5861,14 +6053,6 @@ final class AppEngine: ObservableObject {
                 await rtmp?.close()
             }
         }
-        // Tear down every restream destination (unpublish + close each output).
-        // Codex #4: cancel + AWAIT every in-flight per-destination connect Task
-        // FIRST, so no `broadcaster.add(dest)` finishes (assigning a live
-        // connection/stream) after `shutdown()` — which would leave a destination
-        // publishing past stop. The await guarantees connect-then-shutdown order
-        // even though actor reentrancy would otherwise interleave them.
-        let connectTasks = Array(destinationConnectTasks.values)
-        destinationConnectTasks.removeAll()
         if let broadcaster {
             // 2c: OWNED handle so `shutdown()` awaits the broadcaster/SRT
             // destination closes before the process exits.

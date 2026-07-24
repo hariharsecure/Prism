@@ -142,10 +142,12 @@ struct TransportBar: View {
     }
 
     /// Whether Go Live has something to publish: a complete primary RTMP target
-    /// OR at least one enabled restream destination (deliverable B).
+    /// OR at least one PUBLISHABLE restream destination (enabled + non-empty URL).
+    /// #9: an enabled BLANK destination no longer counts — otherwise Go Live would
+    /// start a destinations-only broadcast with nothing to send and report "live".
     private var canGoLive: Bool {
-        (!rtmpURL.isEmpty && !streamKey.isEmpty)
-            || engine.destinations.contains(where: \.enabled)
+        AppEngine.canGoLive(primaryURL: rtmpURL, primaryKey: streamKey,
+                            destinations: engine.destinations)
     }
 
     private var streamPopover: some View {

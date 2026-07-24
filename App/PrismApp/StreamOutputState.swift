@@ -75,10 +75,11 @@ enum StreamOutputState: Equatable, Sendable {
 /// `RTMPStreamOutput.ConnectionState` so the transition table is a PURE,
 /// unit-testable seam (`StreamOutputStateTests`) that needs no live socket.
 enum StreamOutputEvent: Equatable, Sendable {
-    /// Go-live requested. `hasPrimary` = a single-RTMP primary must confirm
-    /// before we're live; without one, a destinations-only broadcast is live as
-    /// soon as its encoder runs.
-    case requestStart(hasPrimary: Bool)
+    /// Go-live requested. Always enters `.preparing` (REQUESTED): a single-RTMP
+    /// primary must confirm publishing, and — after #9 — a destinations-only
+    /// broadcast likewise stays `.preparing` until at least one destination
+    /// actually reports publishing (it is NOT live the instant its encoder runs).
+    case requestStart
     /// The single-RTMP socket is connecting (not yet publishing).
     case socketConnecting
     /// The single-RTMP socket confirmed publishing.
@@ -101,10 +102,11 @@ extension StreamOutputState {
     /// the lifecycle lives in one place and is testable without a socket.
     static func reduce(_ state: StreamOutputState, on event: StreamOutputEvent) -> StreamOutputState {
         switch event {
-        case .requestStart(let hasPrimary):
-            // With a single-RTMP primary we're only REQUESTED until the socket
-            // confirms publishing; destinations-only is live immediately.
-            return hasPrimary ? .preparing : .live
+        case .requestStart:
+            // REQUESTED: a primary is only confirmed when its socket publishes,
+            // and (#9) a destinations-only broadcast is only confirmed when ≥1
+            // destination reports publishing. Both start `.preparing`.
+            return .preparing
         case .socketConnecting:
             return .preparing
         case .socketPublishing:

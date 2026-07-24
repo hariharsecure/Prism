@@ -1,4 +1,5 @@
 import XCTest
+import PrismOutput
 @testable import Prism
 
 /// Phase 2f — REQUESTED vs CONFIRMED streaming output state, and Phase 2c — the
@@ -22,7 +23,7 @@ final class StreamOutputStateTests: XCTestCase {
     /// every real RTMP event through.
     func testRequestedToLiveToStoppedLifecycle() {
         var state = StreamOutputState.idle
-        state = StreamOutputState.reduce(state, on: .requestStart(hasPrimary: true))
+        state = StreamOutputState.reduce(state, on: .requestStart)
         XCTAssertEqual(state, .preparing, "go-live with a single-RTMP primary is REQUESTED, not yet confirmed")
         state = StreamOutputState.reduce(state, on: .socketPublishing)
         XCTAssertEqual(state, .live, "socket publishing CONFIRMS the stream is live")
@@ -32,11 +33,14 @@ final class StreamOutputStateTests: XCTestCase {
         XCTAssertEqual(state, .idle, "a clean close returns to the resting state")
     }
 
-    /// A destinations-only broadcast has no single-RTMP primary to confirm, so it
-    /// is CONFIRMED live the moment its encoder runs.
-    func testDestinationsOnlyIsLiveImmediately() {
-        let state = StreamOutputState.reduce(.idle, on: .requestStart(hasPrimary: false))
-        XCTAssertEqual(state, .live, "destinations-only broadcast is live without a socket-confirmation step")
+    /// #9: a destinations-only broadcast is REQUESTED (`.preparing`) on go-live —
+    /// it is NOT live the instant its encoder runs. It stays `.preparing` until a
+    /// destination actually reports publishing (was: reduced straight to `.live`,
+    /// so a blank destinations-only broadcast reported "live" with nothing
+    /// connected).
+    func testDestinationsOnlyStaysPreparingUntilPublish() {
+        let state = StreamOutputState.reduce(.idle, on: .requestStart)
+        XCTAssertEqual(state, .preparing, "#9: destinations-only go-live is REQUESTED, not immediately live")
     }
 
     /// A drop while live goes to `reconnecting`, and a re-publish returns to live.
@@ -137,6 +141,115 @@ final class StreamOutputStateTests: XCTestCase {
     func testBarrierNoHandlesReturnsImmediately() async {
         let timedOut = await AppEngine.awaitAll([], timeout: .milliseconds(10))
         XCTAssertFalse(timedOut)
+    }
+
+    // MARK: #5 — a cancelled observer must not tear down its successor
+
+    /// THE RACE: stream A's `.failed` wins the yield/cancel race and its main-actor
+    /// job queues; stop-A/start-B runs first (current output is now B); then the
+    /// stale A job executes. Pre-fix it applied A's `.failed` → tore down B
+    /// (final current = nil). The guard drops any event whose generation or output
+    /// identity no longer matches the current stream, so B survives.
+    func testCancelledObserverEventForSupersededStreamIsDropped() {
+        let outA = RTMPStreamOutput()
+        let outB = RTMPStreamOutput()
+        // A's observer was started at generation 5; the engine has since torn A
+        // down and started B (generation 7, current output B).
+        XCTAssertFalse(AppEngine.streamEventIsCurrent(eventGeneration: 5, currentGeneration: 7,
+                                                      eventOutput: outA, currentOutput: outB),
+                       "#5: a stale A event (superseded generation) must be DROPPED, not applied to B")
+        // Even if the generation counter happened to coincide, a DIFFERENT output
+        // instance than the current one is still dropped (identity guard).
+        XCTAssertFalse(AppEngine.streamEventIsCurrent(eventGeneration: 7, currentGeneration: 7,
+                                                      eventOutput: outA, currentOutput: outB),
+                       "#5: an event for a different output instance must be dropped")
+        // B's OWN observer event (same generation, same output) is applied.
+        XCTAssertTrue(AppEngine.streamEventIsCurrent(eventGeneration: 7, currentGeneration: 7,
+                                                     eventOutput: outB, currentOutput: outB),
+                      "#5: the current stream's own event must still be applied")
+        // A late event after everything torn down (current output nil) is dropped.
+        XCTAssertFalse(AppEngine.streamEventIsCurrent(eventGeneration: 7, currentGeneration: 7,
+                                                      eventOutput: outB, currentOutput: nil))
+    }
+
+    // MARK: #9 — destinations-only never reports live with zero connected
+
+    /// canGoLive requires a VALID target: an enabled BLANK destination (empty URL)
+    /// does not count, so Go Live can no longer start a destinations-only broadcast
+    /// with nothing to publish.
+    func testCanGoLiveRequiresAValidTarget() {
+        // The "Add" default: enabled but blank → not publishable.
+        let blank = Destination(name: "New", proto: .rtmp, url: "", key: "", enabled: true)
+        XCTAssertFalse(blank.isPublishable, "#9: an enabled BLANK destination is not publishable")
+        XCTAssertFalse(AppEngine.canGoLive(primaryURL: "", primaryKey: "", destinations: [blank]),
+                       "#9: a blank primary + blank destination must NOT be able to go live")
+        // A destination with a URL is publishable → can go live.
+        let real = Destination(name: "YT", proto: .rtmp, url: "rtmp://a.rtmp.youtube.com/live2",
+                               key: "k", enabled: true)
+        XCTAssertTrue(real.isPublishable)
+        XCTAssertTrue(AppEngine.canGoLive(primaryURL: "", primaryKey: "", destinations: [real]))
+        // A disabled destination (even with a URL) doesn't count.
+        var disabled = real; disabled.enabled = false
+        XCTAssertFalse(disabled.isPublishable)
+        XCTAssertFalse(AppEngine.canGoLive(primaryURL: "", primaryKey: "", destinations: [disabled]))
+        // A complete primary alone is enough.
+        XCTAssertTrue(AppEngine.canGoLive(primaryURL: "rtmp://x/app", primaryKey: "k", destinations: []))
+        // A primary with an empty key is NOT (unpublishable, W9).
+        XCTAssertFalse(AppEngine.canGoLive(primaryURL: "rtmp://x/app", primaryKey: "", destinations: []))
+    }
+
+    /// The destinations-only aggregate transitions (#9), each independently:
+    /// nothing published → stay `.preparing`; ≥1 published → `.live`; a partial
+    /// set (some published, some failed) → `.degraded`; every one failed →
+    /// `.failed`.
+    func testDestinationsOnlyAggregateTransitions() {
+        func stateAfter(published: Int, failed: Int, total: Int) -> StreamOutputState {
+            guard let ev = AppEngine.destinationsOnlyEvent(published: published, failed: failed, total: total)
+            else { return .preparing }   // nil → no transition yet
+            return StreamOutputState.reduce(.preparing, on: ev)
+        }
+        // Nothing has resolved yet → still REQUESTED.
+        XCTAssertNil(AppEngine.destinationsOnlyEvent(published: 0, failed: 0, total: 2),
+                     "#9: with nothing published the broadcast stays .preparing (was: instantly .live)")
+        XCTAssertEqual(stateAfter(published: 0, failed: 0, total: 2), .preparing)
+        // At least one publishing, none failed → LIVE.
+        XCTAssertEqual(stateAfter(published: 1, failed: 0, total: 2), .live,
+                       "#9: a destination reporting publishing confirms live")
+        XCTAssertEqual(stateAfter(published: 2, failed: 0, total: 2), .live)
+        // Partial: one up, one failed → DEGRADED.
+        XCTAssertEqual(stateAfter(published: 1, failed: 1, total: 2), .degraded(reason: "1 of 2 destination(s) failed"),
+                       "#9: a partial destination set is degraded, not plain live")
+        // Every destination failed → FAILED.
+        XCTAssertEqual(stateAfter(published: 0, failed: 2, total: 2), .failed(reason: "all 2 destination(s) failed to connect"),
+                       "#9: all-failed is terminal .failed, not a phantom .live")
+    }
+
+    // MARK: #10 — stop enters .stopping and serializes an overlapping restart
+
+    /// The serialization rule: a go-live that lands while the lifecycle is
+    /// `.stopping` (A's socket still closing) must be QUEUED behind the close, not
+    /// run immediately.
+    func testStartDuringStoppingIsQueued() {
+        XCTAssertTrue(AppEngine.startShouldQueueBehindStop(currentState: .stopping),
+                      "#10: a start during .stopping must be serialized behind the close")
+        XCTAssertFalse(AppEngine.startShouldQueueBehindStop(currentState: .idle))
+        XCTAssertFalse(AppEngine.startShouldQueueBehindStop(currentState: .live))
+        XCTAssertFalse(AppEngine.startShouldQueueBehindStop(currentState: .preparing))
+    }
+
+    /// Reproduce-first at the engine level (#10): while `.stopping`, the app is
+    /// still `isStreaming` (the socket hasn't closed), and a go-live is HELD as a
+    /// pending restart rather than starting a second stream into A's open socket.
+    func testRestartDuringStopIsHeldNotStarted() {
+        let engine = AppEngine()
+        engine._test_setStreamOutputState(.stopping)   // A is still closing its socket
+        XCTAssertTrue(engine.isStreaming,
+                      "#10: isStreaming must stay true through .stopping until the socket closes")
+        engine.goLive(rtmpURL: "rtmp://a.rtmp.youtube.com/live2", streamKey: "k")  // B requested mid-stop
+        XCTAssertTrue(engine._test_pendingStreamStartQueued,
+                      "#10: a go-live during .stopping must be QUEUED, not run")
+        XCTAssertEqual(engine.streamOutputState, .stopping,
+                       "#10: the queued restart must not have started a second stream while A closes")
     }
 }
 
