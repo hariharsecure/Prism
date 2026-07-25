@@ -36,7 +36,8 @@ public final class BackgroundEffect {
     private let dummyBlurred: MTLTexture
     private var intermediateA: MTLTexture?
     private var intermediateB: MTLTexture?
-    private var cachedWeightsRadius: Float = -1
+    private var cachedWeightsValid = false
+    private var cachedWeightsRadius: Float = 0
     private var cachedWeights: [Float] = []
 
     #if DEBUG
@@ -282,17 +283,22 @@ public final class BackgroundEffect {
     /// tap ±i, `weights.count - 1` taps each side. `sigma = radius/2`; reach
     /// clamped to 1…63 so `setBytes` stays tiny and the loop bounded.
     private func gaussianWeights(radius: Float) -> [Float] {
-        if radius == cachedWeightsRadius { return cachedWeights }
-        let reach = min(max(Int(radius.rounded(.up)), 1), 63)
-        let sigma = max(radius, 1) / 2
+        // Guard a non-finite radius BEFORE `Int(_.rounded())` (Int(NaN) traps).
+        // Also use an explicit valid-flag rather than a `-1` sentinel: a legitimate
+        // radius could otherwise collide with the sentinel and return stale weights.
+        let r = radius.isFinite ? radius : 0
+        if cachedWeightsValid && r == cachedWeightsRadius { return cachedWeights }
+        let reach = min(max(Int(r.rounded(.up)), 1), 63)
+        let sigma = max(r, 1) / 2
         var weights = (0...reach).map { i -> Float in
             let x = Float(i)
             return exp(-x * x / (2 * sigma * sigma))
         }
         let sum = weights[0] + 2 * weights.dropFirst().reduce(0, +)
         weights = weights.map { $0 / sum }
-        cachedWeightsRadius = radius
+        cachedWeightsRadius = r
         cachedWeights = weights
+        cachedWeightsValid = true
         return weights
     }
 }

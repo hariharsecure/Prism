@@ -342,22 +342,56 @@ public final class MontageSource: VideoSource, @unchecked Sendable {
         // If called from inside `onFrame` we are ON the director queue; capture that
         // BEFORE hopping to the lifecycle queue so the drain skips it (no deadlock).
         let onDirector = DispatchQueue.getSpecific(key: directorQueueKey) != nil
-        lifecycleQueue.sync { stopLocked(skipDirectorDrain: onDirector) }
+
+        // Phase 1: claim the stop transition under lifecycleQueue — serialized with
+        // the natural `.finish` terminal transition (`finishFromTick`), so exactly
+        // one of them performs the teardown. Cancel the timer (no further ticks are
+        // scheduled) but DEFER nil-ing it and tearing down slots until AFTER the
+        // drain (M3), so an in-flight tick can't be mutating `current`/`incoming`
+        // while we tear them down.
+        let claimed: Bool = lifecycleQueue.sync {
+            let ok = stateLock.withLock { s -> Bool in
+                guard s == .running || s == .starting || s == .failed else { return false }
+                s = .stopping
+                return true
+            }
+            if ok { timer?.cancel() }
+            return ok
+        }
+        guard claimed else { return }
+
+        // Phase 2: drain the in-flight tick OUTSIDE lifecycleQueue (a tick-originated
+        // `.finish` can still enter lifecycleQueue, observe `.stopping` and no-op —
+        // no cross-queue lock cycle), unless we ARE that tick. THEN finalize under
+        // the lock so all `timer`/slot access stays serialized.
+        if !onDirector { directorQueue.sync {} }
+        lifecycleQueue.sync {
+            timer = nil
+            teardownSlots()
+            stateLock.withLock { if $0 == .stopping { $0 = .idle } }
+        }
     }
 
-    private func stopLocked(skipDirectorDrain: Bool) {
-        let proceed: Bool = stateLock.withLock { s in
-            guard s == .running || s == .starting || s == .failed else { return false }
-            s = .stopping
-            return true
+    /// Natural end-of-montage terminal transition, invoked from `tick()` on the
+    /// directorQueue for a non-looping montage that ran past its last item. Routed
+    /// through `lifecycleQueue` (as `MovieSource.loopFinishedEOF` does) so it can't
+    /// race `stop()`'s teardown (M3): whichever claims `.stopping` first performs
+    /// the single timer-cancel + slot-teardown; the loser is a no-op. We are ON the
+    /// directorQueue (the finishing tick), so no directorQueue drain is needed — and
+    /// attempting one would deadlock a concurrent `stop()`.
+    private func finishFromTick() {
+        lifecycleQueue.sync {
+            let proceed: Bool = stateLock.withLock { s in
+                guard s == .running else { return false }   // stop() already claimed it → no-op
+                s = .stopping
+                return true
+            }
+            guard proceed else { return }
+            timer?.cancel()
+            timer = nil
+            teardownSlots()
+            stateLock.withLock { if $0 == .stopping { $0 = .idle } }
         }
-        guard proceed else { return }
-        timer?.cancel()
-        timer = nil
-        // Let the in-flight tick finish (unless we ARE that tick).
-        if !skipDirectorDrain { directorQueue.sync {} }
-        teardownSlots()
-        stateLock.withLock { if $0 == .stopping { $0 = .idle } }
     }
 
     private func teardownSlots() {
@@ -414,12 +448,10 @@ public final class MontageSource: VideoSource, @unchecked Sendable {
 
         switch action {
         case .finish:
-            // Non-loop montage: render the last frame once and move to a
-            // restartable terminal state.
+            // Non-loop montage: render the last frame once, then route the terminal
+            // transition through lifecycleQueue so it can't race stop() (M3).
             renderAndEmit(timeInItem: interval, alphaIn: 0, houseTime: now)
-            timer?.cancel(); timer = nil
-            teardownSlots()
-            stateLock.withLock { if $0 == .running { $0 = .idle } }
+            finishFromTick()
             return
         case .commit:
             commitAdvance(now: now)

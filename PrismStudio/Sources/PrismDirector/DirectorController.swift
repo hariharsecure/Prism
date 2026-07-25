@@ -89,7 +89,10 @@ public final class DirectorController: @unchecked Sendable {
     public var isEnabled: Bool { lock.lock(); defer { lock.unlock() }; return enabled }
 
     /// The source currently on program per the policy (nil before first acquire).
-    public var activeSource: SourceID? { director.currentActiveSource }
+    /// Read under `lock`: the analyzer queue writes `director.currentActiveSource`
+    /// (a heap `String`) from `handle(_:)`, so an unlocked read here is a torn
+    /// read (crash). Mirrors every sibling accessor (`isEnabled`).
+    public var activeSource: SourceID? { lock.lock(); defer { lock.unlock() }; return director.currentActiveSource }
 
     /// Update configuration live.
     public func updateConfig(_ newConfig: DirectorConfig) {
@@ -131,10 +134,17 @@ public final class DirectorController: @unchecked Sendable {
         // `CandidateStore`'s TTL prune. House time is monotonic and shared across
         // sources, so age off the newest PTS seen.
         let staleness = config.policy.stalenessSeconds
-        if let clock = latestSignals.values
-            .compactMap({ $0.pts.seconds.isFinite ? $0.pts.seconds : nil }).max() {
-            for (id, sig) in latestSignals
-            where sig.pts.seconds.isFinite && clock - sig.pts.seconds > staleness {
+        let clock = latestSignals.values
+            .compactMap({ $0.pts.seconds.isFinite ? $0.pts.seconds : nil }).max()
+        for (id, sig) in latestSignals {
+            let secs = sig.pts.seconds
+            // L1: a non-finite-PTS signal can't be aged against the house clock, so
+            // it would linger forever as a cut target for a source that emitted one
+            // NaN/inf PTS then vanished. Treat it as stale (prune it). Finite-PTS
+            // staleness (unplugged/frozen camera) is handled unchanged below.
+            if !secs.isFinite {
+                latestSignals.removeValue(forKey: id)
+            } else if let clock, clock - secs > staleness {
                 latestSignals.removeValue(forKey: id)
             }
         }

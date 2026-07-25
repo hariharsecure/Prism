@@ -124,7 +124,21 @@ public final class HighlightDirector: @unchecked Sendable {
 
     // MARK: - State
 
-    private struct Event { let kind: HighlightSignal.Kind; let seconds: Double; let magnitude: Double }
+    private struct Event { let kind: HighlightSignal.Kind; let seconds: Double; var magnitude: Double }
+
+    /// Hard cap on retained in-window events. A burst (a source flooding thousands
+    /// of signals inside one scoring window) is first COALESCED per-kind into
+    /// sub-millisecond buckets — score-exact, since co-located same-kind
+    /// contributions sum — which crushes the common same-instant flood; this count
+    /// cap is the final backstop against an adversarial flood of DISTINCT
+    /// timestamps, keeping the sorted insert / re-score O(cap) and memory O(cap)
+    /// by dropping the OLDEST (most-decayed, least-weighted) events. Without it a
+    /// 100k-signal burst was O(N²) ingest + O(N) memory (a DoS).
+    private static let maxEvents = 4096
+    /// Same-kind events closer than this (s) are indistinguishable to any in-window
+    /// score at millisecond resolution, so they are merged (magnitude summed) —
+    /// exact, and it bounds a same-instant burst to one event per kind.
+    private static let coalesceEpsilon = 1e-3
 
     /// A tracked highlight cluster (mutable peak).
     private struct Cluster {
@@ -194,9 +208,19 @@ public final class HighlightDirector: @unchecked Sendable {
             guard t.isFinite else { return [] }
 
             // Insert sorted by time (buffer is bounded to the window → cheap).
-            let event = Event(kind: signal.kind, seconds: t, magnitude: signal.magnitude)
+            // Coalesce a same-kind event landing in the same sub-ms bucket into the
+            // adjacent one (magnitude summed) so a same-instant burst can't explode
+            // the buffer into an O(N²) ingest — this merge is score-exact.
             let idx = s.events.firstIndex { $0.seconds > t } ?? s.events.count
-            s.events.insert(event, at: idx)
+            if idx > 0, s.events[idx - 1].kind == signal.kind,
+               t - s.events[idx - 1].seconds < Self.coalesceEpsilon {
+                s.events[idx - 1].magnitude += signal.magnitude
+            } else if idx < s.events.count, s.events[idx].kind == signal.kind,
+                      s.events[idx].seconds - t < Self.coalesceEpsilon {
+                s.events[idx].magnitude += signal.magnitude
+            } else {
+                s.events.insert(Event(kind: signal.kind, seconds: t, magnitude: signal.magnitude), at: idx)
+            }
 
             if t > s.maxSeconds { s.maxSeconds = t }
             trimEvents(&s)
@@ -228,6 +252,12 @@ public final class HighlightDirector: @unchecked Sendable {
 
     /// Latest momentary score (score at the newest ingested instant).
     public var currentScore: Double { lock.withLock { $0.currentScore } }
+
+    #if DEBUG
+    /// Test-only: number of retained in-window events. Proves the M4 burst bound
+    /// (coalescing + count cap) keeps the buffer from growing without limit.
+    var _test_eventCount: Int { lock.withLock { $0.events.count } }
+    #endif
 
     /// Momentary score at an arbitrary house-time (seconds), reconstructed from
     /// the events still inside the window. Accurate for times within the current
@@ -261,11 +291,17 @@ public final class HighlightDirector: @unchecked Sendable {
         return (total, dominant)
     }
 
-    /// Drops events older than the window behind the newest time seen.
+    /// Drops events older than the window behind the newest time seen, then caps
+    /// the retained count so a burst of DISTINCT-timestamp events inside one window
+    /// can't grow the buffer without bound (M4). Over cap, the oldest (most-decayed)
+    /// events are dropped first.
     private func trimEvents(_ s: inout State) {
         let cutoff = s.maxSeconds - s.config.windowSeconds
         while let first = s.events.first, first.seconds < cutoff {
             s.events.removeFirst()
+        }
+        if s.events.count > Self.maxEvents {
+            s.events.removeFirst(s.events.count - Self.maxEvents)
         }
     }
 

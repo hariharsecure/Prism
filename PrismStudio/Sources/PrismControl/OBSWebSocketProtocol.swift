@@ -84,6 +84,25 @@ public enum OBSWS {
         return Data(SHA256.hash(data: Data((secret + challenge).utf8))).base64EncodedString()
     }
 
+    /// Constant-time string equality for the auth check: folds the length check
+    /// and every byte comparison into a single accumulator so it never
+    /// short-circuits on the first mismatch, denying an attacker a timing oracle
+    /// on how many leading characters of the expected auth response matched.
+    public static func constantTimeEquals(_ a: String, _ b: String) -> Bool {
+        let ab = Array(a.utf8)
+        let bb = Array(b.utf8)
+        var diff = UInt8(ab.count == bb.count ? 0 : 1)
+        let n = Swift.max(ab.count, bb.count)
+        var i = 0
+        while i < n {
+            let x = i < ab.count ? ab[i] : 0
+            let y = i < bb.count ? bb[i] : 0
+            diff |= (x ^ y)
+            i += 1
+        }
+        return diff == 0
+    }
+
     /// Random base64 token for Hello's salt/challenge.
     public static func randomToken() -> String {
         var bytes = [UInt8](repeating: 0, count: 32)
@@ -120,9 +139,43 @@ public enum OBSWS {
     }
 
     public static func encodeEnvelope(_ envelope: Envelope) -> Data {
-        // Payloads are built from JSON-safe values only; treat failure as fatal in debug.
-        (try? JSONSerialization.data(withJSONObject: ["op": envelope.op.rawValue, "d": envelope.d]))
-            ?? Data("{}".utf8)
+        let object: [String: Any] = ["op": envelope.op.rawValue, "d": envelope.d]
+        if let data = try? JSONSerialization.data(withJSONObject: object) { return data }
+        // A value slipped through un-sanitized (e.g. a non-finite Double that
+        // JSONSerialization rejects). Retry with a sanitized payload so the client
+        // still gets a WELL-FORMED envelope carrying its requestId (L2) instead of
+        // a bare `{}` that discards the whole response.
+        let sanitized: [String: Any] = ["op": envelope.op.rawValue, "d": sanitizedForJSON(envelope.d)]
+        if let data = try? JSONSerialization.data(withJSONObject: sanitized) { return data }
+        // Last resort: a valid envelope preserving the op (and requestId, if any).
+        var minimal: [String: Any] = ["op": envelope.op.rawValue]
+        var inner: [String: Any] = [:]
+        if let id = envelope.d["requestId"] as? String { inner["requestId"] = id }
+        minimal["d"] = inner
+        return (try? JSONSerialization.data(withJSONObject: minimal))
+            ?? Data("{\"op\":\(envelope.op.rawValue),\"d\":{}}".utf8)
+    }
+
+    /// Recursively replaces JSON-illegal numbers (non-finite `Double`/`Float`, or
+    /// NSNumber-wrapped non-finite doubles) with `0` so a single NaN/inf backend
+    /// field can't collapse the whole response to `{}` (L2). Applied at the
+    /// response-mapping boundary (`requestResponse`/`event`) and again as a
+    /// backstop in `encodeEnvelope`.
+    static func sanitizedForJSON(_ value: Any) -> Any {
+        switch value {
+        case let dict as [String: Any]:
+            return dict.mapValues { sanitizedForJSON($0) }
+        case let array as [Any]:
+            return array.map { sanitizedForJSON($0) }
+        case let n as NSNumber:
+            // Swift Double/Float/Int/Bool all bridge to NSNumber here. Only a
+            // non-finite FLOATING value is illegal for JSON; replace just those
+            // with 0 and leave everything else (integers, bools, finite doubles)
+            // EXACTLY as-is so numeric types and precision are preserved.
+            return n.doubleValue.isFinite ? value : 0.0
+        default:
+            return value
+        }
     }
 
     // MARK: Message builders (pure)
@@ -144,7 +197,7 @@ public enum OBSWS {
 
     public static func event(type: String, intent: EventSubscription, data: [String: Any]?) -> Envelope {
         var d: [String: Any] = ["eventType": type, "eventIntent": intent.rawValue]
-        if let data { d["eventData"] = data }
+        if let data { d["eventData"] = sanitizedForJSON(data) }
         return Envelope(op: .event, d: d)
     }
 
@@ -161,7 +214,9 @@ public enum OBSWS {
             "requestId": requestId,
             "requestStatus": status,
         ]
-        if let responseData { d["responseData"] = responseData }
+        // Sanitize at the mapping boundary: a non-finite backend double (NaN/inf
+        // congestion, fps, …) must not make the whole response un-encodable (L2).
+        if let responseData { d["responseData"] = sanitizedForJSON(responseData) }
         return Envelope(op: .requestResponse, d: d)
     }
 

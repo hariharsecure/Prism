@@ -146,9 +146,11 @@ public final class AutoDirector {
         // more than the staleness window has stopped emitting (unplugged / frozen)
         // and must not be rankable — otherwise its last high signal out-ranks the
         // live active source forever and we cut to a dead source. A signal with a
-        // non-finite PTS can't be aged out, so it stays eligible.
+        // non-finite PTS can't be aged out, so it is treated as STALE too (L1):
+        // otherwise a source that emits one NaN/inf-PTS signal then vanishes would
+        // stay cuttable forever.
         let fresh = signals.filter { sig in
-            guard sig.pts.seconds.isFinite else { return true }
+            guard sig.pts.seconds.isFinite else { return false }
             return clock - sig.pts.seconds <= config.stalenessSeconds
         }
 

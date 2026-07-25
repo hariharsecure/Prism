@@ -168,6 +168,12 @@ public final class ControlServer: @unchecked Sendable {
         var salt: String = ""
         var incomingMessages: UInt64 = 0
         var outgoingMessages: UInt64 = 0
+        /// Tail of this session's serial request chain (M1). Each op-6 request
+        /// awaits the previous request's task before touching the backend and
+        /// before emitting its response, so a client's ordered requests
+        /// (e.g. StopStream then StartStream) apply and respond in requestId order
+        /// instead of interleaving. Confined to the server `queue`.
+        var requestTail: Task<Void, Never>?
         init(connection: NWConnection) { self.connection = connection }
     }
 
@@ -286,7 +292,8 @@ public final class ControlServer: @unchecked Sendable {
         if let password {
             let expected = OBSWS.authResponse(password: password, salt: session.salt,
                                               challenge: session.challenge)
-            guard let presented = d["authentication"] as? String, presented == expected else {
+            guard let presented = d["authentication"] as? String,
+                  OBSWS.constantTimeEquals(presented, expected) else {
                 log.warning("client failed authentication")
                 return close(session, reason: .authenticationFailed)
             }
@@ -312,47 +319,62 @@ public final class ControlServer: @unchecked Sendable {
             return
         }
         let requestData = d["requestData"] as? [String: Any] ?? [:]
-
-        guard Self.supportedRequests.contains(type) else {
-            send(OBSWS.requestResponse(requestType: type, requestId: id, code: .unknownRequestType),
-                 to: session)
-            return
-        }
-        guard let backend = _backend else {
-            send(OBSWS.requestResponse(requestType: type, requestId: id, code: .notReady,
-                                       comment: "No engine attached."), to: session)
-            return
-        }
-
-        // GetVersion + per-session stats need no backend hop and answer inline.
-        if type == "GetVersion" {
-            send(OBSWS.requestResponse(requestType: type, requestId: id, code: .success,
-                                       responseData: Self.versionPayload()), to: session)
-            return
-        }
-
+        // Snapshot everything the response needs off the queue-confined session.
+        let backend = _backend
         let sessionIn = session.incomingMessages
         let sessionOut = session.outgoingMessages
-        Task { [weak self, weak session] in
-            let envelope: OBSWS.Envelope
-            do {
-                let responseData = try await Self.execute(type, requestData: requestData,
-                                                          backend: backend,
-                                                          sessionMessages: (sessionIn, sessionOut))
-                envelope = OBSWS.requestResponse(requestType: type, requestId: id,
-                                                 code: .success, responseData: responseData)
-            } catch {
-                let mapped = OBSWS.statusIncludingFieldErrors(for: error)
-                envelope = OBSWS.requestResponse(requestType: type, requestId: id,
-                                                 code: mapped.code, comment: mapped.comment)
-            }
+
+        // Chain this request behind the session's previous one so ordered requests
+        // apply and respond in requestId order (M1). An independent Task per request
+        // could interleave — a StopStream then StartStream could leave the stream
+        // STARTED when the user meant stopped, and responses could arrive out of
+        // order. Because the previous task enqueues its `sendRaw` before it
+        // completes, awaiting it also preserves response ordering on `queue`.
+        let previous = session.requestTail
+        session.requestTail = Task { [weak self, weak session] in
+            await previous?.value
+            guard let self else { return }
+            let envelope = await Self.responseEnvelope(type: type, id: id, requestData: requestData,
+                                                       backend: backend,
+                                                       sessionMessages: (sessionIn, sessionOut))
             // Serialize off-queue (pure), deliver the Sendable bytes on-queue.
             let payload = OBSWS.encodeEnvelope(envelope)
-            guard let self else { return }
             self.queue.async { [weak session] in
                 guard let session else { return }
                 self.sendRaw(payload, to: session)
             }
+        }
+    }
+
+    /// Computes the op-7 response for one request. Pure with respect to the server
+    /// (no session/connection mutation) so the serial chain in `handleRequest` can
+    /// run it off-queue. Preserves the original dispatch order:
+    /// unsupported → no-backend → GetVersion (inline) → backend `execute`.
+    static func responseEnvelope(type: String, id: String, requestData: [String: Any],
+                                 backend: ControlBackend?,
+                                 sessionMessages: (incoming: UInt64, outgoing: UInt64)) async -> OBSWS.Envelope {
+        guard Self.supportedRequests.contains(type) else {
+            return OBSWS.requestResponse(requestType: type, requestId: id, code: .unknownRequestType)
+        }
+        guard let backend else {
+            return OBSWS.requestResponse(requestType: type, requestId: id, code: .notReady,
+                                         comment: "No engine attached.")
+        }
+        // GetVersion needs no backend hop and answers inline.
+        if type == "GetVersion" {
+            return OBSWS.requestResponse(requestType: type, requestId: id, code: .success,
+                                         responseData: Self.versionPayload())
+        }
+        do {
+            let responseData = try await Self.execute(type, requestData: requestData,
+                                                      backend: backend,
+                                                      sessionMessages: sessionMessages)
+            return OBSWS.requestResponse(requestType: type, requestId: id,
+                                         code: .success, responseData: responseData)
+        } catch {
+            let mapped = OBSWS.statusIncludingFieldErrors(for: error)
+            return OBSWS.requestResponse(requestType: type, requestId: id,
+                                         code: mapped.code, comment: mapped.comment)
         }
     }
 

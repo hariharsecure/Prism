@@ -28,6 +28,19 @@ public enum SurfaceAction: Hashable, Codable, Sendable {
         if case .setGain = self { return true }
         return false
     }
+
+    /// Structural validity of an action decoded from an untrusted source (an
+    /// imported/persisted MIDI map). A `switchScene` with a NEGATIVE index would
+    /// crash the app the moment it is used to index the scene list, so such a
+    /// binding is rejected at import. The UPPER bound (index < sceneCount) is the
+    /// consumer's responsibility — it alone knows the live scene count — but the
+    /// lower bound can and must be enforced here.
+    var isStructurallyValid: Bool {
+        switch self {
+        case .switchScene(let index): return index >= 0
+        default: return true
+        }
+    }
 }
 
 /// The persisted, versioned form of a mapping (Codable). Bindings are stored
@@ -67,7 +80,11 @@ public struct MIDIActionMap: Sendable {
 
     public init(_ mapping: SurfaceMapping) {
         bindings = [:]
-        for b in mapping.bindings { bindings[b.trigger] = b.action }
+        // Drop structurally-invalid bindings (e.g. a negative switchScene index)
+        // rather than importing a binding that would crash the scene-list index.
+        for b in mapping.bindings where b.action.isStructurallyValid {
+            bindings[b.trigger] = b.action
+        }
     }
 
     // MARK: Editing
