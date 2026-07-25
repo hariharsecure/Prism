@@ -80,6 +80,10 @@ public struct MediaFragmenter: Sendable {
 public struct DeviceClockSync: Sendable {
     private var estimator: ClockSkewEstimator
     private var bestRTTNanos: Int64?
+    /// Pings this device actually sent and has not yet matched to a pong
+    /// (seq + echoed t1). A pong is only trusted if it correlates to one of
+    /// these; unsolicited/spoofed pongs never reach the clock math.
+    private var outstanding: [(seq: UInt32, t1: Int64)] = []
     public private(set) var acceptedSamples = 0
     public private(set) var rejectedSamples = 0
 
@@ -87,9 +91,33 @@ public struct DeviceClockSync: Sendable {
     /// accepted (bootstrap); after that, outlier rejection applies.
     public let minSamplesBeforeFiltering: Int
 
+    /// Cap on tracked-but-unanswered pings (bounds memory under a pong flood
+    /// and drops correlation records the peer never answered).
+    private let maxOutstanding: Int
+
+    /// A round-trip beyond this is physically implausible on a LAN and marks a
+    /// garbage/hostile sample (legitimate LAN RTT is sub-millisecond).
+    private static let maxPlausibleRTTNanos: Int64 = 10_000_000_000 // 10 s
+    /// House−device offset magnitude ceiling. Generous (well above real clock
+    /// disagreement) — its only job is to fence off wildly hostile values that
+    /// would poison the regression; the overflow-safe math + seq correlation
+    /// are the primary defenses.
+    private static let maxPlausibleOffsetNanos: Int64 = 1_000_000_000_000_000 // ~11.6 days
+
     public init(window: Int = 64, minSamplesBeforeFiltering: Int = 4) {
         self.estimator = ClockSkewEstimator(window: window)
         self.minSamplesBeforeFiltering = minSamplesBeforeFiltering
+        self.maxOutstanding = max(2, window)
+    }
+
+    /// Record a ping this device just sent so a later pong echoing the same
+    /// (seq, t1) can be correlated and trusted. Must be called for every ping
+    /// actually transmitted.
+    public mutating func registerPing(seq: UInt32, t1: Int64) {
+        outstanding.append((seq, t1))
+        if outstanding.count > maxOutstanding {
+            outstanding.removeFirst(outstanding.count - maxOutstanding)
+        }
     }
 
     /// Ingest one pong. `t4` = device clock at pong receipt (same clock that
@@ -97,18 +125,52 @@ public struct DeviceClockSync: Sendable {
     ///
     /// offset = ((t2 − t1) + (t3 − t4)) / 2  (house − device)
     /// rtt    = (t4 − t1) − (t3 − t2)
+    ///
+    /// All timestamp fields are attacker-controlled (JSON, reached pre-auth),
+    /// so every subtraction is overflow-checked and rejected rather than
+    /// trapped, and the pong must correlate to a ping we actually sent.
     @discardableResult
     public mutating func ingest(pong: LinkClockPong, receivedAtDeviceNanos t4: Int64) -> Bool {
-        let rtt = (t4 - pong.t1) - (pong.t3 - pong.t2)
-        guard rtt >= 0 else {
+        // 1. Correlation: only a pong echoing an outstanding ping's (seq, t1)
+        //    is trusted. Consume the match so a replay is dropped too.
+        guard let matchIndex = outstanding.firstIndex(where: {
+            $0.seq == pong.seq && $0.t1 == pong.t1
+        }) else {
             rejectedSamples += 1
             return false
         }
-        let offset = ((pong.t2 - pong.t1) + (pong.t3 - t4)) / 2
+        outstanding.remove(at: matchIndex)
+
+        // 2. Overflow-safe rtt = (t4 − t1) − (t3 − t2). Identical to the
+        //    trapping form for valid input; rejects (never traps) on overflow.
+        let (a, oa) = t4.subtractingReportingOverflow(pong.t1)
+        let (b, ob) = pong.t3.subtractingReportingOverflow(pong.t2)
+        guard !oa, !ob else { rejectedSamples += 1; return false }
+        let (rtt, orc) = a.subtractingReportingOverflow(b)
+        guard !orc else { rejectedSamples += 1; return false }
+        guard rtt >= 0, rtt <= Self.maxPlausibleRTTNanos else {
+            rejectedSamples += 1
+            return false
+        }
+
+        // 3. Overflow-safe offset = ((t2 − t1) + (t3 − t4)) / 2.
+        let (c, oc) = pong.t2.subtractingReportingOverflow(pong.t1)
+        let (d, od) = pong.t3.subtractingReportingOverflow(t4)
+        guard !oc, !od else { rejectedSamples += 1; return false }
+        let (sum, os) = c.addingReportingOverflow(d)
+        guard !os else { rejectedSamples += 1; return false }
+        let offset = sum / 2
+        // `.magnitude` (not `abs`) so an Int64.min offset does not itself trap.
+        guard offset.magnitude <= UInt64(Self.maxPlausibleOffsetNanos) else {
+            rejectedSamples += 1
+            return false
+        }
+
         let best = bestRTTNanos.map { min($0, rtt) } ?? rtt
         bestRTTNanos = best
         // A sample whose RTT is far above the best seen went through a queue
         // somewhere; its one-way asymmetry bound is too loose to trust.
+        // (rtt is bounded above, so best * 2 + … cannot overflow here.)
         if acceptedSamples >= minSamplesBeforeFiltering, rtt > best * 2 + 1_000_000 {
             rejectedSamples += 1
             return false

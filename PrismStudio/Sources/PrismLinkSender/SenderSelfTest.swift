@@ -231,6 +231,7 @@ public enum SenderSelfTest {
             let t2 = houseAt(device: arriveDevice)
             let t3 = t2 + processing
             let t4 = arriveDevice + processing + downlink
+            sync.registerPing(seq: UInt32(i), t1: t1)
             let accepted = sync.ingest(pong: LinkClockPong(seq: UInt32(i), t1: t1, t2: t2, t3: t3),
                                        receivedAtDeviceNanos: t4)
             if !accepted { rejected += 1 }

@@ -60,15 +60,38 @@ public struct ClockSkewEstimator: Sendable {
     private var samples: [(deviceNanos: Int64, offsetNanos: Int64)] = []
     private let window: Int
 
+    /// Plausibility fence for a peer-reported clock field. Both device epoch
+    /// nanos (wall-clock in 2026 ≈ 1.75e18) and house−device offset live far
+    /// below this; values above it are garbage/hostile (a paired peer sending
+    /// ±5e18 would overflow the regression's Int64 math), so they never enter
+    /// the window. Comfortably under Int64.max so any later difference of two
+    /// admitted samples also cannot overflow.
+    static let maxPlausibleNanos: Int64 = 4_000_000_000_000_000_000 // ~126 years of ns
+
     public init(window: Int = 64) {
         self.window = max(2, window)
     }
 
+    /// Ingest one (device time, offset) measurement. Fields are attacker-
+    /// controlled (LinkStats JSON), so implausible magnitudes are dropped
+    /// rather than admitted; valid samples are stored unchanged.
     public mutating func add(deviceNanos: Int64, offsetNanos: Int64) {
+        // `.magnitude` (not `abs`) so Int64.min does not itself trap.
+        let bound = UInt64(Self.maxPlausibleNanos)
+        guard deviceNanos.magnitude <= bound, offsetNanos.magnitude <= bound else { return }
         samples.append((deviceNanos, offsetNanos))
         if samples.count > window {
             samples.removeFirst(samples.count - window)
         }
+    }
+
+    /// Rounds a Double to Int64, never trapping on NaN/±inf/out-of-range
+    /// (clamps to the representable range; 0 for NaN).
+    private static func safeInt64(_ d: Double) -> Int64 {
+        let r = d.rounded()
+        if let v = Int64(exactly: r) { return v }
+        if r.isNaN { return 0 }
+        return r > 0 ? Int64.max : Int64.min
     }
 
     public var sampleCount: Int { samples.count }
@@ -84,15 +107,28 @@ public struct ClockSkewEstimator: Sendable {
         }
         // Center on the first sample to keep the math well-conditioned
         // (nanosecond epochs are ~1e18; squaring them loses precision).
+        // Difference in Int64 first (exact, small — byte-identical to the old
+        // path for valid input) but fall back to a Double subtraction on the
+        // rare overflow instead of trapping.
         let x0 = samples[0].deviceNanos
         let y0 = samples[0].offsetNanos
-        let points = samples.map { (x: Double($0.deviceNanos - x0), y: Double($0.offsetNanos - y0)) }
+        let points = samples.map { s in
+            (x: Self.centered(s.deviceNanos, x0), y: Self.centered(s.offsetNanos, y0))
+        }
         guard let fit = linearFit(points) else {
             return Estimate(offsetNanos: last.offsetNanos, atDeviceNanos: at, skewPPM: 0,
                             sampleCount: samples.count)
         }
-        let predicted = fit.slope * Double(at - x0) + fit.intercept + Double(y0)
-        return Estimate(offsetNanos: Int64(predicted.rounded()), atDeviceNanos: at,
+        let predicted = fit.slope * Self.centered(at, x0) + fit.intercept + Double(y0)
+        return Estimate(offsetNanos: Self.safeInt64(predicted), atDeviceNanos: at,
                         skewPPM: fit.slope * 1_000_000, sampleCount: samples.count)
+    }
+
+    /// `Double(v − origin)`, overflow-safe: exact for admitted samples (whose
+    /// difference cannot overflow Int64), Double-subtracts rather than trapping
+    /// otherwise.
+    private static func centered(_ v: Int64, _ origin: Int64) -> Double {
+        let (diff, overflow) = v.subtractingReportingOverflow(origin)
+        return overflow ? (Double(v) - Double(origin)) : Double(diff)
     }
 }

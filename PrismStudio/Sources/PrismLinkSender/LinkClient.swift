@@ -680,7 +680,11 @@ public final class LinkClient: @unchecked Sendable {
     private func sendClockPing() {
         if burstRemaining > 0 { burstRemaining -= 1 }
         pingSeq &+= 1
-        sendControl(.clockPing, LinkClockPing(seq: pingSeq, t1: LinkClock.houseNanos()))
+        let ping = LinkClockPing(seq: pingSeq, t1: LinkClock.houseNanos())
+        // Record before sending so the matching pong correlates (a pong that
+        // does not echo a ping we sent is dropped in ingest).
+        clockSync.registerPing(seq: ping.seq, t1: ping.t1)
+        sendControl(.clockPing, ping)
     }
 
     /// Telemetry the server folds into its skew view + HUD: current clock

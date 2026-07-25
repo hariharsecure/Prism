@@ -99,7 +99,7 @@ let package = Package(
                 "PrismCompositor", "PrismAudio", "PrismAnimation", "PrismColor",
                 "PrismVision", "PrismSources", "PrismExport", "PrismCompose",
                 "PrismOutput", "PrismControlSurface", "PrismControl", "PrismProximity", "PrismDirector", "PrismSound",
-                "PrismCapture", "PrismScreen", "PrismLink", "PrismVirtualCam", "PrismAVTestKit",
+                "PrismCapture", "PrismScreen", "PrismLink", "PrismLinkSender", "PrismVirtualCam", "PrismAVTestKit",
             ],
             swiftSettings: v5
         ),
