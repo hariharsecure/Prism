@@ -48,7 +48,14 @@ public final class ISORecorderBank: @unchecked Sendable {
         var deferred: [SourceID: DeferredSource] = [:]
         var recorders: [SourceID: MovieRecorder] = [:]
         var startTime: CMTime?
+        /// Monotonic timestamp of the last deferred-materialize error log, so a
+        /// per-frame retry storm (a persistent disk-full / permissions fault at
+        /// 30–60 fps) cannot flood the log. See `materializeErrorLogIntervalNanos`.
+        var lastMaterializeErrorLogNanos: UInt64 = 0
     }
+
+    /// Minimum spacing between deferred-materialize failure logs (1 s).
+    private static let materializeErrorLogIntervalNanos: UInt64 = 1_000_000_000
 
     /// Seam for constructing recorders (failure injection in headless
     /// verification; production uses `MovieRecorder.init`).
@@ -291,7 +298,33 @@ public final class ISORecorderBank: @unchecked Sendable {
                 recorder.cancel()
                 return nil
             } catch {
-                log.error("deferred ISO recorder for \(id.raw, privacy: .public) failed to start (first frame \(frame.width)×\(frame.height)): \(String(describing: error), privacy: .public)")
+                // RESTORE the claimed descriptor under the lock so a LATER frame
+                // retries. The claim (`s.deferred[id] = nil`) happened before this
+                // FALLIBLE creation; without restoring it, a single transient
+                // first-frame failure (disk-full / too-many-open-files /
+                // permissions, or a bad 0×0 first frame → invalid settings) would
+                // leave recorders[id]==nil && deferred[id]==nil ⇒ `.none` forever,
+                // so the angle would silently record NOTHING for the whole session
+                // even after conditions recover. Only restore while still recording
+                // (a concurrent finishAll may have flipped to .finished) and only if
+                // no recorder was installed. Rate-limit the log to avoid a per-frame
+                // retry-storm flood.
+                // TODO: surface a `.failed` per-angle status to the UI HUD — there is
+                // no recorder to read `MovieRecorder.State` from while unmaterialized.
+                let shouldLog: Bool = lock.withLock { s in
+                    if s.state == .recording, s.recorders[id] == nil {
+                        s.deferred[id] = d
+                    }
+                    let now = DispatchTime.now().uptimeNanoseconds
+                    if now &- s.lastMaterializeErrorLogNanos >= Self.materializeErrorLogIntervalNanos {
+                        s.lastMaterializeErrorLogNanos = now
+                        return true
+                    }
+                    return false
+                }
+                if shouldLog {
+                    log.error("deferred ISO recorder for \(id.raw, privacy: .public) failed to start (first frame \(frame.width)×\(frame.height)) — descriptor restored, will retry on a later frame: \(String(describing: error), privacy: .public)")
+                }
                 return nil
             }
         }

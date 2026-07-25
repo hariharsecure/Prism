@@ -384,6 +384,12 @@ public final class MixerChannel: @unchecked Sendable {
                     timing.withLock { $0.gaps += 1 }
                     if alreadyRenderedPause {
                         state.needsAbsolutePlacement = true
+                        // A house-time forward restart wants ~zero offset. Clear any
+                        // stale rebase left by an EARLIER backward-PTS jump whose
+                        // placement never cleared it (e.g. trim-debt retry) — otherwise
+                        // this restart packet is misplaced by the stale offset (spurious
+                        // ~1 s silence, or the whole packet trimmed/dropped).
+                        state.ptsAdjustment = .zero
                         log.notice("ingest: \(String(format: "%.1f", gap * 1_000)) ms source restart from \(self.id.raw, privacy: .public) — re-aligned to house time")
                     } else {
                         let silenceFrames = Int((min(gap, Self.maxGapSilenceSeconds)
@@ -415,6 +421,12 @@ public final class MixerChannel: @unchecked Sendable {
             }
             let adjustedPTS = CMTimeAdd(pts, state.ptsAdjustment)
             placeAbsolutely(buffer, pts: adjustedPTS, state: &state)
+            // The rebase offset was computed for THIS one packet. Once the packet is
+            // actually placed (absolute mode cleared), drop it so it never bleeds
+            // onto a later absolute placement (e.g. a forward source-restart). A
+            // trim-debt retry keeps `needsAbsolutePlacement` true and re-maps the
+            // next packet afresh, so it must retain the offset — hence the guard.
+            if !state.needsAbsolutePlacement { state.ptsAdjustment = .zero }
         }
     }
 
