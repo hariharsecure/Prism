@@ -885,13 +885,36 @@ public final class MovieSource: VideoSource, AudioSource, @unchecked Sendable {
         return .stopped
     }
 
+    /// Build the single house-time timing entry for a re-stamped audio buffer.
+    ///
+    /// The PTS is `target` (house time). Crucially the duration is converted into
+    /// the SAME timescale as `target` so the emitted `AudioPacket` is timescale-
+    /// COHERENT. `target` is house time (the host clock, timescale ≈ 1e9) while a
+    /// file's native audio `duration` is in the sample-rate timescale (48 000); a
+    /// timing entry that mixes the two makes a RAW multitrack/ISO recorder
+    /// (`AudioTrackRecorder`, which bypasses the resampling `AudioMixer`) mux a
+    /// bogus multi-hundred-second track duration with mostly unreadable samples.
+    /// The conversion to `target.timescale` (host clock ≈ 1e9) is loss-free to
+    /// sub-nanosecond, so the mixer path (which resamples off the PTS + PCM) sees
+    /// byte-equivalent timing. `.invalid`/non-numeric duration passes through.
+    static func houseAudioTiming(target: CMTime, duration: CMTime) -> CMSampleTimingInfo {
+        let coherentDuration: CMTime
+        if duration.isNumeric, target.timescale != 0, duration.timescale != target.timescale {
+            coherentDuration = CMTimeConvertScale(duration, timescale: target.timescale, method: .default)
+        } else {
+            coherentDuration = duration.isNumeric ? duration : .invalid
+        }
+        return CMSampleTimingInfo(duration: coherentDuration,
+                                  presentationTimeStamp: target,
+                                  decodeTimeStamp: .invalid)
+    }
+
     /// Copy `sample` with its presentation timestamp replaced by `target` (house
-    /// time), preserving duration. One uniform timing entry re-stamps the whole
-    /// buffer. Falls back to the original buffer if the copy fails.
+    /// time), the duration re-expressed in `target`'s timescale so the buffer's
+    /// timing is COHERENT (see `houseAudioTiming`). One uniform timing entry
+    /// re-stamps the whole buffer. Falls back to the original buffer if the copy fails.
     private func retimed(_ sample: CMSampleBuffer, to target: CMTime, duration: CMTime) -> CMSampleBuffer {
-        var timing = CMSampleTimingInfo(duration: duration.isNumeric ? duration : .invalid,
-                                        presentationTimeStamp: target,
-                                        decodeTimeStamp: .invalid)
+        var timing = Self.houseAudioTiming(target: target, duration: duration)
         var out: CMSampleBuffer?
         let status = CMSampleBufferCreateCopyWithNewTiming(
             allocator: kCFAllocatorDefault, sampleBuffer: sample,

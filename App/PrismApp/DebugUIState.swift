@@ -19,7 +19,7 @@ enum PrismDebugUIState {
     static let allStates = [
         "empty", "one-test-source", "inspector-camera", "mixer-expanded",
         "soundboard", "memes", "destinations-sheet", "review-finish",
-        "studio", "multiview", "engine-fault", "getting-started",
+        "studio", "multiview", "engine-fault", "getting-started", "movie-feed",
     ]
 
     /// Apply `name` to `engine`. Engine/UserDefaults mutations happen immediately;
@@ -44,6 +44,21 @@ enum PrismDebugUIState {
         // lastAddedVideoSourceID, which ContentView auto-selects → Inspector fills.
         func addTestSource() { engine.addTextSource(text: "PRISM {time}", fontSize: 120, color: .white) }
 
+        // A REAL decoded video file fed through the production MovieSource path, so
+        // a screenshot shows the actual compositor rendering real frames (the
+        // simulated-camera visual pass). The path comes from PRISM_DEBUG_MOVIE_FILE
+        // so no asset path is baked in; missing/unset falls back to the generated
+        // source (still a non-empty monitor).
+        func addMovieFeed() {
+            if let p = ProcessInfo.processInfo.environment["PRISM_DEBUG_MOVIE_FILE"],
+               !p.isEmpty, FileManager.default.fileExists(atPath: p) {
+                engine.addMovieSource(fileURL: URL(fileURLWithPath: p), loop: true)
+            } else {
+                NSLog("PRISM_DEBUG_UI_STATE[movie-feed]: PRISM_DEBUG_MOVIE_FILE unset/missing — using generated source")
+                addTestSource()
+            }
+        }
+
         switch name {
         case "empty", "getting-started":
             break
@@ -64,6 +79,8 @@ enum PrismDebugUIState {
             engine.studioMode = true              // dual preview/program layout
         case "multiview":
             addTestSource()
+        case "movie-feed":
+            addMovieFeed()
         case "engine-fault":
             // The status-line error surface (spec's "lastError set"). `engineFault`
             // is private(set); lastError is the public, view-mutated error channel.
