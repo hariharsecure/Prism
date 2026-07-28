@@ -87,14 +87,64 @@ final class MemoryGovernorTests: XCTestCase {
     }
 
     func testSourceCostRisesWithEffectsAndResolution() {
-        let noFX = MemoryCostModel.estimateWorstCase(for: .addSource(resolution: .uhd4k, effectsEnabled: false))
-        let withFX = MemoryCostModel.estimateWorstCase(for: .addSource(resolution: .uhd4k, effectsEnabled: true))
-        XCTAssertGreaterThan(withFX, noFX)                 // effects add the effect pool
-        // Base pool = 4 buffers * 4K BGRA frame.
-        XCTAssertEqual(noFX, 4 * (3840 * 2160 * 4))
-        // A 4K source costs strictly more than a 1080p one.
-        let hd = MemoryCostModel.estimateWorstCase(for: .addSource(resolution: .hd1080, effectsEnabled: true))
+        // Base pool = 4 buffers * 4K BGRA frame — the resident cost of a plain source.
+        let base = MemoryCostModel.estimateWorstCase(
+            for: .addSource(resolution: .uhd4k, effectsEnabled: false, effectsActive: false))
+        XCTAssertEqual(base, 4 * (3840 * 2160 * 4))
+        // A live effect chain charges the effect pool ON TOP → strictly more.
+        let withFX = MemoryCostModel.estimateWorstCase(
+            for: .addSource(resolution: .uhd4k, effectsEnabled: true, effectsActive: true))
+        XCTAssertGreaterThan(withFX, base)
+        // A 4K effect-laden source costs strictly more than a 1080p one.
+        let hd = MemoryCostModel.estimateWorstCase(
+            for: .addSource(resolution: .hd1080, effectsEnabled: true, effectsActive: true))
         XCTAssertGreaterThan(withFX, hd)
+    }
+
+    /// The conditional effect overhead (closes the observed 0.727 over-estimate):
+    /// a source whose effect pipeline merely EXISTS but runs an identity chain
+    /// (effectsActive == false) is charged the base pool ONLY — the same as a
+    /// source with no pipeline. The overhead is charged only when a non-trivial
+    /// chain is actually active (BOTH flags true).
+    func testSourceEffectOverheadIsConditionalOnActiveChain() {
+        let base = MemoryCostModel.estimateWorstCase(
+            for: .addSource(resolution: .uhd4k, effectsEnabled: false, effectsActive: false))
+        // Pipeline present but idle → base only (the freshly-added-source case).
+        let idlePipeline = MemoryCostModel.estimateWorstCase(
+            for: .addSource(resolution: .uhd4k, effectsEnabled: true, effectsActive: false))
+        XCTAssertEqual(idlePipeline, base)
+        // effectsActive with the pipeline disabled also charges nothing (BOTH required).
+        let disabledButActive = MemoryCostModel.estimateWorstCase(
+            for: .addSource(resolution: .uhd4k, effectsEnabled: false, effectsActive: true))
+        XCTAssertEqual(disabledButActive, base)
+        // Only a live chain (both true) adds the effect pool.
+        let active = MemoryCostModel.estimateWorstCase(
+            for: .addSource(resolution: .uhd4k, effectsEnabled: true, effectsActive: true))
+        XCTAssertGreaterThan(active, idlePipeline)
+        // The plain source is now the lower estimate → ratio moves toward ~1.0.
+        XCTAssertLessThan(idlePipeline, active)
+    }
+
+    /// Dedicated cost entries for the stream encoder and the meme cache.
+    func testStreamEncodeAndMemeCacheCosts() {
+        // Stream encode = encoder pool + bounded writer queue at the stream bitrate.
+        let stream6 = MemoryCostModel.estimateWorstCase(
+            for: .streamEncode(resolution: .uhd4k, bitrate: 6_000_000))
+        // Same encoder+queue SHAPE as a program record at the same resolution, but a
+        // lower (6 Mbps vs 12 Mbps) writer-queue tail → costs no more than a record.
+        let record = MemoryCostModel.estimateWorstCase(for: .startProgramRecord(resolution: .uhd4k))
+        XCTAssertGreaterThan(stream6, 0)
+        XCTAssertLessThanOrEqual(stream6, record)
+        // A non-positive bitrate falls back to the 6 Mbps default (never 0-cost).
+        let streamDefault = MemoryCostModel.estimateWorstCase(
+            for: .streamEncode(resolution: .uhd4k, bitrate: 0))
+        XCTAssertEqual(streamDefault, stream6)
+        // Meme cache reports its REAL aggregate byte total (not a proxy), clamped ≥ 0.
+        XCTAssertEqual(MemoryCostModel.estimateWorstCase(for: .memeCache(aggregateBytes: 700 * MiB)), 700 * MiB)
+        XCTAssertEqual(MemoryCostModel.estimateWorstCase(for: .memeCache(aggregateBytes: -1)), 0)
+        // The kinds book into the expected classes.
+        XCTAssertEqual(AdmissionKind.streamEncode(resolution: .uhd4k, bitrate: 6_000_000).loadClass, .streamEncode)
+        XCTAssertEqual(AdmissionKind.memeCache(aggregateBytes: 0).loadClass, .memeCache)
     }
 
     // MARK: - Admission: the three outcomes
@@ -295,6 +345,91 @@ final class MemoryGovernorTests: XCTestCase {
                     }
                 }
             }
+        }
+    }
+
+    // MARK: - v1b enforce admission (refuse only at hard, only refusable classes)
+
+    func testRefusableSetIsExactlyISOSourceAndReplay() {
+        for c in LoadClass.allCases {
+            let expected = (c == .isoAngle || c == .sourceCaptureRes || c == .replayBuffer)
+            XCTAssertEqual(c.isRefusable, expected, "\(c).isRefusable")
+        }
+        // Every refusable class is a commitment; no cache or sacrosanct is refusable.
+        for c in LoadClass.allCases where c.isRefusable {
+            XCTAssertTrue(c.isCommitment)
+            XCTAssertFalse(c.isSacrosanct)
+            XCTAssertFalse(c.isCache)
+        }
+    }
+
+    func testEnforceRefusesISOAtHardLimitButNotProgramRecord() {
+        let ram = 8 * GiB
+        let hard = MemoryGovernor.computeBudget(physicalRAM: ram).hardLimit
+        // Fill the ledger right up to the hard limit with a sacrosanct class so any
+        // further add's projected total crosses it.
+        let snap: [LoadClass: Int64] = [.streamEncode: hard]
+        let add: Int64 = 256 * MiB
+
+        // A refusable ISO angle at/over hard → REFUSE, with a positive gap + remedy.
+        let iso = AdmissionRequest(loadClass: .isoAngle, worstCaseBytes: add)
+        guard case let .refuse(gap, remedy) = MemoryGovernor.enforceAdmission(
+            request: iso, snapshot: snap, physicalRAM: ram) else {
+            return XCTFail("expected ISO to be refused at the hard limit")
+        }
+        XCTAssertGreaterThan(gap, 0)
+        XCTAssertFalse(remedy.targetClass.isSacrosanct)
+
+        // The SAME pressure must NOT refuse the sacrosanct program record — the show
+        // is protected over a new commitment but never blocked itself. It warns.
+        let rec = AdmissionRequest(loadClass: .programRecord, worstCaseBytes: add)
+        XCTAssertEqual(MemoryGovernor.enforceAdmission(request: rec, snapshot: snap, physicalRAM: ram), .warn)
+        // Stream encode is likewise never refused.
+        let stream = AdmissionRequest(loadClass: .streamEncode, worstCaseBytes: add)
+        XCTAssertEqual(MemoryGovernor.enforceAdmission(request: stream, snapshot: snap, physicalRAM: ram), .warn)
+    }
+
+    func testEnforceWarnsInSoftBandNeverRefuses() {
+        let ram = 8 * GiB
+        let b = MemoryGovernor.computeBudget(physicalRAM: ram)
+        // Sit just above soft but below hard: projected in [soft, hard).
+        let snap: [LoadClass: Int64] = [.sourceCaptureRes: b.softLimit]
+        let add: Int64 = 16 * MiB
+        XCTAssertLessThan(b.softLimit + add, b.hardLimit)   // still under hard
+        // Even a REFUSABLE class only warns in the soft band — never refuses.
+        let iso = AdmissionRequest(loadClass: .isoAngle, worstCaseBytes: add)
+        XCTAssertEqual(MemoryGovernor.enforceAdmission(request: iso, snapshot: snap, physicalRAM: ram), .warn)
+    }
+
+    func testEnforceAllowsWithHugeHeadroom() {
+        // A normal single-source session on a big machine: enormous headroom → allow.
+        let ram = 128 * GiB
+        let snap: [LoadClass: Int64] = [.sourceCaptureRes: 130 * MiB]  // one 4K source
+        let add = AdmissionRequest(kind: .addSource(resolution: .uhd4k, effectsEnabled: true, effectsActive: false))
+        XCTAssertEqual(MemoryGovernor.enforceAdmission(request: add, snapshot: snap, physicalRAM: ram), .allow)
+    }
+
+    func testEnforceKillSwitchAlwaysAllows() {
+        let ram = 8 * GiB
+        let hard = MemoryGovernor.computeBudget(physicalRAM: ram).hardLimit
+        let snap: [LoadClass: Int64] = [.streamEncode: hard]
+        // Even a refusable class over the hard limit is allowed when enforcement is off.
+        let iso = AdmissionRequest(loadClass: .isoAngle, worstCaseBytes: 512 * MiB)
+        XCTAssertEqual(
+            MemoryGovernor.enforceAdmission(request: iso, snapshot: snap, physicalRAM: ram, enforcementEnabled: false),
+            .allow)
+    }
+
+    func testEnforceInstanceWrapperUsesLiveLedger() {
+        let ram = 8 * GiB
+        let hard = MemoryGovernor.computeBudget(physicalRAM: ram).hardLimit
+        let gov = MemoryGovernor(physicalRAM: ram)
+        // Empty ledger → an ISO arm allows.
+        XCTAssertEqual(gov.enforceAdmission(kind: .startISOAngle(resolution: .hd1080), enforcementEnabled: true), .allow)
+        // Load the ledger to the hard limit → the same arm is now refused.
+        gov.ledger.register(ResourceAccount(id: "stream", loadClass: .streamEncode, residentBytes: hard))
+        guard case .refuse = gov.enforceAdmission(kind: .startISOAngle(resolution: .uhd4k), enforcementEnabled: true) else {
+            return XCTFail("expected refusal once the live ledger is at the hard limit")
         }
     }
 

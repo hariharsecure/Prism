@@ -82,6 +82,20 @@ public enum LoadClass: String, CaseIterable, Sendable, Hashable {
         }
     }
 
+    /// The classes a v1b-enforce admission gate may REFUSE up-front at the hard
+    /// limit — exactly the user-add commitments that have an add-site and can be
+    /// safely declined without harming the running show: an extra source, an ISO
+    /// angle, or arming the replay ring. The primary program record and the live
+    /// stream are NEVER in this set (protect the show over a new commitment, but
+    /// never block the show itself). `liveEffectQuality` has no user add-site, so
+    /// it is degraded (with consent), never refused, and is excluded here.
+    public var isRefusable: Bool {
+        switch self {
+        case .isoAngle, .sourceCaptureRes, .replayBuffer: return true
+        default: return false
+        }
+    }
+
     /// Silently degradable. The only bytes admission is allowed to auto-reclaim.
     public var isCache: Bool { !isSacrosanct && !isCommitment }
 
@@ -109,12 +123,24 @@ public enum Resolution: Sendable, Equatable, Hashable {
 }
 
 /// A user-initiated add whose worst-case resident cost we estimate before
-/// admitting it. Exactly the four sites v1b will wire.
+/// admitting it. One case per wired add-site.
 public enum AdmissionKind: Sendable, Equatable {
     case startISOAngle(resolution: Resolution)
-    case addSource(resolution: Resolution, effectsEnabled: Bool)
+    /// `effectsEnabled` — the source's effect pipeline exists; `effectsActive` —
+    /// a NON-TRIVIAL effect chain is actually running. The ~47.5 MiB (4K) effect
+    /// pool is charged only when BOTH hold: a freshly-added source has an identity
+    /// chain (effectsActive == false) and costs ~base-pool only (closes the
+    /// observed 0.727 over-estimate); a source carrying live effects stays
+    /// worst-case-high.
+    case addSource(resolution: Resolution, effectsEnabled: Bool, effectsActive: Bool)
     case enableReplay(durationSec: Double, bitrate: Int64)
     case startProgramRecord(resolution: Resolution)
+    /// Outbound stream encoder — same encoder+queue shape as a record, at the
+    /// stream bitrate (6 Mbps default). Sacrosanct: warned, never refused.
+    case streamEncode(resolution: Resolution, bitrate: Int64)
+    /// The animated-meme decoded-frame LRU, reported against its REAL aggregate
+    /// byte total (not a proxy). A cache: shed silently, never refused.
+    case memeCache(aggregateBytes: Int64)
 
     /// The ledger class this add books into.
     public var loadClass: LoadClass {
@@ -123,6 +149,8 @@ public enum AdmissionKind: Sendable, Equatable {
         case .addSource:         return .sourceCaptureRes
         case .enableReplay:      return .replayBuffer
         case .startProgramRecord: return .programRecord
+        case .streamEncode:      return .streamEncode
+        case .memeCache:         return .memeCache
         }
     }
 }
@@ -194,9 +222,12 @@ public enum MemoryCostModel {
     /// Worst-case resident bytes for a user-initiated add.
     public static func estimateWorstCase(for kind: AdmissionKind) -> Int64 {
         switch kind {
-        case let .addSource(res, effects):
+        case let .addSource(res, effectsEnabled, effectsActive):
+            // Base capture pool always resident; the effect pool is charged only
+            // when a non-trivial chain is actually running (effectsEnabled AND
+            // effectsActive). A plain source estimates ~base-pool → ratio ≈ 1.0.
             let base = sourcePoolBuffers * frameBytes(res)
-            let fx = effects ? effectOverheadBytes(res) : 0
+            let fx = (effectsEnabled && effectsActive) ? effectOverheadBytes(res) : 0
             return base + fx
 
         case let .startISOAngle(res):
@@ -207,6 +238,16 @@ public enum MemoryCostModel {
         case let .startProgramRecord(res):
             return encoderPoolBuffers * frameBytes(res)
                 + writerQueueBytes(bitrate: defaultRecordBitrate)
+
+        case let .streamEncode(res, bitrate):
+            // Same encoder+queue shape as a record, at the stream bitrate.
+            let br = bitrate > 0 ? bitrate : defaultStreamBitrate
+            return encoderPoolBuffers * frameBytes(res)
+                + writerQueueBytes(bitrate: br)
+
+        case let .memeCache(aggregateBytes):
+            // Report against the cache's REAL aggregate decoded-byte total.
+            return max(0, aggregateBytes)
 
         case let .enableReplay(durationSec, bitrate):
             guard durationSec > 0, bitrate > 0 else { return 0 }
@@ -270,6 +311,22 @@ public enum AdmissionDecision: Sendable, Equatable {
     /// Won't fit even after dropping every cache. Reports the residual gap, which
     /// commitment/sacrosanct classes are being protected, and a real remedy.
     case refuse(gapBytes: Int64, protecting: [LoadClass], remedy: RemedySuggestion)
+}
+
+/// The v1b-ENFORCE admission outcome, with SAFE DEFAULTS. Distinct from the
+/// stricter `AdmissionDecision` (which refuses at the SOFT limit): enforcement
+/// refuses ONLY at the HARD limit (near-OOM) and ONLY for `isRefusable` classes,
+/// so an imprecise cost estimate can never spuriously block a normal add. Soft
+/// pressure only WARNS.
+public enum EnforceDecision: Sendable, Equatable {
+    /// Plenty of headroom (or enforcement disabled) — perform the add.
+    case allow
+    /// Projected use is in the soft band — allow the add, but raise a passive
+    /// warning so the UI can surface an 80% banner. Never blocks.
+    case warn
+    /// At/over the hard limit AND a refusable class — decline the add up-front
+    /// with a concrete remedy. Never returned for a non-refusable class.
+    case refuse(gapBytes: Int64, remedy: RemedySuggestion)
 }
 
 // MARK: - Degrade
@@ -466,6 +523,33 @@ public final class MemoryGovernor: @unchecked Sendable {
         return .refuse(gapBytes: gap, protecting: protecting, remedy: remedy)
     }
 
+    /// v1b-ENFORCE admission with SAFE DEFAULTS (the wired app path). Pure +
+    /// deterministic like `admit`, but with the enforcement policy baked in:
+    ///   • enforcement disabled           → `.allow` (kill-switch honored here too)
+    ///   • refusable class, projected ≥ hard → `.refuse` (near-OOM, up-front, with remedy)
+    ///   • otherwise projected ≥ soft      → `.warn` (passive banner, never blocks)
+    ///   • else                            → `.allow`
+    /// Never refuses a non-refusable class (`.programRecord`/`.streamEncode` and
+    /// every cache) — the primary show is protected over a new commitment, but the
+    /// show itself is never blocked.
+    public static func enforceAdmission(request: AdmissionRequest,
+                                        snapshot: [LoadClass: Int64],
+                                        physicalRAM: Int64,
+                                        fraction: Double = 0.5,
+                                        enforcementEnabled: Bool = true) -> EnforceDecision {
+        guard enforcementEnabled else { return .allow }
+        let budget = computeBudget(physicalRAM: physicalRAM, fraction: fraction)
+        let currentTotal = snapshot.values.reduce(0, +)
+        let projected = currentTotal + max(0, request.worstCaseBytes)
+
+        if request.loadClass.isRefusable, projected >= budget.hardLimit {
+            let gap = projected - budget.hardLimit
+            return .refuse(gapBytes: gap, remedy: remedy(snapshot: snapshot))
+        }
+        if projected >= budget.softLimit { return .warn }
+        return .allow
+    }
+
     /// A real, ledger-derived reclaim the user can choose. Prefers the cheapest
     /// commitment to the user (shorten the ephemeral replay), then stopping an
     /// ISO angle, then closing a source. Never proposes a sacrosanct class.
@@ -569,6 +653,15 @@ public final class MemoryGovernor: @unchecked Sendable {
 
     public func admit(kind: AdmissionKind) -> AdmissionDecision {
         admit(AdmissionRequest(kind: kind))
+    }
+
+    /// Instance `enforceAdmission` — snapshots the live ledger. `enforcementEnabled`
+    /// is passed by the caller (the app gates it on the kill-switch env var).
+    public func enforceAdmission(kind: AdmissionKind, enforcementEnabled: Bool) -> EnforceDecision {
+        Self.enforceAdmission(request: AdmissionRequest(kind: kind),
+                              snapshot: ledger.snapshot(),
+                              physicalRAM: physicalRAM, fraction: fraction,
+                              enforcementEnabled: enforcementEnabled)
     }
 
     /// Run degrade, record shed rungs, and append `DegradeEvent`s stamped with

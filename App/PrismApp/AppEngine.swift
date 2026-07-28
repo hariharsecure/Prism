@@ -1427,10 +1427,11 @@ final class AppEngine: ObservableObject {
         // ACTUAL: the SourceRenderCanvas render pool — minimumBufferCount BGRA frames
         // at the program-canvas resolution.
         let actual = Self.ledgerSourcePoolBuffers * Self.ledgerFrameBytes(w, h)
-        // ESTIMATE: worst-case add cost WITH effects (a per-source effect pipeline is
-        // always created), so the log surfaces the effect-overhead assumption.
+        // ESTIMATE: a per-source effect pipeline is always CREATED but a freshly-added
+        // source runs an identity chain, so `effectsActive: false` charges the base
+        // pool only — matching the actual (closes the observed 0.727 over-estimate).
         let estimate = MemoryCostModel.estimateWorstCase(
-            for: .addSource(resolution: ledgerCanvasResolution, effectsEnabled: true))
+            for: .addSource(resolution: ledgerCanvasResolution, effectsEnabled: true, effectsActive: false))
         ledgerRegister(id: "source.\(id.raw)", loadClass: .sourceCaptureRes,
                        actual: actual, estimate: estimate)
     }
@@ -1441,9 +1442,232 @@ final class AppEngine: ObservableObject {
     /// (memeCache has no admission-kind cost entry — a v1b-enforce gap to note).
     private func ledgerSyncMemeCache() {
         let actual = Int64(animatedMemeDecodedBytes)
-        let estimate = Int64(Self.animatedMemeAggregateByteBudget)
+        // Dedicated meme-cache cost entry (v1b-enforce): the aggregate hard ceiling
+        // this LRU is bounded to — closes the "memeCache has no admission-kind cost
+        // entry" gap the observe pass flagged.
+        let estimate = MemoryCostModel.estimateWorstCase(
+            for: .memeCache(aggregateBytes: Int64(Self.animatedMemeAggregateByteBudget)))
         ledgerRegister(id: "memeCache", loadClass: .memeCache, actual: actual, estimate: estimate)
     }
+
+    // MARK: - Memory governor ENFORCEMENT (G1 v1b-ENFORCE)
+    //
+    // Turns the wired+validated MemoryGovernor ON with SAFE DEFAULTS:
+    //   • OS memory-pressure → auto-degrade the caches+replay on ACTUAL bytes.
+    //   • admission → refuse ONLY at the HARD limit (near-OOM) and ONLY for the
+    //     refusable commitments (ISO / extra source / replay). The primary program
+    //     record and the live stream are NEVER refused (warn only). Soft-band
+    //     pressure warns, never refuses (no false refusals from cost imprecision).
+    // Kill-switch: PRISM_DISABLE_MEM_GOVERNOR=1 disables ALL enforcement (ledger
+    // population stays unconditional). The gauge/dialog UI is a separate follow-up
+    // (enforce-ui); here refusals surface only via `lastError` (Fable's framing).
+
+    /// Coarse headroom state for the enforce-ui banner/gauge (this step only
+    /// publishes it — no UI is built here).
+    enum MemoryHeadroomState: String, Sendable { case ok, warn, critical }
+
+    /// Enforcement master switch: ON by default; the env kill-switch forces it off.
+    let memoryGovernorEnforcement: Bool =
+        ProcessInfo.processInfo.environment["PRISM_DISABLE_MEM_GOVERNOR"] != "1"
+
+    /// Coarse ok/warn/critical headroom, derived from the live ledger vs budget.
+    @Published private(set) var memoryHeadroomState: MemoryHeadroomState = .ok
+    /// Passive soft-band flag (enforce-ui reads it for an 80% banner). Never blocks.
+    @Published private(set) var memoryWarning = false
+
+    /// A minimal ledger snapshot for enforce-ui (no UI built here).
+    struct MemoryLedgerSnapshot: Sendable, Equatable {
+        var totalBytes: Int64
+        var softLimit: Int64
+        var hardLimit: Int64
+        var budgetTotal: Int64
+    }
+    var memoryLedgerSnapshot: MemoryLedgerSnapshot {
+        let b = memoryGovernor.budget
+        return MemoryLedgerSnapshot(totalBytes: memoryGovernor.ledger.totalBytes,
+                                    softLimit: b.softLimit, hardLimit: b.hardLimit,
+                                    budgetTotal: b.total)
+    }
+    /// Recent auto-degrade events (from the governor's own log) for the session log.
+    var recentDegradeEvents: [DegradeEvent] { memoryGovernor.degradeLog }
+
+    /// The installed OS memory-pressure source (nil when enforcement is off).
+    private var memoryPressureSource: DispatchSourceMemoryPressure?
+    /// True while the replay ring is suspended BY the governor (vs the user), so a
+    /// hysteresis-gated restore re-arms only what pressure took, and never flaps.
+    private var governorSuspendedReplay = false
+    /// True while the governor itself is re-arming/shrinking/suspending the replay
+    /// ring, so the admission gate in `setReplayArmed` doesn't refuse the governor's
+    /// OWN (smaller / restorative) re-arm.
+    private var governorInternalReplayChange = false
+    /// Governor housekeeping timer (belt hard-limit check + hysteresis restore +
+    /// headroom refresh). Installed only when enforcement is on.
+    private var governorTickTimer: Timer?
+
+    /// Human label for a refused add, for the Fable-framed `lastError`.
+    private static func governorThingName(_ cls: LoadClass) -> String {
+        switch cls {
+        case .isoAngle:        return "ISO angle"
+        case .sourceCaptureRes: return "source"
+        case .replayBuffer:    return "instant replay"
+        default:               return "capture"
+        }
+    }
+
+    private static func governorMiB(_ bytes: Int64) -> Int {
+        max(0, Int((Double(bytes) / (1024.0 * 1024.0)).rounded()))
+    }
+
+    /// Enforce admission for `kind`. Returns `true` iff the add must be REFUSED
+    /// (only ever at the hard limit and only for a refusable class). Sets a
+    /// Fable-framed `lastError` on refusal and the passive `memoryWarning` flag in
+    /// the soft band. No-op pass-through (returns false) when enforcement is off.
+    @discardableResult
+    private func governorRefuses(_ kind: AdmissionKind) -> Bool {
+        let decision = memoryGovernor.enforceAdmission(
+            kind: kind, enforcementEnabled: memoryGovernorEnforcement)
+        switch decision {
+        case .allow:
+            updateHeadroomState()
+            return false
+        case .warn:
+            memoryWarning = true
+            updateHeadroomState()
+            return false
+        case let .refuse(gapBytes, remedy):
+            let thing = Self.governorThingName(kind.loadClass)
+            lastError = "Not enough headroom for a \(thing) — starting it now would risk "
+                + "your recording and live stream. Free ~\(Self.governorMiB(gapBytes)) MiB: \(remedy.message)"
+            NSLog("[MEMGOV] REFUSED %@ gap=%dMiB remedy=%@",
+                  kind.loadClass.rawValue, Self.governorMiB(gapBytes), remedy.message)
+            updateHeadroomState()
+            return true
+        }
+    }
+
+    /// Recompute the published headroom state + soft-band flag from the LIVE ledger.
+    private func updateHeadroomState() {
+        let total = memoryGovernor.ledger.totalBytes
+        let b = memoryGovernor.budget
+        let state: MemoryHeadroomState =
+            total >= b.hardLimit ? .critical : (total >= b.softLimit ? .warn : .ok)
+        if memoryHeadroomState != state { memoryHeadroomState = state }
+        let warn = total >= b.softLimit
+        if memoryWarning != warn { memoryWarning = warn }
+    }
+
+    /// Install the OS memory-pressure source (warning|critical). On each event it
+    /// runs `governor.degrade` and APPLIES the returned actions on the main actor.
+    /// Gated on the enforcement flag; installs without crashing (nil device / test
+    /// harness safe — it only reads env + creates a dispatch source).
+    private func installMemoryPressureSource() {
+        guard memoryGovernorEnforcement else { return }
+        let source = DispatchSource.makeMemoryPressureSource(
+            eventMask: [.warning, .critical], queue: .main)
+        source.setEventHandler { [weak self, weak source] in
+            guard let self, let source else { return }
+            let event = source.data
+            let level: PressureLevel = event.contains(.critical) ? .critical : .warning
+            self.handleMemoryPressure(level)
+        }
+        source.resume()
+        memoryPressureSource = source
+
+        // Housekeeping: a light 2s tick for the belt hard-limit degrade, the
+        // hysteresis-gated replay restore, and the headroom refresh.
+        governorTickTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.governorTick() }
+        }
+        updateHeadroomState()
+    }
+
+    /// React to an OS memory-pressure event: degrade + apply on ACTUAL bytes.
+    private func handleMemoryPressure(_ pressure: PressureLevel) {
+        guard memoryGovernorEnforcement else { return }
+        let actions = memoryGovernor.degrade(pressure: pressure, now: ProcessInfo.processInfo.systemUptime)
+        applyDegradeActions(actions, reason: "os-pressure=\(pressure)")
+        updateHeadroomState()
+    }
+
+    /// Periodic housekeeping (enforcement on): a belt hard-limit degrade even
+    /// without an OS event, a hysteresis-gated restore of a governor-suspended
+    /// replay, and the headroom refresh.
+    private func governorTick() {
+        guard memoryGovernorEnforcement else { return }
+        // Belt: if OUR ledger is at/over the hard limit, degrade regardless of OS
+        // pressure (governor.degrade treats over-hard as critical under .normal).
+        let overHard = memoryGovernor.ledger.totalBytes >= memoryGovernor.budget.hardLimit
+        if overHard {
+            let actions = memoryGovernor.degrade(pressure: .normal, now: ProcessInfo.processInfo.systemUptime)
+            applyDegradeActions(actions, reason: "ledger-over-hard")
+        } else if governorSuspendedReplay, memoryGovernor.canRestore() {
+            // Pressure has relieved past the hysteresis band → re-arm the replay the
+            // governor suspended (restores the user's original intent, no flapping).
+            governorSuspendedReplay = false
+            if !replayArmed {
+                NSLog("[MEMGOV] restore: re-arming governor-suspended replay (hysteresis cleared)")
+                governorInternalReplayChange = true
+                setReplayArmed(true)
+                governorInternalReplayChange = false
+            }
+        }
+        updateHeadroomState()
+    }
+
+    /// Apply degrade actions to the REAL app state (meme LRU + replay ring). A
+    /// belt-and-suspenders guard rejects any action targeting a sacrosanct class
+    /// (the governor already guarantees this).
+    private func applyDegradeActions(_ actions: [DegradeAction], reason: String) {
+        for action in actions {
+            assert(!action.loadClass.isSacrosanct, "degrade produced a sacrosanct action")
+            guard !action.loadClass.isSacrosanct else { continue }
+            switch action {
+            case let .shrinkMemeCache(toBytes):
+                governorShrinkMemeCache(toBytes: toBytes)
+            case let .shrinkReplay(toSeconds):
+                governorShrinkReplay(toSeconds: toSeconds)
+            case .suspendReplay:
+                governorSuspendReplay()
+            }
+            NSLog("[MEMGOV] applied %@ reason=%@", String(describing: action), reason)
+        }
+    }
+
+    /// rung 1 — evict oldest animated memes until the decoded-byte total is at/under
+    /// `ceiling`. Acts on ACTUAL decoded bytes via the existing LRU.
+    private func governorShrinkMemeCache(toBytes ceiling: Int64) {
+        while Int64(animatedMemeDecodedBytes) > ceiling, let victim = animatedMemeLRU.first {
+            evictAnimatedSource(victim)                 // removes from the LRU + syncs the ledger
+            if animatedMemeLRU.first == victim { break } // safety: victim didn't leave → stop
+        }
+        ledgerSyncMemeCache()
+    }
+
+    /// rung 4 (soft) — shrink the replay ring to `seconds` by re-arming at the shorter
+    /// window (drops the actual ring bytes). No-op if replay is off or already shorter.
+    private func governorShrinkReplay(toSeconds seconds: Double) {
+        guard replayArmed, replayLengthSeconds > seconds else { return }
+        governorInternalReplayChange = true
+        defer { governorInternalReplayChange = false }
+        setReplayLength(seconds)   // re-arms the ring at the shorter window
+    }
+
+    /// rung 4 (hard) — suspend the replay ring entirely, remembering the governor did
+    /// so (for the hysteresis-gated restore).
+    private func governorSuspendReplay() {
+        guard replayArmed else { return }
+        governorSuspendedReplay = true
+        governorInternalReplayChange = true
+        defer { governorInternalReplayChange = false }
+        setReplayArmed(false)      // releases the replay ledger account + ring bytes
+    }
+
+    #if DEBUG
+    /// Test hook: drive an OS-pressure event through the real degrade+apply path.
+    func _test_handleMemoryPressure(_ level: PressureLevel) { handleMemoryPressure(level) }
+    /// Test hook: run one governor housekeeping tick (belt degrade + hysteresis restore).
+    func _test_governorTick() { governorTick() }
+    #endif
 
     /// Source URL of an ORDINARY (non-meme) animated GIF, kept so a victim evicted to
     /// admit a replacement can be RE-ADMITTED if the replacement's decode fails (sol #4
@@ -2320,6 +2544,29 @@ final class AppEngine: ObservableObject {
         restorePersistedSettings()                     // transition kind/enable/duration + stinger
         restorePersistedSources()                      // source persistence: reopen the saved show's sources
 
+        // G1 v1b-ENFORCE: install the OS memory-pressure auto-degrade source (ON by
+        // default; the PRISM_DISABLE_MEM_GOVERNOR kill-switch skips it). Purely
+        // defensive — acts on ACTUAL ledger bytes, touching only caches + replay.
+        installMemoryPressureSource()
+
+        #if DEBUG
+        // Debug-only: pre-fill the ledger with a synthetic sacrosanct account so a
+        // live run can PROVE the hard-limit admission refusal fires (the 4 GiB budget
+        // floor makes it otherwise unreachable in a normal session). `HARD` fills to
+        // the hard limit exactly; a numeric value is MiB. INERT unless the env is set.
+        if let fill = env["PRISM_DEBUG_MEMGOV_FILL"] {
+            let hard = memoryGovernor.budget.hardLimit
+            let bytes: Int64 = (fill == "HARD") ? hard : ((Int64(fill) ?? 0) * 1024 * 1024)
+            if bytes > 0 {
+                memoryGovernor.ledger.register(ResourceAccount(
+                    id: "debug.memgov.fill", loadClass: .compositor, residentBytes: bytes))
+                NSLog("[MEMGOV] DEBUG synthetic fill = %.1fMiB (hard=%.1fMiB)",
+                      Double(bytes) / 1048576.0, Double(hard) / 1048576.0)
+                updateHeadroomState()
+            }
+        }
+        #endif
+
         // G1 v1b-observe (debug-only): dump the full MemoryGovernor ledger snapshot +
         // totals + budget every 2s so a run can validate the cost model against the
         // actual populated bytes. INERT: read-only, no admission/degrade is ever run.
@@ -2679,6 +2926,10 @@ final class AppEngine: ObservableObject {
         streamConnectTask?.cancel()
         isoStatusTimer?.invalidate()
         replayStatusTimer?.invalidate()
+        // G1 v1b-enforce: tear down the OS memory-pressure source + governor tick.
+        memoryPressureSource?.cancel()
+        memoryPressureSource = nil
+        governorTickTimer?.invalidate(); governorTickTimer = nil
         // Integrations: stop MIDI input, auto-director, and BLE discovery.
         directorAudioInjectTimer?.invalidate()
         directorTap.install(nil)
@@ -3061,6 +3312,10 @@ final class AppEngine: ObservableObject {
 
     func addCamera(_ descriptor: SourceDescriptor) {
         guard !isActive(SourceID(descriptor.id)) else { return }
+        // G1 v1b-enforce: refuse a new source ONLY at the hard limit (near-OOM). No-op
+        // add + Fable-framed lastError; warns (never refuses) in the soft band.
+        guard !governorRefuses(.addSource(resolution: ledgerCanvasResolution,
+                                          effectsEnabled: true, effectsActive: false)) else { return }
         do {
             let source = try CameraSource(deviceID: descriptor.id)
             let mailbox = FrameMailbox()
@@ -3132,6 +3387,9 @@ final class AppEngine: ObservableObject {
     func addScreen(_ descriptor: SourceDescriptor, captureAudio: Bool = true) {
         let sid = SourceID(descriptor.id)
         guard !isActive(sid) else { return }
+        // G1 v1b-enforce: refuse a new source ONLY at the hard limit (near-OOM).
+        guard !governorRefuses(.addSource(resolution: ledgerCanvasResolution,
+                                          effectsEnabled: true, effectsActive: false)) else { return }
         do {
             // sol #5 #3: request the 10-bit HDR capture path when the show is HDR —
             // pre-fix the App always built a default (preferHDR=false) config, so a
@@ -3350,6 +3608,10 @@ final class AppEngine: ObservableObject {
     /// channel (folded into the master mix). A missing/undecodable file surfaces
     /// via `lastError` — never a crash.
     func addMovieSource(fileURL: URL, loop: Bool = true) {
+        // G1 v1b-enforce: refuse a new source ONLY at the hard limit (near-OOM). Done
+        // before taking the security scope so a refusal leaks nothing.
+        guard !governorRefuses(.addSource(resolution: ledgerCanvasResolution,
+                                          effectsEnabled: true, effectsActive: false)) else { return }
         // Unlike ImageSource (which caches its frame synchronously so the scope can
         // be released immediately), MovieSource streams from disk for its whole
         // lifetime. In a sandboxed build the security-scoped grant must therefore be
@@ -4491,6 +4753,10 @@ final class AppEngine: ObservableObject {
     func startRecording() throws {
         guard !didShutdown else { return } // Codex #4: don't attach outputs after shutdown
         guard recorder == nil else { return }
+        // G1 v1b-enforce: the program record is SACROSANCT — never refused (protect the
+        // show over a new commitment, but never block the show itself). This only
+        // raises the passive soft-band warning; it can never return early / throw.
+        governorRefuses(.startProgramRecord(resolution: ledgerCanvasResolution))
         let directory = URL(filePath: NSHomeDirectory()).appending(path: "Movies/Prism")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         // sol HIGH #1 (data loss): a second-resolution name let two rapid Records
@@ -4760,6 +5026,33 @@ final class AppEngine: ObservableObject {
         // Only video sources still present can be ISO-recorded.
         let armed = activeSources.filter { $0.isVideo && isoArmedSourceIDs.contains($0.id) }
         guard !armed.isEmpty else { return }
+
+        // G1 v1b-enforce: ISO angles are a REFUSABLE commitment. If the aggregate ISO
+        // writer cost would push us to the hard limit, DECLINE the ISO bank (skip it)
+        // but let the sacrosanct program record proceed — protect the show over the
+        // extra angles, never block the record itself. Estimated as the sum of the
+        // armed angles' per-angle native-resolution writer cost.
+        if memoryGovernorEnforcement {
+            let isoBytes = armed.reduce(Int64(0)) { acc, source in
+                let fmt = isoTap.formats.format(for: source.id)
+                let w = fmt?.width ?? canvasConfig.width
+                let h = fmt?.height ?? canvasConfig.height
+                return acc + MemoryCostModel.estimateWorstCase(
+                    for: .startISOAngle(resolution: .custom(width: w, height: h)))
+            }
+            let req = AdmissionRequest(loadClass: .isoAngle, worstCaseBytes: isoBytes)
+            if case let .refuse(gap, remedy) = MemoryGovernor.enforceAdmission(
+                request: req, snapshot: memoryGovernor.ledger.snapshot(),
+                physicalRAM: memoryGovernor.physicalRAM, fraction: memoryGovernor.fraction,
+                enforcementEnabled: true) {
+                lastError = "Not enough headroom for ISO angles — recording them now would "
+                    + "risk your program recording and live stream. The program record is still "
+                    + "rolling. Free ~\(Self.governorMiB(gap)) MiB: \(remedy.message)"
+                NSLog("[MEMGOV] REFUSED isoAngle bank gap=%dMiB (program record continues)", Self.governorMiB(gap))
+                updateHeadroomState()
+                return
+            }
+        }
 
         // Per-take subfolder so a later take's `iso-<source>.mov` never lands on
         // (and overwrites) an earlier take's file (sol HIGH #1).
@@ -5040,6 +5333,14 @@ final class AppEngine: ObservableObject {
     func setReplayArmed(_ armed: Bool) {
         guard armed != replayArmed else { return }
         if armed {
+            // G1 v1b-enforce: refuse arming the replay ring ONLY at the hard limit
+            // (near-OOM). Skipped when the governor itself is re-arming (its own
+            // smaller/restorative re-arm must not be blocked).
+            if !governorInternalReplayChange,
+               governorRefuses(.enableReplay(durationSec: replayLengthSeconds,
+                                             bitrate: Self.ledgerReplayBitrate)) {
+                return
+            }
             let buffer = ReplayBuffer(seconds: replayLengthSeconds)
             // HDR sink-parity (Stage O): an HDR show buffers 10-bit HEVC Main10 /
             // Rec.2020-HLG so a saved replay matches the HDR recording (was 8-bit
@@ -5914,6 +6215,9 @@ final class AppEngine: ObservableObject {
             return
         }
         guard streamEncoder == nil, !isStreaming else { return }
+        // G1 v1b-enforce: the live stream is SACROSANCT — never refused. Raise the
+        // passive soft-band warning only (can never return early).
+        governorRefuses(.streamEncode(resolution: ledgerCanvasResolution, bitrate: Self.ledgerStreamBitrate))
         // #9: only PUBLISHABLE destinations (enabled + non-empty URL) are brought
         // up — an enabled BLANK destination can't publish and must not make a
         // destinations-only broadcast falsely report "live".
@@ -5984,17 +6288,16 @@ final class AppEngine: ObservableObject {
         rtmpOutput = rtmp
         self.broadcaster = broadcaster
         streamStartDate = Date()
-        // G1 v1b-observe: record the stream encoder pool bytes. ACTUAL uses the real
-        // stream resolution (canvas) + stream bitrate (6 Mbps) writer queue. streamEncode
-        // has no dedicated cost-model AdmissionKind, so the ESTIMATE uses the nearest
-        // entry (program-record encoder, 12 Mbps writer queue) — the mismatch is a
-        // v1b-enforce tuning signal (no stream-class cost entry yet).
+        // G1 v1b-enforce: record the stream encoder pool bytes. ACTUAL uses the real
+        // stream resolution (canvas) + stream bitrate (6 Mbps) writer queue, and the
+        // ESTIMATE now uses the DEDICATED `.streamEncode` cost entry at the same
+        // bitrate (was the nearest program-record proxy).
         do {
             let actual = Self.ledgerEncoderPoolBuffers
                 * Self.ledgerFrameBytes(canvasConfig.width, canvasConfig.height)
                 + Self.ledgerWriterQueueBytes(bitrate: Self.ledgerStreamBitrate)
             let estimate = MemoryCostModel.estimateWorstCase(
-                for: .startProgramRecord(resolution: ledgerCanvasResolution))
+                for: .streamEncode(resolution: ledgerCanvasResolution, bitrate: Self.ledgerStreamBitrate))
             ledgerRegister(id: "stream", loadClass: .streamEncode, actual: actual, estimate: estimate)
         }
         // 2f/#9: enter the streaming lifecycle at REQUESTED (`.preparing`). A
