@@ -1358,6 +1358,93 @@ final class AppEngine: ObservableObject {
     private var animatedMemeByteCost: [SourceID: Int] = [:]
     private var animatedMemeLRU: [SourceID] = []
     private var animatedMemeDecodedBytes: Int { animatedMemeByteCost.values.reduce(0, +) }
+
+    // MARK: - Memory governor ledger (G1 v1b-OBSERVE)
+    //
+    // INERT observe-only wiring: this ONLY records ACTUAL resident bytes into the
+    // (already-shipped, tested) MemoryGovernor ledger at each lifecycle seam, and —
+    // behind PRISM_DEBUG_MEMLEDGER=1 — logs the cost-model estimate vs the actual so
+    // the model can be validated before v1b-ENFORCE turns on admission/degrade.
+    // HARD RULE: nothing here calls `admit()`/`degrade()`, refuses an add, shrinks or
+    // suspends anything, or shows UI. Populating the ledger has no user-visible effect;
+    // only the NSLog + 2s snapshot dump are gated on the env flag.
+    let memoryGovernor = MemoryGovernor(physicalRAM: Int64(ProcessInfo.processInfo.physicalMemory))
+    /// Gate for the estimate-vs-actual + snapshot NSLogs (PRISM_DEBUG_MEMLEDGER=1).
+    private lazy var memLedgerDebug = ProcessInfo.processInfo.environment["PRISM_DEBUG_MEMLEDGER"] == "1"
+    /// The repeating 2s ledger-snapshot dumper (installed only under the debug flag).
+    private var memLedgerDumpTimer: Timer?
+    /// The ISO per-angle ledger account ids currently registered — released as a set
+    /// when the ISO bank is torn down (the stop seam doesn't re-derive the armed set).
+    private var ledgerISOAccounts: Set<String> = []
+
+    // Byte-cost constants for the REAL (measured) side of the estimate-vs-actual log.
+    // These mirror the pools actually created by the App so "actual" reflects the
+    // created resource, not a re-run of the cost model. Kept local because the cost
+    // model's internal constants (sourcePoolBuffers, frameBytes, …) are module-internal
+    // to PrismCore — only `estimateWorstCase` is public.
+    private static let ledgerBytesPerPixelBGRA: Int64 = 4          // kCVPixelFormatType_32BGRA
+    private static let ledgerSourcePoolBuffers: Int64 = 4          // SourceRenderCanvas.minimumBufferCount
+    private static let ledgerEncoderPoolBuffers: Int64 = 6         // VideoToolbox in-flight surfaces (record/ISO/stream)
+    private static let ledgerWriterQueueSeconds: Double = 2        // bounded muxer/writer backlog
+    private static let ledgerRecordBitrate: Int64 = 12_000_000     // MovieRecorder / ISO writer
+    private static let ledgerStreamBitrate: Int64 = 6_000_000      // ProgramEncoder stream
+    private static let ledgerReplayBitrate: Int64 = 12_000_000     // replay ring encoder (setReplayArmed)
+
+    private static func ledgerFrameBytes(_ width: Int, _ height: Int) -> Int64 {
+        Int64(max(0, width)) * Int64(max(0, height)) * ledgerBytesPerPixelBGRA
+    }
+    private static func ledgerWriterQueueBytes(bitrate: Int64) -> Int64 {
+        Int64((ledgerWriterQueueSeconds * Double(max(0, bitrate)) / 8.0).rounded(.up))
+    }
+
+    /// The current program-canvas resolution as a cost-model `Resolution`.
+    private var ledgerCanvasResolution: Resolution {
+        .custom(width: canvasConfig.width, height: canvasConfig.height)
+    }
+
+    /// Record an account's ACTUAL bytes in the ledger and (debug-only) log the
+    /// cost-model estimate alongside it. INERT — never gates behavior.
+    private func ledgerRegister(id: String, loadClass: LoadClass, actual: Int64, estimate: Int64) {
+        memoryGovernor.ledger.register(ResourceAccount(id: id, loadClass: loadClass, residentBytes: actual))
+        ledgerLogEstimateVsActual(loadClass: loadClass, id: id, actual: actual, estimate: estimate)
+    }
+
+    private func ledgerRelease(id: String) {
+        memoryGovernor.ledger.release(id: id)
+    }
+
+    private func ledgerLogEstimateVsActual(loadClass: LoadClass, id: String, actual: Int64, estimate: Int64) {
+        guard memLedgerDebug else { return }
+        let mib = { (b: Int64) in Double(b) / (1024.0 * 1024.0) }
+        let ratio = estimate > 0 ? Double(actual) / Double(estimate) : 0
+        NSLog("[MEMLEDGER] %@ %@ estimate=%.1fMiB actual=%.1fMiB ratio=%.3f",
+              loadClass.rawValue, id, mib(estimate), mib(actual), ratio)
+    }
+
+    /// Register/refresh a capture source's pool bytes (source add seams).
+    private func ledgerRegisterSource(_ id: SourceID) {
+        let w = canvasConfig.width, h = canvasConfig.height
+        // ACTUAL: the SourceRenderCanvas render pool — minimumBufferCount BGRA frames
+        // at the program-canvas resolution.
+        let actual = Self.ledgerSourcePoolBuffers * Self.ledgerFrameBytes(w, h)
+        // ESTIMATE: worst-case add cost WITH effects (a per-source effect pipeline is
+        // always created), so the log surfaces the effect-overhead assumption.
+        let estimate = MemoryCostModel.estimateWorstCase(
+            for: .addSource(resolution: ledgerCanvasResolution, effectsEnabled: true))
+        ledgerRegister(id: "source.\(id.raw)", loadClass: .sourceCaptureRes,
+                       actual: actual, estimate: estimate)
+    }
+
+    /// Keep the aggregate meme-cache account in step with the decoded-byte total.
+    /// Uses `register` (upsert) so the account exists on first meme without a
+    /// separate init. Estimate = the aggregate hard ceiling this cache is bounded to
+    /// (memeCache has no admission-kind cost entry — a v1b-enforce gap to note).
+    private func ledgerSyncMemeCache() {
+        let actual = Int64(animatedMemeDecodedBytes)
+        let estimate = Int64(Self.animatedMemeAggregateByteBudget)
+        ledgerRegister(id: "memeCache", loadClass: .memeCache, actual: actual, estimate: estimate)
+    }
+
     /// Source URL of an ORDINARY (non-meme) animated GIF, kept so a victim evicted to
     /// admit a replacement can be RE-ADMITTED if the replacement's decode fails (sol #4
     /// evict-before-decode rollback). Cleared in `removeSource`.
@@ -2233,6 +2320,28 @@ final class AppEngine: ObservableObject {
         restorePersistedSettings()                     // transition kind/enable/duration + stinger
         restorePersistedSources()                      // source persistence: reopen the saved show's sources
 
+        // G1 v1b-observe (debug-only): dump the full MemoryGovernor ledger snapshot +
+        // totals + budget every 2s so a run can validate the cost model against the
+        // actual populated bytes. INERT: read-only, no admission/degrade is ever run.
+        if env["PRISM_DEBUG_MEMLEDGER"] == "1" {
+            memLedgerDumpTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    let ledger = self.memoryGovernor.ledger
+                    let snap = ledger.snapshot()
+                    let total = ledger.totalBytes
+                    let b = self.memoryGovernor.budget
+                    let mib = { (x: Int64) in Double(x) / (1024.0 * 1024.0) }
+                    let parts = snap.sorted { $0.key.rawValue < $1.key.rawValue }
+                        .map { String(format: "%@=%.1fMiB", $0.key.rawValue, mib($0.value)) }
+                        .joined(separator: " ")
+                    NSLog("[MEMLEDGER] SNAPSHOT total=%.1fMiB budget=%.1fMiB soft=%.1fMiB hard=%.1fMiB | %@",
+                          mib(total), mib(b.total), mib(b.softLimit), mib(b.hardLimit),
+                          parts.isEmpty ? "(empty)" : parts)
+                }
+            }
+        }
+
         // Debug-only: auto-start the obs-websocket control server on TCP 4455 so
         // a headless loopback client can exercise the request surface without the
         // UI toggle. No-op in normal use.
@@ -2969,6 +3078,7 @@ final class AppEngine: ObservableObject {
             }
             register(ActiveSource(id: source.id, descriptor: descriptor,
                                   backing: .camera(source), mailbox: mailbox))
+            ledgerRegisterSource(source.id) // G1 v1b-observe: record actual pool bytes
         } catch {
             lastError = "Couldn't add \(descriptor.name): \(error.localizedDescription)"
         }
@@ -3082,6 +3192,7 @@ final class AppEngine: ObservableObject {
             }
             register(ActiveSource(id: source.id, descriptor: descriptor,
                                   backing: .screen(source), mailbox: mailbox))
+            ledgerRegisterSource(source.id) // G1 v1b-observe: record actual pool bytes
         } catch {
             lastError = "Couldn't add \(descriptor.name): \(error.localizedDescription)"
         }
@@ -3254,6 +3365,7 @@ final class AppEngine: ObservableObject {
             registerPersistableSourceFile(id: source.id, url: fileURL, isMovie: true, loop: loop)
             try registerMovie(source, descriptor: descriptor,
                               fileURL: fileURL, loop: loop, scoped: scoped)
+            ledgerRegisterSource(source.id) // G1 v1b-observe: record actual pool bytes
         } catch {
             if scoped { fileURL.stopAccessingSecurityScopedResource() }
             lastError = "Couldn't add video \(fileURL.lastPathComponent): \(error.localizedDescription)"
@@ -3977,6 +4089,8 @@ final class AppEngine: ObservableObject {
         animatedMemeByteCost[id] = nil
         animatedMemeLRU.removeAll { $0 == id }
         animatedGIFSourceURLs[id] = nil
+        ledgerRelease(id: "source.\(id.raw)") // G1 v1b-observe: source pool released
+        ledgerSyncMemeCache()                 // G1 v1b-observe: meme total may have dropped
         persistableSourceFiles[id] = nil // source persistence: drop the file identity on remove
         invalidatePendingStingerCue(for: id, drain: true)
         if activeStingerSourceID == id { cancelActiveStingerTransition() }
@@ -4419,6 +4533,17 @@ final class AppEngine: ObservableObject {
         fanOut.setRecorder(newRecorder, wantsAudio: hasAudio)
         isRecording = true
         recordStartDate = Date()
+        // G1 v1b-observe: record the program-record encoder pool bytes. ACTUAL uses the
+        // real record resolution (canvas) + record bitrate (12 Mbps) writer queue.
+        do {
+            let actual = Self.ledgerEncoderPoolBuffers
+                * Self.ledgerFrameBytes(canvasConfig.width, canvasConfig.height)
+                + Self.ledgerWriterQueueBytes(bitrate: Self.ledgerRecordBitrate)
+            let estimate = MemoryCostModel.estimateWorstCase(
+                for: .startProgramRecord(resolution: ledgerCanvasResolution))
+            ledgerRegister(id: "record.program", loadClass: .programRecord,
+                           actual: actual, estimate: estimate)
+        }
         // Companion vertical (9:16) file alongside the 16:9 program, if enabled.
         currentRecordingBaseURL = url
         startVerticalRecorderIfNeeded()
@@ -4458,6 +4583,7 @@ final class AppEngine: ObservableObject {
         recorder = nil
         fanOut.setRecorder(nil)
         currentRecordingBaseURL = nil
+        ledgerRelease(id: "record.program") // G1 v1b-observe: program record stopped
         // Flip the public flag synchronously with the claim (before the first
         // await) so the claim is fully atomic on the main actor.
         isRecording = false
@@ -4476,6 +4602,7 @@ final class AppEngine: ObservableObject {
             isoBank = nil
             isoTap.install(nil)
             stopISOStatusTimer()
+            ledgerReleaseAllISO() // G1 v1b-observe: ISO angles torn down
             let audio = multitrackBank
             multitrackBank = nil
             multitrackTap.install(nil)
@@ -4540,6 +4667,7 @@ final class AppEngine: ObservableObject {
         recorder = nil
         fanOut.setRecorder(nil)
         currentRecordingBaseURL = nil
+        ledgerRelease(id: "record.program") // G1 v1b-observe: program record stopped
         Task { await self.finishVerticalRecorder() } // close the 9:16 companion too
         isRecording = false
         recordStartDate = nil
@@ -4552,6 +4680,7 @@ final class AppEngine: ObservableObject {
             isoBank = nil
             isoTap.install(nil)
             stopISOStatusTimer()
+            ledgerReleaseAllISO() // G1 v1b-observe: ISO angles torn down
             Task { let results = await bank.finishAll(); await MainActor.run { self.finishISOSession(results: results, program: nil) } }
         }
         // Tear down the multitrack audio bank too — close its files, don't leak.
@@ -4714,10 +4843,31 @@ final class AppEngine: ObservableObject {
                 width: canvasConfig.width, height: canvasConfig.height, fps: Double(canvasConfig.fps))
             isoStatuses = Dictionary(uniqueKeysWithValues: armed.map { ($0.id, "recording…") })
             startISOStatusTimer()
+            // G1 v1b-observe: record each ISO angle's writer-pool bytes. ACTUAL uses the
+            // per-angle native resolution (from meta, native-probe or canvas fallback) —
+            // the same resolution the writer was configured at.
+            for source in armed {
+                let w = meta[source.id]?.width ?? canvasConfig.width
+                let h = meta[source.id]?.height ?? canvasConfig.height
+                let actual = Self.ledgerEncoderPoolBuffers * Self.ledgerFrameBytes(w, h)
+                    + Self.ledgerWriterQueueBytes(bitrate: Self.ledgerRecordBitrate)
+                let estimate = MemoryCostModel.estimateWorstCase(
+                    for: .startISOAngle(resolution: .custom(width: w, height: h)))
+                let accountID = "iso.\(source.id.raw)"
+                ledgerRegister(id: accountID, loadClass: .isoAngle, actual: actual, estimate: estimate)
+                ledgerISOAccounts.insert(accountID)
+            }
         } catch {
             lastError = "Couldn't start ISO recording: \(error.localizedDescription)"
             isoBank = nil
         }
+    }
+
+    /// Release every registered ISO ledger account (G1 v1b-observe). Called from
+    /// each ISO-bank teardown seam — the bank's armed set isn't re-derivable there.
+    private func ledgerReleaseAllISO() {
+        for id in ledgerISOAccounts { ledgerRelease(id: id) }
+        ledgerISOAccounts.removeAll()
     }
 
     /// Nominal fps for a source's recording metadata (exact for generated
@@ -4916,6 +5066,13 @@ final class AppEngine: ObservableObject {
             fanOut.setReplayBuffer(buffer)
             replayArmed = true
             startReplayStatusTimer()
+            // G1 v1b-observe: record the replay ring's actual capacity. ACTUAL = the raw
+            // ring bytes (seconds × bitrate/8) the encoder buffers; the cost-model
+            // estimate adds a 5% keyframe/index headroom on top.
+            let raw = Int64((replayLengthSeconds * Double(Self.ledgerReplayBitrate) / 8.0).rounded(.up))
+            let estimate = MemoryCostModel.estimateWorstCase(
+                for: .enableReplay(durationSec: replayLengthSeconds, bitrate: Self.ledgerReplayBitrate))
+            ledgerRegister(id: "replay", loadClass: .replayBuffer, actual: raw, estimate: estimate)
         } else {
             fanOut.setReplayEncoder(nil)
             fanOut.setReplayBuffer(nil)
@@ -4925,6 +5082,7 @@ final class AppEngine: ObservableObject {
             replayArmed = false
             replayBufferedSeconds = 0
             replayStatusTimer?.invalidate(); replayStatusTimer = nil
+            ledgerRelease(id: "replay") // G1 v1b-observe: replay disarmed
         }
     }
 
@@ -5826,6 +5984,19 @@ final class AppEngine: ObservableObject {
         rtmpOutput = rtmp
         self.broadcaster = broadcaster
         streamStartDate = Date()
+        // G1 v1b-observe: record the stream encoder pool bytes. ACTUAL uses the real
+        // stream resolution (canvas) + stream bitrate (6 Mbps) writer queue. streamEncode
+        // has no dedicated cost-model AdmissionKind, so the ESTIMATE uses the nearest
+        // entry (program-record encoder, 12 Mbps writer queue) — the mismatch is a
+        // v1b-enforce tuning signal (no stream-class cost entry yet).
+        do {
+            let actual = Self.ledgerEncoderPoolBuffers
+                * Self.ledgerFrameBytes(canvasConfig.width, canvasConfig.height)
+                + Self.ledgerWriterQueueBytes(bitrate: Self.ledgerStreamBitrate)
+            let estimate = MemoryCostModel.estimateWorstCase(
+                for: .startProgramRecord(resolution: ledgerCanvasResolution))
+            ledgerRegister(id: "stream", loadClass: .streamEncode, actual: actual, estimate: estimate)
+        }
         // 2f/#9: enter the streaming lifecycle at REQUESTED (`.preparing`). A
         // single-RTMP primary is confirmed when its socket publishes; a
         // destinations-only broadcast is confirmed only when ≥1 destination
@@ -6053,6 +6224,7 @@ final class AppEngine: ObservableObject {
         self.broadcaster = nil
         streamStartDate = nil
         streamHasPublished = false
+        ledgerRelease(id: "stream") // G1 v1b-observe: stream encoder torn down
         // Reset counters on teardown too (Codex #7): a stopped stream has no live
         // bitrate, and the next stream starts from a clean slate regardless.
         streamBitrate = 0
@@ -8866,6 +9038,7 @@ extension AppEngine {
         guard cost > 0 else { return }
         animatedMemeByteCost[id] = cost
         animatedMemeLRU.append(id)
+        ledgerSyncMemeCache() // G1 v1b-observe: meme decoded-byte total changed
     }
 
     /// Evict one animated source to reclaim budget: a meme via `removeMeme`, an
@@ -8889,6 +9062,7 @@ extension AppEngine {
         // Release the aggregate-budget accounting for this animated meme (F15).
         animatedMemeByteCost[item.sourceID] = nil
         animatedMemeLRU.removeAll { $0 == item.sourceID }
+        ledgerSyncMemeCache() // G1 v1b-observe: meme decoded-byte total changed
         invalidatePendingStingerCue(for: item.sourceID, drain: true)
         if activeStingerSourceID == item.sourceID { cancelActiveStingerTransition() }
         auxiliarySources[item.sourceID]?.source.stop()
