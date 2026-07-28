@@ -335,6 +335,12 @@ public final class RenderLoop: @unchecked Sendable {
         // Re-arm so a concurrent/later stop() of this generation also returns
         // immediately (the thread is confirmed gone).
         exitSignal.signal()
+        // Idle seam (stream disarm): the render thread has CONFIRMED it exited its
+        // tick — no code is inside `composite`, so the compositor's output pool
+        // holds only free (non-in-flight) buffers. Shed any excess IOSurfaces a
+        // past spike left resident (G2 hardening). Safe here and only here: this
+        // runs once per stop, never on the per-frame hot path.
+        compositor.flushExcessBuffers()
         return true
     }
 

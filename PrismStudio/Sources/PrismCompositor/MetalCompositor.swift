@@ -882,6 +882,14 @@ public final class MetalCompositor {
     /// buffer, and tombstone it so a stale in-flight tick (mailbox snapshotted
     /// before removal) cannot re-fold it and re-pin the IOSurface forever
     /// (F1/F22). Thread-safe: callable from any thread while the render loop runs.
+    /// Shed the output pool's *unused* buffers so a past spike's IOSurfaces don't
+    /// stay resident for process lifetime. Idle-seam only (see `RenderLoop.stop`);
+    /// buffers still in flight are untouched, so live recycling is unaffected.
+    /// Never call this per-frame — the hot path must stay allocation-free.
+    public func flushExcessBuffers() {
+        outputPool.flushExcess()
+    }
+
     public func forget(source: SourceID) {
         store.withLock { s in
             s.held.removeValue(forKey: source)

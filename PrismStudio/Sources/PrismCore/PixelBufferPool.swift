@@ -37,4 +37,23 @@ public final class PixelBufferPool: @unchecked Sendable {
         guard status == kCVReturnSuccess, let buffer else { throw PoolError.allocationFailed(status) }
         return buffer
     }
+
+    /// Release the pool's *unused* (returned, not in-flight) buffers so a past
+    /// spike's IOSurfaces don't stay resident for process lifetime.
+    ///
+    /// The pool is created with only `kCVPixelBufferPoolMinimumBufferCountKey`
+    /// (no age-out), so after a transient spike pushes the outstanding count to
+    /// K it permanently retains K IOSurfaces. `kCVPixelBufferPoolFlushExcessBuffers`
+    /// (verified in the MacOSX SDK `<CoreVideo/CVPixelBufferPool.h>`: the flush
+    /// flag "will cause CVPixelBufferPoolFlush to flush all unused buffers
+    /// regardless of age") frees every buffer *currently sitting in the pool's
+    /// free list* — buffers still held by consumers are untouched, so steady-state
+    /// recycling is unaffected.
+    ///
+    /// This is a latent-hardening seam, NOT a live-bug fix: call it only at idle
+    /// seams (stream disarm / source teardown / canvas reconfig), never per-frame
+    /// — the hot path must stay allocation-free.
+    public func flushExcess() {
+        CVPixelBufferPoolFlush(pool, .excessBuffers)
+    }
 }
