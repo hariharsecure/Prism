@@ -1475,21 +1475,37 @@ final class AppEngine: ObservableObject {
     /// Passive soft-band flag (enforce-ui reads it for an 80% banner). Never blocks.
     @Published private(set) var memoryWarning = false
 
-    /// A minimal ledger snapshot for enforce-ui (no UI built here).
+    /// A minimal ledger snapshot for enforce-ui. `perClass` is the live per-class
+    /// resident-byte breakdown (read-only, snapshotted on read) that the Headroom
+    /// popover groups into producer-facing rows.
     struct MemoryLedgerSnapshot: Sendable, Equatable {
         var totalBytes: Int64
         var softLimit: Int64
         var hardLimit: Int64
         var budgetTotal: Int64
+        var perClass: [LoadClass: Int64] = [:]
     }
     var memoryLedgerSnapshot: MemoryLedgerSnapshot {
         let b = memoryGovernor.budget
         return MemoryLedgerSnapshot(totalBytes: memoryGovernor.ledger.totalBytes,
                                     softLimit: b.softLimit, hardLimit: b.hardLimit,
-                                    budgetTotal: b.total)
+                                    budgetTotal: b.total,
+                                    perClass: memoryGovernor.ledger.snapshot())
     }
     /// Recent auto-degrade events (from the governor's own log) for the session log.
     var recentDegradeEvents: [DegradeEvent] { memoryGovernor.degradeLog }
+
+    /// Structured refusal for the enforce-ui alert — the ONE tiny logic-adjacent
+    /// addition of this step. Set (alongside the existing `lastError`) at the SAME
+    /// admission-refusal site; carries just what the alert renders. Purely a UI
+    /// carrier — it gates NO governor behavior. The view clears it on dismiss.
+    struct MemoryRefusalInfo: Sendable, Equatable, Identifiable {
+        let id = UUID()
+        var thing: String     // e.g. "ISO angle", "source", "instant replay"
+        var gapMiB: Int       // headroom shortfall to clear
+        var remedy: String    // the ledger-derived one-line remedy
+    }
+    @Published var memoryRefusal: MemoryRefusalInfo?
 
     /// The installed OS memory-pressure source (nil when enforcement is off).
     private var memoryPressureSource: DispatchSourceMemoryPressure?
@@ -1538,6 +1554,11 @@ final class AppEngine: ObservableObject {
             let thing = Self.governorThingName(kind.loadClass)
             lastError = "Not enough headroom for a \(thing) — starting it now would risk "
                 + "your recording and live stream. Free ~\(Self.governorMiB(gapBytes)) MiB: \(remedy.message)"
+            // enforce-ui: also publish a structured carrier for the refusal alert
+            // (keeps the existing lastError string too). Gates no behavior.
+            memoryRefusal = MemoryRefusalInfo(thing: thing,
+                                              gapMiB: Self.governorMiB(gapBytes),
+                                              remedy: remedy.message)
             NSLog("[MEMGOV] REFUSED %@ gap=%dMiB remedy=%@",
                   kind.loadClass.rawValue, Self.governorMiB(gapBytes), remedy.message)
             updateHeadroomState()
@@ -2556,7 +2577,12 @@ final class AppEngine: ObservableObject {
         // the hard limit exactly; a numeric value is MiB. INERT unless the env is set.
         if let fill = env["PRISM_DEBUG_MEMGOV_FILL"] {
             let hard = memoryGovernor.budget.hardLimit
-            let bytes: Int64 = (fill == "HARD") ? hard : ((Int64(fill) ?? 0) * 1024 * 1024)
+            let soft = memoryGovernor.budget.softLimit
+            // HARD → critical (hard limit) · WARN → soft band midpoint (drives the
+            // amber gauge + passive banner for the enforce-ui screenshot) · numeric → MiB.
+            let bytes: Int64 = (fill == "HARD") ? hard
+                : (fill == "WARN") ? (soft + (hard - soft) / 2)
+                : ((Int64(fill) ?? 0) * 1024 * 1024)
             if bytes > 0 {
                 memoryGovernor.ledger.register(ResourceAccount(
                     id: "debug.memgov.fill", loadClass: .compositor, residentBytes: bytes))

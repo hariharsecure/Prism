@@ -67,6 +67,9 @@ struct TransportBar: View {
                 }
             }
 
+            // Memory-governor headroom gauge (enforce-ui): unobtrusive when healthy,
+            // amber/red when the governor is protecting the recording. Read-only.
+            HeadroomGauge()
             helpButton
             onAirBadge
         }

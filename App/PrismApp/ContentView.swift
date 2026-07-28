@@ -23,6 +23,10 @@ struct ContentView: View {
             TransportBar(showHelp: $showGettingStarted)
             Divider()
 
+            // Passive 80% headroom banner (enforce-ui). Renders nothing unless the
+            // governor's soft-band warning is active; never pushes content otherwise.
+            MemoryWarningBanner()
+
             HSplitView {
                 SourcesSidebar()
                     .frame(minWidth: 230, idealWidth: 260, maxWidth: 340)
@@ -96,6 +100,9 @@ struct ContentView: View {
         .onAppear {
             if !hasSeenGettingStarted { showGettingStarted = true }
         }
+        // Enforce-ui floating surfaces: the refusal alert + the transient replay-
+        // degrade toast (both read-only reflections of governor state).
+        .memoryGovernorSurfaces()
     }
 
     /// Friendly hint painted over the empty program monitor until a video
